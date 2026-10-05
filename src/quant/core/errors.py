@@ -29,3 +29,11 @@ class DataError(QuantError):
 
 class ModelError(QuantError):
     """A model can't produce a valid output: NaN features, a bad fit, a failed provenance check."""
+
+
+class PolicyError(QuantError):
+    """A read whose purpose the data segment doesn't allow (ARCHITECTURE §6.3)."""
+
+
+class LockboxError(PolicyError):
+    """Scoring or reporting on the lockbox before the go-live test (A2, C1)."""
