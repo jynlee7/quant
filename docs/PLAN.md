@@ -1,7 +1,7 @@
 # PLAN — SPY Regime Trader
 
-**Status:** APPROVED v1.0 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2.
-**Builds on:** [SPEC.md](SPEC.md) v1.2 (v1.1 plus this plan's C11–C17) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.3 (v1.0 aligned with this plan, plus notes from B0 and B2), all approved 2026-10-05
+**Status:** APPROVED v1.1 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does.
+**Builds on:** [SPEC.md](SPEC.md) v1.2 (v1.1 plus this plan's C11–C17) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.4 (v1.0 aligned with this plan, plus notes from B0 and B2), all approved 2026-10-05
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The build started 2026-10-05 with B0. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -178,7 +178,7 @@ If r1 fails the gates at CP2, as spec §0 expects, the build continues as planne
   - `market.db` with migrations: minute and hourly bars stored as versions with `available_at` and `known_at`, plus dividends, splits and a calendar cache;
   - the hourly bar builder;
   - validation: OHLC order, duplicates, session bounds, and a flag on any one-minute move over 5%;
-  - `PointInTimeView(τ)`;
+  - `PointInTimeView(τ, as_of)` (v1.1: ARCHITECTURE §6.2);
   - `DataPolicy`, with the FIT, DEV, LOCKBOX and FORWARD segments and purpose-tagged queries;
   - cache keys built from the bytes read through the view.
 - **Red tests first:**

@@ -2,8 +2,10 @@
 
 A row is visible when its bar was available strictly before tau (available_at < tau), in the
 latest version known strictly before as_of (known_at < as_of). In the backtest as_of is tau.
-Live, the engine ingests the bar at tau and reads the view just after, so as_of is that later
-moment; the decision record keeps it, and a replay sees exactly the same versions.
+Live, the engine ingests the bar at tau and reads the view just after, with as_of stamped by the
+store like a write (`BarStore.view(tau, as_of=NOW)`), so a row is known before as_of exactly when
+it was committed before the view. The decision record keeps as_of, and a replay sees exactly the
+same versions.
 
 Every read names its purpose, and DataPolicy checks it against the days read (ARCHITECTURE
 §6.3). A view that scores DEV carries the trial ticket that allows it (C11).
@@ -17,7 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 
@@ -81,6 +83,9 @@ _ACTIONS = {
 }
 
 
+_US = timedelta(microseconds=1)
+
+
 def _ny_date(moment: datetime) -> date:
     return moment.astimezone(NEW_YORK).date()
 
@@ -128,6 +133,8 @@ class PointInTimeView:
         latest `last`."""
         if since is not None and last is not None:
             raise ValueError("ask for bars since a time, or for the last n, not both")
+        if last is not None and last < 0:
+            raise ValueError(f"last must be zero or more, not {last}")
         params: dict[str, object] = {**self._params, "symbol": symbol}
         if since is not None:
             params["since"] = to_us(since)
@@ -170,7 +177,8 @@ class PointInTimeView:
         self, symbol: str, start: datetime, end: datetime, *, purpose: Purpose
     ) -> MinuteFrame:
         """Visible minutes starting in [start, end)."""
-        self._check_to_tau(purpose, _ny_date(start))
+        last = _ny_date(min(ensure_utc(end), self.tau) - _US)  # the last day the read can reach
+        self._check(purpose, min(_ny_date(start), last), last)
         params = {**self._params, "symbol": symbol, "start": to_us(start), "end": to_us(end)}
         rows = self._conn.execute(_MINUTES, params).fetchall()
         if not rows:

@@ -67,14 +67,17 @@ def _switch_to_wal(conn: sqlite3.Connection) -> str:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """One write transaction: committed if the block finishes, rolled back if it raises."""
+    """One write transaction: committed if the block finishes, rolled back if it or the commit
+    raises. Some errors (an interrupt, a full disk) make SQLite roll back by itself; then there
+    is nothing left to roll back, and the error raised is SQLite's own."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
+        conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
-    conn.execute("COMMIT")
 
 
 def _user_version(conn: sqlite3.Connection) -> int:

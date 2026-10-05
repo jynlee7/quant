@@ -1,6 +1,6 @@
 # CLAUDE.md: SPY Regime Trader
 
-This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.2, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.3 and [docs/PLAN.md](docs/PLAN.md) v1.0. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
+This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.2, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.4 and [docs/PLAN.md](docs/PLAN.md) v1.1. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
 
 ## Start every session here
 
@@ -58,6 +58,7 @@ If a step is blocked on them, continue with the steps that aren't, and come back
 
 - **DEV stays dark** (2019–2024) until trial #1, which is r1 at CP2 (C11). Nothing computes strategy P&L on DEV before then, so build and debug on synthetic data and FIT (2016–2018).
 - **The lockbox** (2025-01 to the seal) is never scored before the go-live test (C1, A2).
+- **market.db stamps time itself.** A write is `known_at=NOW` (the store's Clock, under the write lock) or `HISTORY` (each row at its own available_at). History only adds whole sessions, and only before live trading reads the store; after that, late data is NOW. A live view is `view(tau, as_of=NOW)`.
 - **Keys** live only in `.env` and `.env.test` (gitignored, chmod 600), and the user adds them. Never print, log or paste them.
 - **numpy is held below 2.5:** hmmlearn 0.3.3 sets `ndarray.shape`, which NumPy 2.5 deprecates.
 - **The hook refuses unstaged changes and untracked files.** The gate checks the working tree, so the working tree must equal the commit.

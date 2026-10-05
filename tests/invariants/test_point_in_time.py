@@ -13,6 +13,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from quant.core.clock import SimClock
 from quant.core.errors import ClockError
 from quant.data.market_db import BarStore
 from quant.data.policy import Purpose
@@ -51,11 +52,12 @@ def test_a_closed_bar_is_invisible_until_it_is_available() -> None:
 
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_a_revision_is_invisible_until_it_is_known() -> None:
-    store = store_with_days(DAY, DAY)
+    clock = SimClock(datetime(2019, 7, 2, tzinfo=UTC))
+    store = store_with_days(DAY, DAY, clock=clock)
     original = store.view(datetime(2019, 7, 3, tzinfo=UTC)).hourly(SYMBOL, purpose=OPERATE)[0]
     tau = original.t_close + timedelta(minutes=16)
     revise_close(
-        store, synthetic_days(DAY, DAY), original, 0.25, known_at=tau + timedelta(minutes=10)
+        store, clock, synthetic_days(DAY, DAY), original, 0.25, at=tau + timedelta(minutes=10)
     )
 
     assert store.view(tau).hourly(SYMBOL, purpose=OPERATE)[0].close == original.close
@@ -119,14 +121,16 @@ def test_an_earlier_view_is_contained_in_a_later_one(tau1: datetime, gap: int) -
 
 def _store_with_a_revision() -> BarStore:
     start, end = date(2019, 7, 1), date(2019, 7, 3)
-    store = store_with_days(start, end)
+    clock = SimClock(datetime(2019, 7, 1, tzinfo=UTC))
+    store = store_with_days(start, end, clock=clock)
     target = store.view(datetime(2019, 7, 5, tzinfo=UTC)).hourly(SYMBOL, purpose=OPERATE)[8]
     revise_close(
         store,
+        clock,
         synthetic_days(start, end),
         target,
         0.25,
-        known_at=target.available_at + timedelta(hours=5),
+        at=target.available_at + timedelta(hours=5),
     )
     return store
 
@@ -145,12 +149,14 @@ def test_the_cache_key_reflects_only_what_was_read() -> None:
     bars = base.view(datetime(2019, 7, 3, tzinfo=UTC)).hourly(SYMBOL, purpose=OPERATE)
     minutes = synthetic_days(DAY, DAY)
 
-    invisible = store_with_days(DAY, DAY)
-    # a bar that isn't available yet at tau, and a revision known only after tau
-    revise_close(invisible, minutes, bars[6], 1.0, known_at=bars[6].available_at + US)
-    revise_close(invisible, minutes, bars[0], 1.0, known_at=tau + US)
+    clock = SimClock(datetime(2019, 7, 2, tzinfo=UTC))
+    invisible = store_with_days(DAY, DAY, clock=clock)
+    # a revision known only after tau, and a bar that isn't available yet at tau
+    revise_close(invisible, clock, minutes, bars[0], 1.0, at=tau + US)
+    revise_close(invisible, clock, minutes, bars[6], 1.0, at=bars[6].available_at + US)
     assert digest(invisible) == reference
 
-    visible = store_with_days(DAY, DAY)
-    revise_close(visible, minutes, bars[1], 1.0, known_at=tau - US)
+    clock = SimClock(datetime(2019, 7, 2, tzinfo=UTC))
+    visible = store_with_days(DAY, DAY, clock=clock)
+    revise_close(visible, clock, minutes, bars[1], 1.0, at=tau - US)
     assert digest(visible) != reference

@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from quant.core.calendar import TradingCalendar
+from quant.core.clock import SimClock
 from quant.core.epoch import to_us
 from quant.core.errors import DataError, PolicyError
 from quant.data import market_db
@@ -47,11 +48,12 @@ def test_every_read_must_name_its_purpose() -> None:
 
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_a_live_ingest_records_when_it_was_known_and_rebuilds_the_hourly_bar() -> None:
-    store = BarStore.memory()
+    late = datetime(2019, 7, 2, 14, 49, tzinfo=UTC)  # tau was 14:46; the bar arrived 3 minutes late
+    clock = SimClock(late)
+    store = BarStore.memory(clock=clock)
     minutes = day_minutes()
     first_bar = minutes.select(minutes.t < to_us(datetime(2019, 7, 2, 14, 30, tzinfo=UTC)))
-    late = datetime(2019, 7, 2, 14, 49, tzinfo=UTC)  # tau was 14:46; the bar arrived 3 minutes late
-    summary = store.ingest_minutes(SYMBOL, first_bar, known_at=late, source="live")
+    summary = store.ingest_minutes(SYMBOL, first_bar, known_at=market_db.NOW, source="live")
     assert (summary.minutes.inserted, summary.hourly.inserted) == (60, 1)
     tau = datetime(2019, 7, 2, 14, 46, tzinfo=UTC)
     assert (
@@ -64,8 +66,9 @@ def test_a_live_ingest_records_when_it_was_known_and_rebuilds_the_hourly_bar() -
 
     # A revised last minute revises the hourly bar too, known at the same moment.
     settle = datetime(2019, 7, 2, 20, 45, tzinfo=UTC)
+    clock.advance_to(settle)
     revised = first_bar.with_close(59, float(first_bar.close[59]) + 0.05)
-    again = store.ingest_minutes(SYMBOL, revised, known_at=settle, source="settle")
+    again = store.ingest_minutes(SYMBOL, revised, known_at=market_db.NOW, source="settle")
     assert (again.minutes.revised, again.hourly.revised) == (1, 1)
     later = store.view(settle + timedelta(seconds=1)).hourly(SYMBOL, purpose=Purpose.OPERATE)[0]
     assert later.close == float(first_bar.close[59]) + 0.05
@@ -75,8 +78,8 @@ def test_a_live_ingest_records_when_it_was_known_and_rebuilds_the_hourly_bar() -
 
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_history_is_stamped_on_purpose_and_revisions_must_move_forward() -> None:
-    store = BarStore.memory()
     minutes = day_minutes()
+    store = BarStore.memory(clock=SimClock(minutes.at(0)))
     store.ingest_minutes(SYMBOL, minutes, known_at=market_db.HISTORY, source="backfill")
     bar = store.view(datetime(2019, 7, 3, tzinfo=UTC)).hourly(SYMBOL, purpose=Purpose.OPERATE)[0]
     assert bar.known_at == bar.available_at
@@ -87,11 +90,11 @@ def test_history_is_stamped_on_purpose_and_revisions_must_move_forward() -> None
             known_at=market_db.HISTORY,
             source="x",
         )
-    with pytest.raises(DataError):  # nor known before the version it replaces
+    with pytest.raises(DataError):  # nor known before the version it replaces: it's 09:30
         store.ingest_minutes(
             SYMBOL,
             minutes.with_close(5, 1.0 + float(minutes.close[5])),
-            known_at=minutes.at(0),
+            known_at=market_db.NOW,
             source="x",
         )
 
@@ -102,6 +105,7 @@ def test_two_writers_revising_the_same_minute_both_land(
 ) -> None:
     path = tmp_path / "market.db"
     minutes = day_minutes()
+    clock = SimClock(datetime(2019, 7, 2, 21, tzinfo=UTC))
     BarStore.open(path).ingest_minutes(
         SYMBOL, minutes, known_at=market_db.HISTORY, source="backfill"
     )
@@ -117,21 +121,21 @@ def test_two_writers_revising_the_same_minute_both_land(
     monkeypatch.setattr(BarStore, "_latest_minutes", read_slowly)
     errors: list[BaseException] = []
 
-    def revise(delta: float, known: datetime) -> None:
+    def revise(delta: float) -> None:
         try:
-            BarStore.open(path).ingest_minutes(
+            BarStore.open(path, clock=clock).ingest_minutes(
                 SYMBOL,
                 minutes.with_close(7, float(minutes.close[7]) + delta),
-                known_at=known,
+                known_at=market_db.NOW,
                 source="settle",
             )
         except BaseException as exc:
             errors.append(exc)
 
-    # The second writer starts once the first is reading, so their order is fixed: the later
-    # revision must land last, because a revision can't be known before the one it replaces.
-    first = threading.Thread(target=revise, args=(0.01, datetime(2019, 7, 2, 21, tzinfo=UTC)))
-    second = threading.Thread(target=revise, args=(0.02, datetime(2019, 7, 2, 22, tzinfo=UTC)))
+    # The second writer starts once the first is reading, so it reaches the lock while the
+    # first holds it.
+    first = threading.Thread(target=revise, args=(0.01,))
+    second = threading.Thread(target=revise, args=(0.02,))
     first.start()
     assert first_read.wait(timeout=10)
     second.start()
@@ -244,20 +248,22 @@ def test_an_ingest_keeps_a_big_move_and_records_its_flag() -> None:
 
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_history_cant_backdate_a_minute_live_trading_missed() -> None:
-    store = BarStore.memory()
     minutes = day_minutes()
     first_bar = minutes.select(minutes.t < to_us(datetime(2019, 7, 2, 14, 30, tzinfo=UTC)))
     tau = datetime(2019, 7, 2, 14, 46, tzinfo=UTC)
     fetched = tau + timedelta(seconds=20)
+    clock = SimClock(fetched)
+    store = BarStore.memory(clock=clock)
     # Live trading fetched the bar at tau without its last minute, so it saw an incomplete bar.
     store.ingest_minutes(
-        SYMBOL, first_bar.select(np.arange(60) < 59), known_at=fetched, source="live"
+        SYMBOL, first_bar.select(np.arange(60) < 59), known_at=market_db.NOW, source="live"
     )
     with pytest.raises(DataError):  # as history, the minute would complete the bar before tau
         store.ingest_minutes(SYMBOL, first_bar, known_at=market_db.HISTORY, source="backfill")
     assert store.versions(SYMBOL, first_bar.at(59)) == []  # the refused ingest left nothing
     retry = tau + timedelta(minutes=1)
-    summary = store.ingest_minutes(SYMBOL, first_bar, known_at=retry, source="live")
+    clock.advance_to(retry)
+    summary = store.ingest_minutes(SYMBOL, first_bar, known_at=market_db.NOW, source="live")
     assert (summary.minutes.inserted, summary.hourly.revised) == (1, 1)
 
     def bar_known_at(as_of: datetime) -> bool:
@@ -270,15 +276,22 @@ def test_history_cant_backdate_a_minute_live_trading_missed() -> None:
 
 @pytest.mark.spec("AD2", "ARCH§6.2")
 def test_a_corporate_action_revision_must_be_known_after_the_version_it_replaces() -> None:
-    store = BarStore.memory()
-    announced = datetime(2019, 6, 20, 20, tzinfo=UTC)
-    ex_date = date(2019, 6, 21)
-    store.put_dividend(SYMBOL, ex_date=ex_date, amount=1.4354, known_at=announced)
-    for known in (announced, announced - timedelta(hours=1)):
-        with pytest.raises(DataError):
-            store.put_dividend(SYMBOL, ex_date=ex_date, amount=1.44, known_at=known)
-    corrected = announced + timedelta(days=1)
-    store.put_dividend(SYMBOL, ex_date=ex_date, amount=1.44, known_at=corrected)
+    clock = SimClock(datetime(2019, 6, 19, 20, tzinfo=UTC))
+    store = BarStore.memory(clock=clock)
+    ex_date, declared = date(2019, 6, 21), date(2019, 6, 19)
+    store.put_dividend(
+        SYMBOL, ex_date=ex_date, amount=1.4354, declared=declared, known_at=market_db.HISTORY
+    )
+    # As history it is known at the end of 2019-06-19 in New York, after the clock's reading.
+    with pytest.raises(DataError):
+        store.put_dividend(
+            SYMBOL, ex_date=ex_date, amount=1.44, declared=declared, known_at=market_db.NOW
+        )
+    corrected = datetime(2019, 6, 20, 20, tzinfo=UTC)
+    clock.advance_to(corrected)
+    store.put_dividend(
+        SYMBOL, ex_date=ex_date, amount=1.44, declared=declared, known_at=market_db.NOW
+    )
     view = store.view(corrected + timedelta(seconds=1))
     assert view.dividends(SYMBOL, ex_date, ex_date, purpose=Purpose.OPERATE) == [(ex_date, 1.44)]
 

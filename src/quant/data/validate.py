@@ -15,12 +15,14 @@ from datetime import datetime
 import numpy as np
 import numpy.typing as npt
 
-from quant.core.calendar import NEW_YORK, TradingCalendar
-from quant.core.epoch import MINUTE_US, from_us, to_us
+from quant.core.calendar import BarSpec, TradingCalendar
+from quant.core.epoch import MINUTE_US, from_us
 from quant.core.errors import DataError
-from quant.data.frames import MinuteFrame
+from quant.data.bars import map_minutes
+from quant.data.frames import Ints, MinuteFrame
 
 MOVE_FLAG = 0.05
+MOVE_KIND = "move_over_5pct"
 
 
 @dataclass(frozen=True)
@@ -30,17 +32,15 @@ class DataFlag:
     detail: str
 
 
-def _fail_where(bad: npt.ArrayLike, t: npt.NDArray[np.int64], why: str) -> None:
+def _fail_where(bad: npt.ArrayLike, t: Ints, why: str) -> None:
     mask = np.asarray(bad, dtype=bool)
     if mask.any():
         i = int(np.flatnonzero(mask)[0])
         raise DataError(f"minute {from_us(int(t[i])).isoformat()}: {why}")
 
 
-def validate_minutes(calendar: TradingCalendar, minutes: MinuteFrame) -> list[DataFlag]:
-    """Raise DataError on bad minutes; return flags on suspicious ones."""
-    if len(minutes) == 0:
-        return []
+def check_minutes(calendar: TradingCalendar, minutes: MinuteFrame) -> tuple[list[BarSpec], Ints]:
+    """Raise DataError on bad minutes; return where they fall in the session map (`map_minutes`)."""
     t, o, h, lo, c, v = (
         minutes.t,
         minutes.open,
@@ -62,25 +62,33 @@ def validate_minutes(calendar: TradingCalendar, minutes: MinuteFrame) -> list[Da
     step = np.diff(t)
     _fail_where(np.r_[False, step == 0], t, "duplicate minute")
     _fail_where(np.r_[False, step < 0], t, "minutes out of order")
+    return map_minutes(calendar, t)
 
-    first = from_us(int(t[0])).astimezone(NEW_YORK).date()
-    last = from_us(int(t[-1])).astimezone(NEW_YORK).date()
-    days = calendar.sessions(first, last)
-    if not days:
-        raise DataError(f"no trading session from {first} to {last}")
-    opens = np.array([to_us(calendar.session(d).open) for d in days], dtype=np.int64)
-    closes = np.array([to_us(calendar.session(d).close) for d in days], dtype=np.int64)
-    k = np.searchsorted(opens, t, side="right") - 1
-    inside = (k >= 0) & (t < closes[np.clip(k, 0, None)])
-    _fail_where(~inside, t, "outside regular trading hours")
 
-    same_session = k[1:] == k[:-1]
-    moves = np.abs(c[1:] / c[:-1] - 1.0) > MOVE_FLAG
+def validate_minutes(calendar: TradingCalendar, minutes: MinuteFrame) -> list[DataFlag]:
+    """Raise DataError on bad minutes; return flags on big moves."""
+    if len(minutes) == 0:
+        return []
+    return _move_flags(minutes, *check_minutes(calendar, minutes))
+
+
+def move_flags(calendar: TradingCalendar, minutes: MinuteFrame) -> list[DataFlag]:
+    """Flags on the big moves in valid minutes, such as a stored session with new ones laid
+    over it."""
+    return _move_flags(minutes, *map_minutes(calendar, minutes.t))
+
+
+def _move_flags(minutes: MinuteFrame, specs: list[BarSpec], which: Ints) -> list[DataFlag]:
+    if len(minutes) < 2:
+        return []
+    t, c = minutes.t, minutes.close
+    session = np.array([spec.session.toordinal() for spec in specs], dtype=np.int64)[which]
+    big = (session[1:] == session[:-1]) & (np.abs(c[1:] / c[:-1] - 1.0) > MOVE_FLAG)
     return [
         DataFlag(
             from_us(int(t[i])),
-            "move_over_5pct",
+            MOVE_KIND,
             f"close {c[i - 1]} -> {c[i]} over {(t[i] - t[i - 1]) // MINUTE_US} min",
         )
-        for i in (np.flatnonzero(same_session & moves) + 1).tolist()
+        for i in (np.flatnonzero(big) + 1).tolist()
     ]

@@ -33,14 +33,6 @@ US = timedelta(microseconds=1)
 TRIAL = Ticket("t1", date(2019, 1, 1), date(2024, 12, 31))
 
 
-def red(failure: type[BaseException]) -> pytest.MarkDecorator:
-    """Red until the review fix lands; `failure` is how each test fails before it (P2)."""
-    return pytest.mark.xfail(strict=True, reason="red:B2", raises=failure)
-
-
-DID_NOT_RAISE = pytest.fail.Exception
-
-
 def day_minutes() -> MinuteFrame:
     return synthetic_minutes(TradingCalendar.xnys(), DAY, DAY, seed=9)
 
@@ -76,7 +68,6 @@ class SteppingClock:
 # 1. known_at is stamped by the store's clock under the write lock, and so is a live view's as_of.
 
 
-@red(TypeError)
 @pytest.mark.spec("I1", "AD2", "ARCH§6.2", "ARCH§9.1")
 def test_an_ingest_is_known_from_when_it_holds_the_write_lock(tmp_path: Path) -> None:
     path = tmp_path / "market.db"
@@ -113,7 +104,6 @@ def test_an_ingest_is_known_from_when_it_holds_the_write_lock(tmp_path: Path) ->
     assert [v.known_at for v in store.versions(SYMBOL, first_bar.at(0))] == [locked]
 
 
-@red(TypeError)
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_stamps_order_live_views_and_ingests_even_when_the_clock_steps_back() -> None:
     clock = SteppingClock(TAU + timedelta(seconds=30))
@@ -133,7 +123,6 @@ def test_stamps_order_live_views_and_ingests_even_when_the_clock_steps_back() ->
         BarStore.memory().view(TAU, as_of=market_db.NOW)
 
 
-@red(TypeError)
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_history_cant_add_what_a_live_view_may_have_read() -> None:
     clock = SimClock(datetime(2019, 7, 3, 14, 46, tzinfo=UTC))
@@ -157,7 +146,6 @@ def test_history_cant_add_what_a_live_view_may_have_read() -> None:
 # 2. Move flags compare against stored minutes, and a revision recomputes them.
 
 
-@red(TypeError)
 @pytest.mark.spec("SPEC§2", "ARCH§6.1")
 def test_a_jump_against_a_stored_minute_is_flagged() -> None:
     clock = SimClock(TAU)
@@ -170,7 +158,6 @@ def test_a_jump_against_a_stored_minute_is_flagged() -> None:
     assert store.flags(SYMBOL) == list(summary.flags)
 
 
-@red(TypeError)
 @pytest.mark.spec("SPEC§2", "ARCH§6.1")
 def test_a_revision_recomputes_the_flags_around_it_and_keeps_the_one_it_clears() -> None:
     clock = SimClock(datetime(2019, 7, 2, 21, tzinfo=UTC))
@@ -195,7 +182,6 @@ def test_a_revision_recomputes_the_flags_around_it_and_keeps_the_one_it_clears()
 # 3. Backfilled dividends and splits are history, known from their declaration day.
 
 
-@red(TypeError)
 @pytest.mark.spec("AD2", "SPEC§2", "ARCH§6.2")
 def test_a_backfilled_corporate_action_is_known_from_the_end_of_its_declaration_day() -> None:
     store = BarStore.memory()
@@ -237,7 +223,6 @@ def test_a_backfilled_corporate_action_is_known_from_the_end_of_its_declaration_
 # 4. Calibration and Kelly edge estimates read forward data, and never the lockbox.
 
 
-@red(AttributeError)
 @pytest.mark.spec("C1", "C11", "A2", "ARCH§6.3")
 def test_calibration_and_edge_estimates_read_fit_dev_with_a_ticket_and_forward() -> None:
     policy = DataPolicy(Segments(lockbox_end=date(2026, 10, 20)))
@@ -256,7 +241,6 @@ def test_calibration_and_edge_estimates_read_fit_dev_with_a_ticket_and_forward()
 # 5. A bounded minute read is checked over the days it reads.
 
 
-@red(LockboxError)
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 def test_a_bounded_minute_read_is_checked_over_the_days_it_reads() -> None:
     store = store_with_days(date(2018, 12, 27), date(2018, 12, 28))
@@ -274,7 +258,6 @@ def test_a_bounded_minute_read_is_checked_over_the_days_it_reads() -> None:
 # 7. The last n bars, for n >= 0.
 
 
-@red(DID_NOT_RAISE)
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_a_negative_count_of_bars_is_refused() -> None:
     view = store_with_days(DAY, DAY).view(datetime(2019, 7, 3, tzinfo=UTC))
@@ -285,7 +268,6 @@ def test_a_negative_count_of_bars_is_refused() -> None:
 # 8. A failed transaction raises its own error and leaves the connection usable.
 
 
-@red(sqlite3.OperationalError)
 @pytest.mark.spec("AD2", "ARCH§9.1")
 def test_a_transaction_sqlite_rolled_back_itself_raises_its_own_error(tmp_path: Path) -> None:
     conn = connect(tmp_path / "x.db")
@@ -306,7 +288,6 @@ def test_a_transaction_sqlite_rolled_back_itself_raises_its_own_error(tmp_path: 
 # Found while verifying finding 8: written red first.
 
 
-@red(AssertionError)
 @pytest.mark.spec("AD2", "ARCH§9.1")
 def test_a_failed_commit_rolls_back_and_frees_the_connection(tmp_path: Path) -> None:
     conn = connect(tmp_path / "x.db")

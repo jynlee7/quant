@@ -1,6 +1,6 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.3 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), and v1.3 how B2 resolves the view's knowledge time (§6.2). Each change is tagged where it lands.
+**Status:** APPROVED v1.4 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). Each change is tagged where it lands.
 **Builds on:** [SPEC.md](SPEC.md) v1.2, which is v1.0 plus this document's C1–C10 and the plan's C11–C17
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
@@ -165,7 +165,7 @@ Each rule below is a test in the build gate. import-linter checks K1–K4, and s
 
 | Step | Module | Pure | What happens |
 |---|---|---|---|
-| 1 Ingest | data | no | Fetch the bar's SIP minute bars, build the hourly bar, store it with `known_at` |
+| 1 Ingest | data | no | Fetch the bar's SIP minute bars, build the hourly bar, store it with `known_at` stamped at commit (§6.2) |
 | 2 View | data | yes | `PointInTimeView(τ, as_of)`: rows with `available_at < τ`, each in the latest version known before `as_of` (§6.2) |
 | 3 Features | features | yes | Streaming update: one new float64 row |
 | 4 Filter | hmm.filter | yes | Log-space forward step, with every output listed in spec §6 |
@@ -226,13 +226,14 @@ On half days the calendar shifts everything earlier. With a 13:00 close, decisio
 - **Source:** Alpaca SIP 1-minute bars, raw (unadjusted), regular hours only. A one-time backfill from 2016-01-01 covers about 1 million minute bars; it is resumable and respects rate limits.
 - **Bar builder:** hourly bars anchored at 09:30, as in spec §2. Slots are numbered by start time, and the final 30-minute bar of any session, full or half day, maps to a single CLOSE slot. This matters for the slot-normalized features F1, F3 and F4.
 - **Completeness:** a bar is complete when its last minute is present. The engine retries from τ until τ + 5 minutes, then applies rule 6.
-- **Validation:** OHLC ordering, no duplicate minutes, session bounds. A one-minute move over 5% is used but flagged with an alert. A split in the corporate-actions feed halts trading, since raw prices would break. SPY has never split.
+- **Validation:** OHLC ordering, no duplicate minutes, session bounds. A one-minute move over 5% is used but flagged with an alert. Each ingest recomputes the flags of the sessions it touches against the stored minutes, so a jump across two ingests is caught, and a revision that clears a flag adds a cleared version rather than deleting it (B2). A split in the corporate-actions feed halts trading, since raw prices would break. SPY has never split.
 
 ### 6.2 Point-in-time store
 
 - Every minute and hourly bar row carries `available_at` (modeled as close + 15 minutes) and `known_at` (when we actually had it). Revisions become new versions and never overwrite.
-- Bulk-loaded history is stamped `known_at = available_at`.
-- `PointInTimeView(τ, as_of)` returns, for each bar with `available_at < τ`, the latest version with `known_at < as_of`. In the backtest `as_of` is τ. Live, the engine ingests the bar at τ (§16), so it reads the view just after, and `as_of` is that moment; the DecisionRecord keeps it. `as_of` is never earlier than τ. Live decisions see what they saw. Backtests see the single historical version. Replays see exactly what live trading saw (B2).
+- `known_at` is when the row was committed: the store stamps it from the Clock while it holds `market.db`'s write lock, not when the data was fetched (B2).
+- Bulk-loaded history is stamped `known_at = available_at`, and a backfilled dividend or split at the end of its declaration day in New York. History only adds rows, and only rows known after the store's last stamp: once a live view has read the store, a late row is known now (B2).
+- `PointInTimeView(τ, as_of)` returns, for each bar with `available_at < τ`, the latest version with `known_at < as_of`. In the backtest `as_of` is τ. Live, the engine ingests the bar at τ (§16), so it reads the view just after, and `as_of` is that moment, stamped like a write under the write lock; the DecisionRecord keeps it. Stamps never go back, even if the clock does, so a row is known before a live view's `as_of` exactly when it was committed before the view (B2). `as_of` is never earlier than τ. Live decisions see what they saw. Backtests see the single historical version. Replays see exactly what live trading saw (B2).
 - Caches (features, model fits) are keyed by hashes of the bytes actually read through the view. A leak of future data would change the key rather than hide behind a cache hit.
 
 ### 6.3 Data segments (C1)
@@ -245,7 +246,8 @@ On half days the calendar shifts everything earlier. With a 13:00 close, decisio
 | FORWARD | from paper start | ✓ | parity and reports only | ✓ | ✓ |
 
 - `DataPolicy` makes every query name its purpose. Scoring anything inside LOCKBOX without a lockbox ticket raises an error and leaves a ledger entry.
-- Kelly edge estimates and calibration skip the lockbox span: they use DEV walk-forward history, then FORWARD.
+- The purposes (B2): **operate** (features, the filter, refits) reads anything; **score** (strategy P&L, trades, gate results) reads FIT, and DEV with a trial ticket; **calibrate** (calibration and Kelly edge estimates) reads FIT, DEV with a trial ticket, and FORWARD; **report** (parity and reports) reads anything but the lockbox. Only operate may read the lockbox.
+- Kelly edge estimates and calibration skip the lockbox span: they use DEV walk-forward history, then FORWARD. On DEV that history is a trial's walk-forward, and Kelly's shadow returns are strategy P&L, so calibrate needs the trial's ticket there (C11).
 - DEV stays dark during the build as well: nothing computes strategy P&L on DEV before trial #1, which is the seed release r1, run at checkpoint CP2 (C11).
 - `quant lockbox seal` writes the closing date into `gates.yaml` when paper trading starts. It is committed like `risk.yaml`, and the engine won't trade paper until it is.
 - At go-live, item 7 scores 2025-01 → today as the spec says. The report shows the sealed part and the forward part separately, because only the sealed part was truly hidden.

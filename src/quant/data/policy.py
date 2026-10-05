@@ -2,13 +2,17 @@
 
 | Segment | Span | May be read to |
 |---|---|---|
-| FIT | 2016-01 to 2018-12 | operate, score, report |
-| DEV | 2019-01 to 2024-12 | operate, report; score only with a trial ticket that covers the read (C11) |
+| FIT | 2016-01 to 2018-12 | operate, score, calibrate, report |
+| DEV | 2019-01 to 2024-12 | operate, report; score and calibrate only with a trial ticket that covers the read (C11) |
 | LOCKBOX | 2025-01 to the seal | operate only (features, the filter, refits: C1) |
-| FORWARD | after the seal | operate and report (parity, reports), never score |
+| FORWARD | after the seal | operate, calibrate and report; never score |
 
-Only the go-live lockbox test may score the lockbox (B19); v1 has no way to. Days before the data
-starts can't be scored or reported, since no segment holds them.
+Calibration and Kelly edge estimates use the fit-window backtest, then DEV walk-forward history,
+then forward data, and skip the lockbox (ARCHITECTURE §6.3). On DEV they come from a trial's
+walk-forward, and Kelly's shadow returns are strategy P&L, so they need its ticket. Gates score
+only FIT and DEV. Only the go-live lockbox test may score the lockbox (B19); v1 has no way to.
+Days before the data starts can't be read for any purpose but operating, since no segment holds
+them.
 """
 
 from __future__ import annotations
@@ -32,7 +36,8 @@ class Purpose(StrEnum):
     """Why a read happens. Every read through the view names one."""
 
     OPERATE = "operate"  # features, the filter and refits
-    SCORE = "score"  # strategy P&L, trades, gates and calibration results
+    SCORE = "score"  # strategy P&L, trades and gate results
+    CALIBRATE = "calibrate"  # calibration and Kelly edge estimates
     REPORT = "report"  # parity replays and reports
 
 
@@ -111,16 +116,16 @@ class DataPolicy:
             )
         if purpose is Purpose.SCORE and Segment.FORWARD in touched:
             raise PolicyError(
-                f"a score read of {first} to {last} touches forward data, which is for parity "
-                "and reports only"
+                f"a score read of {first} to {last} touches forward data, which is for "
+                "calibration, parity and reports only"
             )
-        if purpose is Purpose.SCORE and Segment.DEV in touched:
+        if purpose in (Purpose.SCORE, Purpose.CALIBRATE) and Segment.DEV in touched:
             dev_first, dev_last = self.segments.spans()[Segment.DEV]
             need = (max(first, dev_first), min(last, dev_last))
             if ticket is None:
                 raise PolicyError(
-                    f"scoring {need[0]} to {need[1]} in DEV needs a trial ticket from the "
-                    "ledger (C11, A2)"
+                    f"a {purpose} read of {need[0]} to {need[1]} in DEV needs a trial ticket "
+                    "from the ledger (C11, A2)"
                 )
             if not ticket.first_day <= need[0] <= need[1] <= ticket.last_day:
                 raise PolicyError(
