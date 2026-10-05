@@ -1,0 +1,21 @@
+# Secret scan for I6, run by quant-check over every tracked file and the git history.
+# It extends gitleaks' default rules with the key formats this project handles.
+title = "quant"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "alpaca-key-id"
+description = "Alpaca API key id: paper keys start with PK, live keys with AK"
+regex = '''\b(?:PK|AK)[A-Z0-9]{18}\b'''
+entropy = 3.0
+keywords = ["pk", "ak"]
+
+[[rules]]
+id = "alpaca-secret-key"
+description = "Alpaca API secret assigned to a variable"
+regex = '''(?i)(?:alpaca|apca)[\w-]*(?:secret|key)[\w-]*\s*[:=]\s*["']?([A-Za-z0-9/+]{32,48})'''
+secretGroup = 1
+entropy = 3.5
+keywords = ["alpaca", "apca"]

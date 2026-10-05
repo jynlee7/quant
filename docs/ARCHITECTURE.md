@@ -1,6 +1,6 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.1 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). Each change is tagged where it lands.
+**Status:** APPROVED v1.2 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13). Each change is tagged where it lands.
 **Builds on:** [SPEC.md](SPEC.md) v1.2, which is v1.0 plus this document's C1–C10 and the plan's C11–C17
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
@@ -420,7 +420,7 @@ Each proposed change is a structured edit, `{path, from, to}`, against the relea
 | Spec ID | Test | How |
 |---|---|---|
 | I1, T-NL1 | Truncation invariance | Run the engine loop with SimBroker for cut times × 3 variants, then compare DecisionRecords and state hashes. The fast tier runs 50 cut times on synthetic bars at every commit; the full tier runs 200 cut times on real bars before each merge and nightly (P4). |
-| I2 | No smoother on the decision path | An AST scan fails the build on `predict`, `predict_proba`, `decode`, `score_samples` or `eval.smoother` anywhere outside `eval/`, plus rule K3. |
+| I2 | No smoother on the decision path | An AST scan fails the build on `predict`, `predict_proba`, `decode`, `score_samples` or `eval.smoother` anywhere outside `eval/`, plus rule K3. `decode` counts when it is called the way hmmlearn's Viterbi is, with an array; `bytes.decode("utf-8")` is allowed. hmmlearn itself is imported only by `hmm.train`, `eval/` included (B0). |
 | I3 | Isolation | Rules K1 and K2 |
 | I4 | One choke point | Rule K5's scan, the runtime token, and adapter tests that reject plain objects, subclasses, and reused or expired approvals |
 | I5 | Paper lock | Adapter-constructor tests across every combination of mode, URL and checklist state |
@@ -439,7 +439,7 @@ The test suite has six other layers:
 - **Integration tests** on the test account, run weekly and on demand.
 - **Stress replays:** March 2020, 2022, a synthetic −10% overnight gap, a 30-minute data outage and a broker outage, using fault-injecting fakes. The April 2025 replay is inside the lockbox, so it runs only at go-live.
 
-**Build gate:** `uv run quant-check` runs ruff, mypy (strict for `core`, `risk`, `decide` and `execution`), import-linter, the test suites listed above and gitleaks. A git hook runs it before every commit.
+**Build gate:** `uv run quant-check` runs ruff, mypy (strict for `core`, `risk`, `decide` and `execution`), import-linter, the test suites listed above and gitleaks. A git hook runs the fast gate before every commit, and a second hook runs the full gate on every `git merge --no-ff` into `main` (B0).
 
 ## 14. Determinism
 

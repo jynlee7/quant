@@ -1,7 +1,7 @@
 # PLAN — SPY Regime Trader
 
 **Status:** APPROVED v1.0 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2.
-**Builds on:** [SPEC.md](SPEC.md) v1.2 (v1.1 plus this plan's C11–C17) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.1 (v1.0 aligned with this plan), all approved 2026-10-05
+**Builds on:** [SPEC.md](SPEC.md) v1.2 (v1.1 plus this plan's C11–C17) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.2 (v1.0 aligned with this plan, plus B0's notes on the gate), all approved 2026-10-05
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The build started 2026-10-05 with B0. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 

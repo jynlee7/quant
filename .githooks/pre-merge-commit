@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs the full gate on `git merge --no-ff`, the way every step reaches main (PLAN §2, rule 7):
+# full-tier tests, no red marks left, and every id the merged step claims covered by a green test.
+exec "$(dirname "$0")/pre-commit" --full
