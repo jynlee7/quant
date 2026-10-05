@@ -144,3 +144,7 @@ def check_trace(repo: Repo) -> tuple[list[Finding], str]:
             red = f"  [red:{test['red']}]" if test["red"] else ""
             lines.append(f"          {test['nodeid']}{red}")
     return findings, "\n".join(lines)
+
+
+def id_sort_key(cid: str) -> tuple[str, tuple[float, ...]]:
+    raise NotImplementedError("red:B1 review")

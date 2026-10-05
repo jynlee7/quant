@@ -152,3 +152,8 @@ def configure_logging(
     root.addHandler(handler)
     root.setLevel(level)
     return redactor
+
+
+def register_secret(value: str) -> None:
+    """Redact `value` from every log line from now on, such as a key read from `.env`."""
+    raise NotImplementedError("red:B1 review")
