@@ -1,6 +1,6 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.2 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13). Each change is tagged where it lands.
+**Status:** APPROVED v1.3 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), and v1.3 how B2 resolves the view's knowledge time (§6.2). Each change is tagged where it lands.
 **Builds on:** [SPEC.md](SPEC.md) v1.2, which is v1.0 plus this document's C1–C10 and the plan's C11–C17
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
@@ -166,7 +166,7 @@ Each rule below is a test in the build gate. import-linter checks K1–K4, and s
 | Step | Module | Pure | What happens |
 |---|---|---|---|
 | 1 Ingest | data | no | Fetch the bar's SIP minute bars, build the hourly bar, store it with `known_at` |
-| 2 View | data | yes | `PointInTimeView(τ)`: rows with `available_at < τ`, each in the version known at τ |
+| 2 View | data | yes | `PointInTimeView(τ, as_of)`: rows with `available_at < τ`, each in the latest version known before `as_of` (§6.2) |
 | 3 Features | features | yes | Streaming update: one new float64 row |
 | 4 Filter | hmm.filter | yes | Log-space forward step, with every output listed in spec §6 |
 | 5 Labels | hmm.labels | yes | State probabilities summed per label, entropy, expected remaining duration |
@@ -186,7 +186,7 @@ Steps 2–11 are the pure core. Features, the filter and every accumulator are s
 
 - **EngineState** holds the filter's log-probabilities; the switching state (active label, challenger and its count, cooldown, health streak, invalidation blocks); the trade state (entry, stop, bars in trade, trade drawdown); the risk state (start-of-day and peak equity, daily-loss lock, intents today, drift freeze); and the edge accumulators for Kelly.
 - State is serialized as canonical JSON (sorted keys, shortest round-trip float64 text, NaN forbidden) and hashed with SHA-256.
-- **A DecisionRecord** holds τ; the ids and hashes of the bars used; the release, model and calibration ids; the code commit; the features; filtered and next-bar probabilities, entropy and predictive log-likelihood; the rule trace with rule ids and reasons; the target; the intents; the risk verdicts; and the state hashes before and after. Replays compare records hash for hash.
+- **A DecisionRecord** holds τ and the view's `as_of` (§6.2); the ids and hashes of the bars used; the release, model and calibration ids; the code commit; the features; filtered and next-bar probabilities, entropy and predictive log-likelihood; the rule trace with rule ids and reasons; the target; the intents; the risk verdicts; and the state hashes before and after. Replays compare records hash for hash.
 
 ### 4.4 Typed choke points
 
@@ -232,7 +232,7 @@ On half days the calendar shifts everything earlier. With a 13:00 close, decisio
 
 - Every minute and hourly bar row carries `available_at` (modeled as close + 15 minutes) and `known_at` (when we actually had it). Revisions become new versions and never overwrite.
 - Bulk-loaded history is stamped `known_at = available_at`.
-- `PointInTimeView(τ)` returns, for each bar with `available_at < τ`, the latest version with `known_at < τ`. Live decisions see what they saw. Backtests see the single historical version. Replays see exactly what live trading saw.
+- `PointInTimeView(τ, as_of)` returns, for each bar with `available_at < τ`, the latest version with `known_at < as_of`. In the backtest `as_of` is τ. Live, the engine ingests the bar at τ (§16), so it reads the view just after, and `as_of` is that moment; the DecisionRecord keeps it. `as_of` is never earlier than τ. Live decisions see what they saw. Backtests see the single historical version. Replays see exactly what live trading saw (B2).
 - Caches (features, model fits) are keyed by hashes of the bytes actually read through the view. A leak of future data would change the key rather than hide behind a cache hit.
 
 ### 6.3 Data segments (C1)

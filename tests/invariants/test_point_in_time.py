@@ -18,8 +18,6 @@ from quant.core.errors import ClockError
 from quant.data.market_db import BarStore
 from tests.support.bars import SYMBOL, store_with_days
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B2", raises=NotImplementedError)
-
 DAY = date(2019, 7, 2)
 US = timedelta(microseconds=1)
 
@@ -141,7 +139,11 @@ def test_the_cache_key_reflects_only_what_was_read() -> None:
     bars = base.view(datetime(2019, 7, 3, tzinfo=UTC)).hourly(SYMBOL)
 
     invisible = store_with_days(DAY, DAY)
-    invisible.put_hourly(SYMBOL, [dataclasses.replace(bars[6], close=bars[6].close + 1)])
+    invisible.put_hourly(  # a bar that isn't available yet at tau
+        SYMBOL,
+        [dataclasses.replace(bars[6], close=bars[6].close + 1)],
+        known_at=bars[6].available_at,
+    )
     invisible.put_hourly(
         SYMBOL, [dataclasses.replace(bars[0], close=bars[0].close + 1)], known_at=tau + US
     )

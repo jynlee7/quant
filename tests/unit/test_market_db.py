@@ -14,8 +14,6 @@ from quant.data.market_db import MIGRATIONS, BarStore
 from quant.data.synthetic import synthetic_minutes
 from quant.store.sqlite import Migration, connect, migrate
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B2", raises=NotImplementedError)
-
 
 @pytest.mark.spec("AD2", "ARCH§9.1")
 def test_migrations_apply_once_and_refuse_a_newer_database(tmp_path: Path) -> None:

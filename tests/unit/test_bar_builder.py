@@ -18,8 +18,6 @@ from quant.data.frames import MinuteFrame
 from quant.data.synthetic import synthetic_minutes
 from quant.data.validate import validate_minutes
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B2", raises=NotImplementedError)
-
 NY = ZoneInfo("America/New_York")
 CAL = TradingCalendar.xnys
 
@@ -131,8 +129,8 @@ def test_validation_rejects_bad_minutes(corruption: str) -> None:
 def test_a_one_minute_move_over_five_percent_is_flagged_but_kept() -> None:
     m = day_minutes(date(2019, 7, 2))
     o, h, lo, c = (x.copy() for x in (m.open, m.high, m.low, m.close))
-    c[100] = c[99] * 1.06
-    h[100] = max(h[100], c[100], o[100])
+    for column in (o, h, lo, c):  # the price level jumps 6% at minute 100 and stays there
+        column[100:] *= 1.06
     flags = validate_minutes(CAL(), MinuteFrame(m.t, o, h, lo, c, m.volume))
     assert [(f.kind, f.t) for f in flags] == [("move_over_5pct", m.at(100))]
     assert validate_minutes(CAL(), m) == []

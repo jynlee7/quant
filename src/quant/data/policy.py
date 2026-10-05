@@ -13,8 +13,10 @@ Only the go-live lockbox test may score the lockbox (B19); v1 has no way to.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from enum import StrEnum
+
+from quant.core.errors import ConfigError, LockboxError, PolicyError
 
 
 class Segment(StrEnum):
@@ -39,8 +41,30 @@ class Segments:
     lockbox_start: date = date(2025, 1, 1)
     lockbox_end: date | None = None  # the seal: the day before the first paper decision
 
+    def __post_init__(self) -> None:
+        ordered = self.fit_start < self.dev_start < self.lockbox_start
+        if not ordered or (self.lockbox_end is not None and self.lockbox_end < self.lockbox_start):
+            raise ConfigError(f"data segments out of order: {self}")
+
+    def spans(self) -> dict[Segment, tuple[date, date]]:
+        """Each segment's first and last day. An unsealed lockbox runs to date.max."""
+        spans = {
+            Segment.FIT: (self.fit_start, self.dev_start - timedelta(days=1)),
+            Segment.DEV: (self.dev_start, self.lockbox_start - timedelta(days=1)),
+            Segment.LOCKBOX: (self.lockbox_start, self.lockbox_end or date.max),
+        }
+        if self.lockbox_end is not None:
+            spans[Segment.FORWARD] = (self.lockbox_end + timedelta(days=1), date.max)
+        return spans
+
     def segment_of(self, day: date) -> Segment:
-        raise NotImplementedError("red:B2")
+        for segment, (first, last) in self.spans().items():
+            if first <= day <= last:
+                return segment
+        raise PolicyError(f"{day} is before the data starts ({self.fit_start})")
+
+    def overlapping(self, first: date, last: date) -> set[Segment]:
+        return {s for s, (lo, hi) in self.spans().items() if lo <= last and first <= hi}
 
 
 @dataclass(frozen=True)
@@ -49,4 +73,19 @@ class DataPolicy:
 
     def check(self, purpose: Purpose, first: date, last: date) -> None:
         """Raise unless `purpose` may read the days from `first` to `last`."""
-        raise NotImplementedError("red:B2")
+        if last < first:
+            raise PolicyError(f"empty span {first} to {last}")
+        if purpose is Purpose.OPERATE:
+            return  # market data may feed features, the filter and refits anywhere (C1)
+        touched = self.segments.overlapping(first, last)
+        if Segment.LOCKBOX in touched:
+            seal = self.segments.lockbox_end or "the seal"
+            raise LockboxError(
+                f"a {purpose} read of {first} to {last} touches the lockbox "
+                f"({self.segments.lockbox_start} to {seal}); only the go-live test may (A2, C1)"
+            )
+        if purpose is Purpose.SCORE and Segment.FORWARD in touched:
+            raise PolicyError(
+                f"a score read of {first} to {last} touches forward data, which is for parity "
+                "and reports only"
+            )

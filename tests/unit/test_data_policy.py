@@ -15,8 +15,6 @@ from quant.core.errors import LockboxError, PolicyError
 from quant.data.policy import DataPolicy, Purpose, Segment, Segments
 from tests.support.bars import SYMBOL, store_with_days
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B2", raises=NotImplementedError)
-
 
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 def test_days_fall_in_the_segments_the_spec_names() -> None:
