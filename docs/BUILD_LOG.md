@@ -2,6 +2,23 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B2 · Bars and the point-in-time store (in progress on `b02-bars`)
+
+**State:** red (e5f1852), green (0b03662), first review red (f77952a), extra red (c952348) and review green (92c5613) are committed, and the fast and full gates pass. The first review's findings are the tests in f77952a; the session that ran it ended before writing them here.
+
+**Second review** (code-review skill, high, over `main...b02-bars` after the fixes): 10 candidate findings, not yet verified. Next: write red tests for the ones that hold, fix them, then the full BUILD_LOG entry, merge and tag `b02-done`.
+
+1. known_at is the fetch time, not the commit time, and a view's queries don't share one snapshot. A replay with the same as_of can see a row that live trading didn't (ARCH §6.2).
+2. The 5% move flag compares only minutes inside one ingest, so a jump against a stored neighbour isn't flagged, and a revision leaves a stale flag behind.
+3. Dividends and splits have no HISTORY stamp, so backfilled actions are invisible to backtests unless the caller backdates known_at.
+4. The policy refuses every SCORE read of FORWARD, but ARCH §6.3 has Kelly and calibration read FORWARD.
+5. `view.minutes()` checks the policy from `start` through tau, not through `min(end, tau)`, so a bounded read of old minutes trips the lockbox.
+6. `ScoringTicket` is structural, so any object of that shape unlocks DEV scoring (C11, K5). The ledger's runtime token (B10) may be the fix.
+7. `hourly(last=n)` with a negative n returns the whole history.
+8. `transaction()` runs ROLLBACK after SQLite has already rolled back itself, which hides the real error.
+9. Cleanup: the hourly build runs twice per ingest, and `bars.py` and `validate.py` repeat the session lookup.
+10. ARCHITECTURE v1.3 (as_of) has no BUILD_LOG note yet, and PLAN §B2 still says `PointInTimeView(τ)`.
+
 ## B1 · Time, calendar and canonical data (done 2026-10-05, tag `b01-done`)
 
 **Built**
