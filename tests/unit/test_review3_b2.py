@@ -132,3 +132,35 @@ def test_connect_retries_a_wal_switch_refused_while_another_connection_recovers(
     conn = connect(tmp_path / "x.db")
     assert conn.execute("PRAGMA journal_mode").fetchone() == ("wal",)
     conn.close()
+
+
+# Found by a review of the fixes above: written red first.
+
+
+def red(failure: type[BaseException]) -> pytest.MarkDecorator:
+    """Red until the review fix lands; `failure` is how each test fails before it (P2)."""
+    return pytest.mark.xfail(strict=True, reason="red:B2", raises=failure)
+
+
+@red(ValueError)
+@pytest.mark.spec("A2", "ARCH§6.3")
+def test_the_policy_refuses_a_purpose_it_doesnt_know() -> None:
+    with pytest.raises(PolicyError, match="peek"):
+        DataPolicy().check("peek", date(2016, 1, 4), date(2016, 1, 8))  # type: ignore[arg-type]
+
+
+@red(AttributeError)
+@pytest.mark.spec("AD2", "ARCH§9.1")
+def test_a_wal_switch_error_without_a_code_comes_through_as_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Failing(sqlite3.Connection):
+        def execute(self, sql: str, *args: object) -> sqlite3.Cursor:
+            if sql == "PRAGMA journal_mode=WAL":
+                raise sqlite3.OperationalError("disk I/O error")  # no SQLite error code on it
+            return super().execute(sql, *args)  # type: ignore[arg-type]
+
+    plain = sqlite3.connect
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k: plain(*a, factory=Failing, **k))
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        connect(tmp_path / "x.db")
