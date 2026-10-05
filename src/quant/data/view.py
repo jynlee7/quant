@@ -96,12 +96,12 @@ class PointInTimeView:
         conn: sqlite3.Connection,
         tau: datetime,
         *,
-        as_of: datetime | None = None,
+        as_of: datetime,
         policy: DataPolicy | None = None,
         ticket: ScoringTicket | None = None,
     ) -> None:
         self.tau = ensure_utc(tau)
-        self.as_of = ensure_utc(as_of) if as_of is not None else self.tau
+        self.as_of = ensure_utc(as_of)
         if self.as_of < self.tau:
             raise ClockError(
                 f"as_of {self.as_of.isoformat()} precedes tau {self.tau.isoformat()}; a view "
@@ -117,8 +117,8 @@ class PointInTimeView:
         self._policy.check(purpose, first, last, ticket=self._ticket)
 
     def _check_to_tau(self, purpose: Purpose, first: date) -> None:
-        """Check a read of bars, which ends at tau."""
-        last = _ny_date(self.tau)
+        """Check a read of bars, which reaches up to tau but not to it."""
+        last = _ny_date(self.tau - _US)
         self._check(purpose, min(first, last), last)
 
     def hourly(

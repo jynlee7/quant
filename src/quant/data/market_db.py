@@ -8,9 +8,9 @@ bars they fall in and recomputes their sessions' move flags, all in one transact
 says how it is known:
 
 - NOW stamps its rows from the store's clock, read under the write lock, so known_at orders
-  exactly with commits. A live view takes its as_of the same way (`view(tau, as_of=NOW)`), and
-  the store keeps the last stamp it issued, so each stamp comes after every earlier one even if
-  the clock steps back. A row is then known before a live view's as_of exactly when it was
+  exactly with commits. A live view takes its as_of the same way (`view(tau, as_of=NOW)`). The
+  store keeps the last stamp it used, on rows or a live view, and each stamp comes after it even
+  if the clock steps back. A row is then known before a live view's as_of exactly when it was
   committed before the view was stamped, and a replay at that as_of sees what live trading saw.
 - HISTORY, for a bulk load of the past, stamps each row known at its own available_at, and an
   action at the end of its declaration day. It only adds rows, and only rows known after the
@@ -117,7 +117,7 @@ MIGRATIONS: tuple[Migration, ...] = (
                 known_at INTEGER NOT NULL,
                 PRIMARY KEY (symbol, t, kind, version)
             ) WITHOUT ROWID""",
-            # The last NOW stamp the store issued, to a write or a live view.
+            # The last NOW stamp the store used, on rows or a live view.
             """CREATE TABLE high_water (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 stamp INTEGER NOT NULL
@@ -133,7 +133,7 @@ class Stamp(Enum):
 
 
 NOW: Final = Stamp.NOW
-"""Known now: by the store's clock under the write lock, after every stamp issued before."""
+"""Known now: by the store's clock under the write lock, after every stamp used before."""
 
 HISTORY: Final = Stamp.HISTORY
 """Known when it became available: for a bulk load of the past that live trading never read.
@@ -332,7 +332,7 @@ class BarStore:
         self, symbol: str, minutes: MinuteFrame, *, known_at: Stamp, source: str
     ) -> IngestSummary:
         """Store minutes, rebuild the hourly bars they fall in and recompute the move flags of
-        their sessions, in one transaction.
+        their sessions, in one transaction. Other sessions are left alone.
 
         A new minute, bar or flag becomes version 1, a changed one a new version, and an
         unchanged one is left alone, so ingesting the same data twice changes nothing. Bad
@@ -347,13 +347,12 @@ class BarStore:
         # Bars and flags are rebuilt from the latest stored version of every minute of the
         # sessions touched, with the new minutes laid over them, so a flag sees the stored
         # minutes on either side of the new ones.
-        start = to_us(self._calendar.session(touched[0].session).open)
-        end = to_us(self._calendar.session(touched[-1].session).close)
+        spans = self._spans({spec.session for spec in touched})
         # Stamp, read and write under one write lock: known_at orders with commits, and a
         # concurrent writer can't take the same version.
         with transaction(self._conn):
             stamping = self._stamping(known_at)
-            stored = self._latest_minutes(symbol, start, end)
+            stored = [row for a, b in spans for row in self._latest_minutes(symbol, a, b)]
             overlay = _overlay(stored, minutes)
             minute_rows, minute_summary = self._minute_versions(
                 symbol, minutes, stored, stamping, source
@@ -363,19 +362,32 @@ class BarStore:
                 for bar in build_hourly(self._calendar, overlay, self._timing)
                 if bar.t_open in affected
             ]
-            hourly_rows, hourly_summary = self._hourly_versions(
-                symbol, rebuilt, stamping, start, end
-            )
-            flag_rows, raised, cleared = self._flag_versions(symbol, overlay, stamping, start, end)
+            hourly_rows, hourly_summary = self._hourly_versions(symbol, rebuilt, stamping, spans)
+            flag_rows, raised, cleared = self._flag_versions(symbol, overlay, stamping, spans)
+            if minute_rows or hourly_rows or flag_rows:
+                self._use(stamping.now)
             self._conn.executemany(_INSERT_MINUTE, minute_rows)
             self._conn.executemany(_INSERT_HOURLY, hourly_rows)
             self._conn.executemany(_INSERT_FLAG, flag_rows)
         return IngestSummary(minute_summary, hourly_summary, raised, cleared)
 
+    def _spans(self, days: set[date]) -> list[tuple[int, int]]:
+        """[open, close) of each run of consecutive sessions among `days`, in time order."""
+        spans: list[tuple[int, int]] = []
+        previous: date | None = None
+        for day in sorted(days):
+            session = self._calendar.session(day)
+            if previous is not None and self._calendar.next_session(previous) == day:
+                spans[-1] = (spans[-1][0], to_us(session.close))
+            else:
+                spans.append((to_us(session.open), to_us(session.close)))
+            previous = day
+        return spans
+
     def _stamping(self, known_at: Stamp) -> _Stamping:
         """How a write is stamped; called under the write lock."""
         if known_at is NOW:
-            return _Stamping(now=self._stamp(), floor=None)
+            return _Stamping(now=self._next_stamp(), floor=None)
         if known_at is HISTORY:
             return _Stamping(now=None, floor=self._high_water())
         assert_never(known_at)
@@ -384,16 +396,20 @@ class BarStore:
         row = self._conn.execute("SELECT stamp FROM high_water").fetchone()
         return None if row is None else int(row[0])
 
-    def _stamp(self) -> int:
-        """A NOW stamp, under the write lock: the clock's reading, but after the last stamp."""
+    def _next_stamp(self) -> int:
+        """A NOW stamp, under the write lock: the clock's reading, but after the last stamp
+        used. It counts once `_use` records it, in the transaction that uses it."""
         if self._clock is None:
             raise ClockError("this store has no clock, so it can't stamp NOW")
         stamp = to_us(self._clock.now())
         last = self._high_water()
-        if last is not None:
-            stamp = max(stamp, last + 1)
-        self._conn.execute(_SET_HIGH_WATER, (stamp,))
-        return stamp
+        return stamp if last is None else max(stamp, last + 1)
+
+    def _use(self, stamp: int | None) -> None:
+        """Record a NOW stamp that stamped rows or a live view as the last one used. A stamp
+        that stamped nothing leaves history's floor where it was."""
+        if stamp is not None:
+            self._conn.execute(_SET_HIGH_WATER, (stamp,))
 
     def _available(self, t: int) -> int:
         """When the minute starting at `t` becomes available: its close plus the feed delay."""
@@ -441,15 +457,20 @@ class BarStore:
         return rows, WriteSummary(inserted, revised, unchanged)
 
     def _hourly_versions(
-        self, symbol: str, bars: list[HourlyBar], stamping: _Stamping, start: int, end: int
+        self,
+        symbol: str,
+        bars: list[HourlyBar],
+        stamping: _Stamping,
+        spans: list[tuple[int, int]],
     ) -> tuple[list[tuple[object, ...]], WriteSummary]:
         latest = {
             row[0]: (row[1], row[2], tuple(row[3:]))
+            for a, b in spans
             for row in self._conn.execute(
                 "SELECT t_open, MAX(version), known_at, session, slot, t_close, open, high, low,"
                 " close, volume, minutes, complete, available_at FROM hourly_bars"
                 " WHERE symbol = ? AND t_open >= ? AND t_open < ? GROUP BY t_open",
-                (symbol, start, end),
+                (symbol, a, b),
             )
         }
         rows: list[tuple[object, ...]] = []
@@ -472,17 +493,22 @@ class BarStore:
         return rows, WriteSummary(inserted, revised, unchanged)
 
     def _flag_versions(
-        self, symbol: str, overlay: MinuteFrame, stamping: _Stamping, start: int, end: int
+        self,
+        symbol: str,
+        overlay: MinuteFrame,
+        stamping: _Stamping,
+        spans: list[tuple[int, int]],
     ) -> tuple[list[tuple[object, ...]], tuple[DataFlag, ...], tuple[DataFlag, ...]]:
-        """New versions of the move flags of minutes in [start, end): raised where a move is
-        big and wasn't flagged so, cleared where a raised flag no longer holds."""
+        """New versions of the move flags of minutes in `spans`: raised where a move is big and
+        wasn't flagged so, cleared where a raised flag no longer holds."""
         computed = {to_us(flag.t): flag for flag in move_flags(self._calendar, overlay)}
         stored: dict[int, tuple[int, int, str, int]] = {
             row[0]: (row[1], row[2], row[3], row[4])
+            for a, b in spans
             for row in self._conn.execute(
                 "SELECT t, MAX(version), raised, detail, known_at FROM data_flags"
                 " WHERE symbol = ? AND kind = ? AND t >= ? AND t < ? GROUP BY t",
-                (symbol, MOVE_KIND, start, end),
+                (symbol, MOVE_KIND, a, b),
             )
         }
         rows: list[tuple[object, ...]] = []
@@ -530,6 +556,7 @@ class BarStore:
             else:
                 version, known = row[0] + 1, stamping.revision(what, row[1])
             self._conn.execute(insert, (symbol, ex_date.isoformat(), version, *values, known))
+            self._use(stamping.now)
 
     def put_dividend(
         self, symbol: str, *, ex_date: date, amount: float, declared: date, known_at: Stamp
@@ -563,16 +590,21 @@ class BarStore:
         self,
         tau: datetime,
         *,
-        as_of: datetime | Stamp | None = None,
+        as_of: datetime | Stamp,
         policy: DataPolicy | None = None,
         ticket: ScoringTicket | None = None,
     ) -> PointInTimeView:
-        """The data as it stood at decision time tau, in the versions known before as_of: tau in
-        the backtest, the recorded as_of in a replay, and NOW live, stamped like a write so it
-        orders with every commit."""
+        """The data as it stood at decision time tau, in the versions known before as_of. Every
+        view says what it knows: tau in a backtest, the recorded as_of in a replay, and NOW
+        live, stamped like a write so it orders with every commit."""
         if as_of is NOW:
             with transaction(self._conn):
-                as_of = from_us(self._stamp())
-        elif as_of is HISTORY:
+                stamp = self._next_stamp()
+                view = PointInTimeView(
+                    self._conn, tau, as_of=from_us(stamp), policy=policy, ticket=ticket
+                )
+                self._use(stamp)  # only once the view is valid
+            return view
+        if as_of is HISTORY:
             raise ValueError("a view's as_of is a time, or NOW for a live read")
         return PointInTimeView(self._conn, tau, as_of=as_of, policy=policy, ticket=ticket)

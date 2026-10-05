@@ -21,7 +21,7 @@ from quant.data.policy import DataPolicy, Purpose
 from quant.data.synthetic import synthetic_minutes
 from quant.data.validate import validate_minutes
 from quant.store import sqlite as store_sqlite
-from tests.support.bars import Ticket, store_with_days
+from tests.support.bars import Ticket, store_with_days, with_close
 
 DAY = date(2019, 7, 2)
 SYMBOL = "SPY"
@@ -34,7 +34,8 @@ def day_minutes() -> MinuteFrame:
 @pytest.mark.spec("A2", "ARCH§6.3")
 def test_every_read_must_name_its_purpose() -> None:
     store = BarStore.memory()
-    view = store.view(datetime(2019, 7, 3, tzinfo=UTC))
+    tau = datetime(2019, 7, 3, tzinfo=UTC)
+    view = store.view(tau, as_of=tau)
     for read in (
         lambda: view.hourly(SYMBOL),  # type: ignore[call-arg]
         lambda: view.minutes(
@@ -57,7 +58,7 @@ def test_a_live_ingest_records_when_it_was_known_and_rebuilds_the_hourly_bar() -
     assert (summary.minutes.inserted, summary.hourly.inserted) == (60, 1)
     tau = datetime(2019, 7, 2, 14, 46, tzinfo=UTC)
     assert (
-        store.view(tau).hourly(SYMBOL, purpose=Purpose.OPERATE) == []
+        store.view(tau, as_of=tau).hourly(SYMBOL, purpose=Purpose.OPERATE) == []
     )  # replay sees what live saw
     bar = store.view(tau, as_of=late + timedelta(seconds=1)).hourly(
         SYMBOL, purpose=Purpose.OPERATE
@@ -67,10 +68,11 @@ def test_a_live_ingest_records_when_it_was_known_and_rebuilds_the_hourly_bar() -
     # A revised last minute revises the hourly bar too, known at the same moment.
     settle = datetime(2019, 7, 2, 20, 45, tzinfo=UTC)
     clock.advance_to(settle)
-    revised = first_bar.with_close(59, float(first_bar.close[59]) + 0.05)
+    revised = with_close(first_bar, 59, float(first_bar.close[59]) + 0.05)
     again = store.ingest_minutes(SYMBOL, revised, known_at=market_db.NOW, source="settle")
     assert (again.minutes.revised, again.hourly.revised) == (1, 1)
-    later = store.view(settle + timedelta(seconds=1)).hourly(SYMBOL, purpose=Purpose.OPERATE)[0]
+    after = settle + timedelta(seconds=1)
+    later = store.view(after, as_of=after).hourly(SYMBOL, purpose=Purpose.OPERATE)[0]
     assert later.close == float(first_bar.close[59]) + 0.05
     assert later.version == 2
     assert later.known_at == settle
@@ -81,19 +83,20 @@ def test_history_is_stamped_on_purpose_and_revisions_must_move_forward() -> None
     minutes = day_minutes()
     store = BarStore.memory(clock=SimClock(minutes.at(0)))
     store.ingest_minutes(SYMBOL, minutes, known_at=market_db.HISTORY, source="backfill")
-    bar = store.view(datetime(2019, 7, 3, tzinfo=UTC)).hourly(SYMBOL, purpose=Purpose.OPERATE)[0]
+    next_day = datetime(2019, 7, 3, tzinfo=UTC)
+    bar = store.view(next_day, as_of=next_day).hourly(SYMBOL, purpose=Purpose.OPERATE)[0]
     assert bar.known_at == bar.available_at
     with pytest.raises(DataError):  # a revision can't claim to be history
         store.ingest_minutes(
             SYMBOL,
-            minutes.with_close(5, 1.0 + float(minutes.close[5])),
+            with_close(minutes, 5, 1.0 + float(minutes.close[5])),
             known_at=market_db.HISTORY,
             source="x",
         )
     with pytest.raises(DataError):  # nor known before the version it replaces: it's 09:30
         store.ingest_minutes(
             SYMBOL,
-            minutes.with_close(5, 1.0 + float(minutes.close[5])),
+            with_close(minutes, 5, 1.0 + float(minutes.close[5])),
             known_at=market_db.NOW,
             source="x",
         )
@@ -125,7 +128,7 @@ def test_two_writers_revising_the_same_minute_both_land(
         try:
             BarStore.open(path, clock=clock).ingest_minutes(
                 SYMBOL,
-                minutes.with_close(7, float(minutes.close[7]) + delta),
+                with_close(minutes, 7, float(minutes.close[7]) + delta),
                 known_at=market_db.NOW,
                 source="settle",
             )
@@ -292,7 +295,8 @@ def test_a_corporate_action_revision_must_be_known_after_the_version_it_replaces
     store.put_dividend(
         SYMBOL, ex_date=ex_date, amount=1.44, declared=declared, known_at=market_db.NOW
     )
-    view = store.view(corrected + timedelta(seconds=1))
+    after = corrected + timedelta(seconds=1)
+    view = store.view(after, as_of=after)
     assert view.dividends(SYMBOL, ex_date, ex_date, purpose=Purpose.OPERATE) == [(ex_date, 1.44)]
 
 
@@ -301,8 +305,11 @@ def test_a_view_scores_dev_only_with_a_ticket_that_covers_the_read() -> None:
     store = store_with_days(date(2019, 1, 2), date(2019, 1, 3))
     tau = datetime(2019, 1, 4, tzinfo=UTC)
     ticket = Ticket("t1", date(2019, 1, 1), date(2024, 12, 31))
-    assert len(store.view(tau, ticket=ticket).hourly(SYMBOL, purpose=Purpose.SCORE)) == 7 + 7
+    assert (
+        len(store.view(tau, as_of=tau, ticket=ticket).hourly(SYMBOL, purpose=Purpose.SCORE))
+        == 7 + 7
+    )
     short = Ticket("t2", date(2019, 1, 3), date(2024, 12, 31))
-    for view in (store.view(tau), store.view(tau, ticket=short)):
+    for view in (store.view(tau, as_of=tau), store.view(tau, as_of=tau, ticket=short)):
         with pytest.raises(PolicyError):
             view.hourly(SYMBOL, purpose=Purpose.SCORE)

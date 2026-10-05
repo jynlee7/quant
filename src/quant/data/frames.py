@@ -57,14 +57,6 @@ class MinuteFrame:
             self.volume[mask],
         )
 
-    def with_close(self, i: int, close: float) -> MinuteFrame:
-        """A copy with minute `i` closing at `close`, its high and low widened to fit."""
-        c, h, lo = self.close.copy(), self.high.copy(), self.low.copy()
-        c[i] = close
-        h[i] = max(h[i], close)
-        lo[i] = min(lo[i], close)
-        return MinuteFrame(self.t.copy(), self.open.copy(), h, lo, c, self.volume.copy())
-
     @classmethod
     def empty(cls) -> MinuteFrame:
         floats = np.empty(0, dtype=np.float64)

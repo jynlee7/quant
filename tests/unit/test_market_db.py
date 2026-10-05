@@ -15,6 +15,7 @@ from quant.data.market_db import HISTORY, MIGRATIONS, NOW, BarStore, WriteSummar
 from quant.data.policy import Purpose
 from quant.data.synthetic import synthetic_minutes
 from quant.store.sqlite import Migration, connect, migrate
+from tests.support.bars import with_close
 
 
 @pytest.mark.spec("AD2", "ARCH§9.1")
@@ -61,7 +62,7 @@ def test_writes_are_idempotent_and_revisions_keep_every_version() -> None:
     again = store.ingest_minutes("SPY", minutes, known_at=HISTORY, source="synthetic")
     assert (again.minutes, again.hourly) == (WriteSummary(0, 0, 390), WriteSummary(0, 0, 7))
 
-    changed = minutes.with_close(10, minutes.close[10] + 0.01)
+    changed = with_close(minutes, 10, minutes.close[10] + 0.01)
     revision = store.ingest_minutes("SPY", changed, known_at=NOW, source="settle")
     assert revision.minutes == WriteSummary(0, 1, 389)
     versions = store.versions("SPY", minutes.at(10))
@@ -82,12 +83,14 @@ def test_dividends_and_splits_are_point_in_time() -> None:
     )
     clock.advance(timedelta(hours=1))
     store.put_split("SPY", ex_date=date(2030, 1, 2), ratio=2.0, declared=declared, known_at=NOW)
-    before = store.view(announced)
-    after = store.view(announced + timedelta(microseconds=1))
+    just_after = announced + timedelta(microseconds=1)
+    before = store.view(announced, as_of=announced)
+    after = store.view(just_after, as_of=just_after)
     year = (date(2019, 1, 1), date(2019, 12, 31))
     assert before.dividends("SPY", *year, purpose=Purpose.OPERATE) == []
     assert after.dividends("SPY", *year, purpose=Purpose.OPERATE) == [(date(2019, 6, 21), 1.4354)]
-    later = store.view(clock.now() + timedelta(microseconds=1))
+    known = clock.now() + timedelta(microseconds=1)
+    later = store.view(known, as_of=known)
     assert later.splits("SPY", date(2030, 1, 1), date(2030, 12, 31), purpose=Purpose.OPERATE) == [
         (date(2030, 1, 2), 2.0)
     ]

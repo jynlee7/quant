@@ -51,11 +51,12 @@ def test_the_policy_refuses_to_score_or_report_on_the_lockbox() -> None:
 def test_the_view_enforces_the_policy_on_every_read() -> None:
     store = store_with_days(date(2024, 12, 30), date(2025, 1, 3))
     tau = datetime(2025, 1, 4, tzinfo=UTC)
-    view = store.view(tau)
+    view = store.view(tau, as_of=tau)
     assert len(view.hourly(SYMBOL, purpose=Purpose.OPERATE)) > 0
     with pytest.raises(LockboxError):
         view.hourly(SYMBOL, purpose=Purpose.SCORE)
     with pytest.raises(LockboxError):
         view.minutes(SYMBOL, datetime(2025, 1, 2, 14, tzinfo=UTC), tau, purpose=Purpose.SCORE)
-    dev_only = store.view(datetime(2024, 12, 31, 23, tzinfo=UTC), ticket=TRIAL)
+    dev_end = datetime(2024, 12, 31, 23, tzinfo=UTC)
+    dev_only = store.view(dev_end, as_of=dev_end, ticket=TRIAL)
     assert len(dev_only.hourly(SYMBOL, purpose=Purpose.SCORE)) == 7 + 7

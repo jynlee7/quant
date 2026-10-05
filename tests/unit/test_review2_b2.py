@@ -198,11 +198,13 @@ def test_a_backfilled_corporate_action_is_known_from_the_end_of_its_declaration_
     )
     midnight = datetime(2019, 6, 20, 4, tzinfo=UTC)  # the end of 2019-06-19 in New York
     june = (date(2019, 6, 1), date(2019, 6, 30))
-    assert store.view(midnight).dividends(SYMBOL, *june, purpose=OPERATE) == []
-    assert store.view(midnight + US).dividends(SYMBOL, *june, purpose=OPERATE) == [
+    after = midnight + US
+    assert store.view(midnight, as_of=midnight).dividends(SYMBOL, *june, purpose=OPERATE) == []
+    assert store.view(after, as_of=after).dividends(SYMBOL, *june, purpose=OPERATE) == [
         (ex_date, 1.4354)
     ]
-    later = store.view(datetime(2029, 12, 5, tzinfo=UTC))
+    december = datetime(2029, 12, 5, tzinfo=UTC)
+    later = store.view(december, as_of=december)
     assert later.splits(SYMBOL, date(2030, 1, 1), date(2030, 1, 31), purpose=OPERATE) == [
         (date(2030, 1, 2), 2.0)
     ]
@@ -246,10 +248,12 @@ def test_a_bounded_minute_read_is_checked_over_the_days_it_reads() -> None:
     store = store_with_days(date(2018, 12, 27), date(2018, 12, 28))
     start = datetime(2018, 12, 27, 14, 30, tzinfo=UTC)
     new_year = datetime(2019, 1, 1, 5, tzinfo=UTC)  # midnight in New York: DEV's first instant
-    in_lockbox = store.view(datetime(2025, 3, 3, 15, tzinfo=UTC))
+    march = datetime(2025, 3, 3, 15, tzinfo=UTC)
+    in_lockbox = store.view(march, as_of=march)
     assert len(in_lockbox.minutes(SYMBOL, start, new_year, purpose=Purpose.SCORE)) == 2 * 390
     # The end is exclusive, so this read stays in FIT and needs no trial ticket.
-    in_dev = store.view(datetime(2019, 1, 3, 15, tzinfo=UTC))
+    january = datetime(2019, 1, 3, 15, tzinfo=UTC)
+    in_dev = store.view(january, as_of=january)
     assert len(in_dev.minutes(SYMBOL, start, new_year, purpose=Purpose.SCORE)) == 2 * 390
     with pytest.raises(LockboxError):
         in_lockbox.minutes(SYMBOL, start, datetime(2025, 1, 3, tzinfo=UTC), purpose=Purpose.SCORE)
@@ -260,7 +264,8 @@ def test_a_bounded_minute_read_is_checked_over_the_days_it_reads() -> None:
 
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_a_negative_count_of_bars_is_refused() -> None:
-    view = store_with_days(DAY, DAY).view(datetime(2019, 7, 3, tzinfo=UTC))
+    next_day = datetime(2019, 7, 3, tzinfo=UTC)
+    view = store_with_days(DAY, DAY).view(next_day, as_of=next_day)
     with pytest.raises(ValueError, match="last"):
         view.hourly(SYMBOL, purpose=OPERATE, last=-1)
 

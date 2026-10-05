@@ -31,6 +31,15 @@ def store_with_days(
     return store
 
 
+def with_close(minutes: MinuteFrame, i: int, close: float) -> MinuteFrame:
+    """A copy with minute `i` closing at `close`, its high and low widened to fit."""
+    c, h, lo = minutes.close.copy(), minutes.high.copy(), minutes.low.copy()
+    c[i] = close
+    h[i] = max(h[i], close)
+    lo[i] = min(lo[i], close)
+    return MinuteFrame(minutes.t.copy(), minutes.open.copy(), h, lo, c, minutes.volume.copy())
+
+
 def revise_close(
     store: BarStore,
     clock: SimClock,
@@ -44,7 +53,7 @@ def revise_close(
     minute, known then, which rebuilds the bar. `clock` is the store's."""
     own = minutes.select((minutes.t >= to_us(bar.t_open)) & (minutes.t < to_us(bar.t_close)))
     last = len(own) - 1
-    revised = own.with_close(last, float(own.close[last]) + delta)
+    revised = with_close(own, last, float(own.close[last]) + delta)
     clock.advance_to(at)
     store.ingest_minutes(SYMBOL, revised, known_at=NOW, source="settle")
 

@@ -13,7 +13,7 @@ import pytest
 from quant.core.calendar import TradingCalendar
 from quant.core.clock import SimClock
 from quant.core.epoch import to_us
-from quant.core.errors import ClockError, DataError, LockboxError, PolicyError
+from quant.core.errors import ClockError, PolicyError
 from quant.data import market_db
 from quant.data.frames import MinuteFrame
 from quant.data.market_db import BarStore
@@ -25,18 +25,9 @@ NEW_YORK = ZoneInfo("America/New_York")
 TRIAL = Ticket("t1", date(2019, 1, 1), date(2024, 12, 31))
 
 
-def red(failure: type[BaseException]) -> pytest.MarkDecorator:
-    """Red until the review fix lands; `failure` is how each test fails before it (P2)."""
-    return pytest.mark.xfail(strict=True, reason="red:B2", raises=failure)
-
-
-DID_NOT_RAISE = pytest.fail.Exception
-
-
 # 1. A view says what it knows: tau in a backtest, the recorded as_of in a replay, NOW live.
 
 
-@red(DID_NOT_RAISE)
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_a_view_must_say_what_it_knows() -> None:
     store = store_with_days(date(2019, 7, 2), date(2019, 7, 2))
@@ -49,7 +40,6 @@ def test_a_view_must_say_what_it_knows() -> None:
 # 4. A read is checked over the days it can reach.
 
 
-@red(LockboxError)
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 def test_an_hourly_read_at_midnight_is_checked_over_the_days_before_it() -> None:
     store = store_with_days(date(2024, 12, 30), date(2024, 12, 31))
@@ -61,7 +51,6 @@ def test_an_hourly_read_at_midnight_is_checked_over_the_days_before_it() -> None
 # 5. An ingest reads and rebuilds only the sessions it touches.
 
 
-@red(AssertionError)
 @pytest.mark.spec("AD2", "ARCH§6.1", "ARCH§9.1")
 def test_an_ingest_reads_only_the_sessions_it_touches(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = SimClock(datetime(2019, 7, 8, tzinfo=UTC))
@@ -90,7 +79,6 @@ def test_an_ingest_reads_only_the_sessions_it_touches(monkeypatch: pytest.Monkey
 # 6. A purpose named by a string is checked as the purpose it names.
 
 
-@red(DID_NOT_RAISE)
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 def test_a_purpose_named_by_a_string_is_checked_the_same() -> None:
     policy = DataPolicy(Segments(lockbox_end=date(2026, 10, 20)))
@@ -103,7 +91,6 @@ def test_a_purpose_named_by_a_string_is_checked_the_same() -> None:
 # 8. A NOW stamp raises the history floor only when it stamps something.
 
 
-@red(DataError)
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_a_stamp_raises_the_history_floor_only_when_it_is_used() -> None:
     clock = SimClock(datetime(2019, 7, 5, tzinfo=UTC))
@@ -122,7 +109,6 @@ def test_a_stamp_raises_the_history_floor_only_when_it_is_used() -> None:
 # 9. The switch to WAL is retried on every kind of busy error.
 
 
-@red(sqlite3.OperationalError)
 @pytest.mark.spec("AD2", "ARCH§9.1")
 def test_connect_retries_a_wal_switch_refused_while_another_connection_recovers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
