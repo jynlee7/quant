@@ -2,6 +2,54 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B1 · Time, calendar and canonical data (done 2026-10-05, tag `b01-done`)
+
+**Built**
+
+- `core.clock`: the Clock port, with `WallClock` and `SimClock`. The simulated clock moves only forward and refuses naive datetimes. It is the only module that reads the wall clock (K6).
+- `core.calendar`: XNYS sessions from exchange_calendars, built once and cached, from 2015-12 to 2040. Bars are anchored at 09:30: hourly bars, then the final 30-minute bar as the CLOSE slot, on full and half days alike. Any other session shape raises `CalendarError`.
+- `core.schedule`: `Timing` (feed delay 15 min, decision delay 16 min). The decision delay must exceed the feed delay, and may not exceed it by more than the 30-minute CLOSE bar, or a decision would see the next bar (I1). `decision_schedule()` covers:
+  - tau for each bar;
+  - the last decision that can fill, which applies the overnight cap (A3);
+  - reduce-only decisions at or after the close, which execute at the next session's open.
+- `core.canonical`: sorted keys, shortest round-trip floats, UTC times written with Z, numpy scalars and float64 arrays. It refuses NaN and infinity in both directions, naive datetimes, float32, non-string keys, duplicate keys and bad UTF-8. `sha256_hex` hashes the canonical bytes.
+- `core.ids` (`decision_id` from tau), `core.model` (`StrictModel`: no unknown keys, no coercion, no NaN, frozen), and `core.errors` (the `QuantError` hierarchy).
+- `core.logs`: one redactor for structlog and stdlib loggers. It covers known values (environment plus `register_secret`), field names that look secret (camelCase, plurals), key-shaped strings (Alpaca, Anthropic, Telegram, bearer), and a last pass over the rendered line. Timestamps come from the Clock port.
+- Trace ids now include doc sections (`SPEC§2`, `ARCH§4.3`, `PLAN§5`) for requirements written as prose, in natural order.
+
+**Tests:** 55 new (154 fast in total). Highlights:
+
+- All 2,765 sessions from 2016 to 2026, including the 23 half days, build a valid schedule.
+- The named half days (2019-07-03, 2019-11-29, 2019-12-24) and both daylight-saving changes behave as specified.
+- A hypothesis property: each bar is available before its decision, and the next bar is not.
+- Canonical JSON round-trips and hashes the same whatever the key order.
+- Log redaction works through structlog, stdlib loggers and tracebacks.
+
+**Run times:** fast gate about 11 s (154 tests in 9 s).
+
+**Review** (code-review skill, high): 10 findings, 9 fixed, as red tests first and then fixes:
+
+1. A decision delay could reach the next bar.
+2. `1e400` loaded as infinity.
+3. A 0-d array raised TypeError.
+4. Bad UTF-8 raised UnicodeDecodeError.
+5. `decision_id` raised a plain ValueError.
+6. The calendar ended in 2027.
+7. Secret field names in camelCase, plural, `private_key` and `passphrase` were missed.
+8. Secrets learned after configuration weren't redacted.
+9. Log timestamps used the wall clock.
+
+The cut cosmetic item, trace sort order, was fixed too.
+
+Not fixed, with reasons:
+
+- **Double scrubbing of values** (event dict and rendered line). This is deliberate defense in depth: the rendered-line pass catches reprs and tracebacks the first pass can't see, and at a few lines per bar the cost is negligible.
+- **`canonical` repeats the naive-datetime check** that `clock.ensure_utc` has. It is kept so the error type stays `CanonicalJSONError`.
+
+**Deviations:** none from the docs. Section ids extend the trace rule in PLAN §2, and CLAUDE.md documents them.
+
+**Open items:** the settings loader (B6) must call `register_secret` for every key it reads from `.env`.
+
 ## B0 · Bootstrap and structural guards (done 2026-10-05, tag `b00-done`)
 
 **Built**

@@ -15,18 +15,10 @@ from quant.core import logs
 from quant.core.calendar import TradingCalendar
 from quant.core.canonical import canonical_dumps, canonical_loads
 from quant.core.clock import SimClock
-from quant.core.errors import CalendarError, CanonicalJSONError, ClockError, ConfigError
+from quant.core.errors import CanonicalJSONError, ClockError, ConfigError
 from quant.core.ids import decision_id
 from quant.core.schedule import Timing, decision_schedule
 from quant_check import trace
-
-
-def red(failure: type[BaseException]) -> pytest.MarkDecorator:
-    """Red until the review fix lands; `failure` is how each test fails before it (P2)."""
-    return pytest.mark.xfail(strict=True, reason="red:B1", raises=failure)
-
-
-DID_NOT_RAISE = pytest.fail.Exception
 
 
 @pytest.fixture
@@ -40,7 +32,6 @@ def stream() -> Iterator[io.StringIO]:
             root.removeHandler(handler)
 
 
-@red(DID_NOT_RAISE)
 @pytest.mark.spec("I1", "D2")
 def test_a_decision_delay_that_would_see_the_next_bar_is_refused() -> None:
     # The shortest gap between two bar closes is the 30-minute CLOSE bar, so the next bar becomes
@@ -51,7 +42,6 @@ def test_a_decision_delay_that_would_see_the_next_bar_is_refused() -> None:
             Timing(feed_delay=timedelta(minutes=15), decision_delay=timedelta(minutes=too_late))
 
 
-@red(DID_NOT_RAISE)
 @pytest.mark.spec("ARCH§4.3", "ARCH§14")
 @pytest.mark.parametrize("text", ["1e400", '{"x": -1e400}', "[1, 2e999]"])
 def test_loading_a_number_that_overflows_to_infinity_is_refused(text: str) -> None:
@@ -59,7 +49,6 @@ def test_loading_a_number_that_overflows_to_infinity_is_refused(text: str) -> No
         canonical_loads(text)
 
 
-@red(TypeError)
 @pytest.mark.spec("ARCH§4.3", "ARCH§14")
 def test_zero_dimensional_arrays_and_bad_bytes_raise_canonical_errors() -> None:
     assert canonical_dumps({"x": np.array(1.5)}) == b'{"x":1.5}'
@@ -70,14 +59,12 @@ def test_zero_dimensional_arrays_and_bad_bytes_raise_canonical_errors() -> None:
         canonical_loads(b"\xff")
 
 
-@red(ValueError)
 @pytest.mark.spec("ARCH§4.3")
 def test_a_decision_id_off_the_minute_is_a_clock_error() -> None:
     with pytest.raises(ClockError):
         decision_id(datetime(2019, 7, 2, 14, 46, 30, tzinfo=UTC))
 
 
-@red(CalendarError)
 @pytest.mark.spec("D1", "ARCH§5")
 def test_the_calendar_reaches_well_past_this_year() -> None:
     cal = TradingCalendar.xnys()
@@ -85,7 +72,6 @@ def test_the_calendar_reaches_well_past_this_year() -> None:
     assert decision_schedule(cal, date(2035, 12, 31))[-1].executes_at.date() == date(2036, 1, 2)
 
 
-@red(AssertionError)
 @pytest.mark.spec("I6")
 @pytest.mark.parametrize(
     "name",
@@ -118,7 +104,6 @@ def test_the_first_secret_field_names_stay_recognized(name: str) -> None:
     assert logs.is_secret_field(name)
 
 
-@red(NotImplementedError)
 @pytest.mark.spec("I6")
 def test_a_secret_registered_after_configuration_is_redacted(stream: io.StringIO) -> None:
     logs.configure_logging(stream=stream, secrets=[])
@@ -129,7 +114,6 @@ def test_a_secret_registered_after_configuration_is_redacted(stream: io.StringIO
     assert secret not in stream.getvalue()
 
 
-@red(TypeError)
 @pytest.mark.spec("K6", "ARCH§14")
 def test_log_timestamps_come_from_the_clock_port(stream: io.StringIO) -> None:
     tau = datetime(2019, 7, 2, 14, 46, tzinfo=UTC)
@@ -141,7 +125,6 @@ def test_log_timestamps_come_from_the_clock_port(stream: io.StringIO) -> None:
     assert all('"timestamp": "2019-07-02T14:46:00Z"' in line for line in lines)
 
 
-@red(NotImplementedError)
 @pytest.mark.spec("P2")
 def test_section_ids_sort_by_number() -> None:
     ids = ["ARCH§14", "ARCH§3", "ARCH§4.3", "K10", "K2", "ARCH§4"]

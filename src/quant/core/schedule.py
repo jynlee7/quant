@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-from quant.core.calendar import BarSpec, TradingCalendar
+from quant.core.calendar import CLOSE_BAR, BarSpec, TradingCalendar
 from quant.core.errors import ConfigError
 from quant.core.ids import decision_id
 
@@ -29,6 +29,13 @@ class Timing:
             raise ConfigError(
                 f"decision_delay {self.decision_delay} must exceed feed_delay {self.feed_delay}, "
                 "or a decision could not see the bar it is for"
+            )
+        # The shortest gap between two bar closes is the 30-minute CLOSE bar. Past this limit a
+        # decision would see the bar after its own (I1).
+        if self.decision_delay > self.feed_delay + CLOSE_BAR:
+            raise ConfigError(
+                f"decision_delay {self.decision_delay} is more than feed_delay + {CLOSE_BAR}, "
+                "so a decision would see the next bar"
             )
 
     def available_at(self, t_close: datetime) -> datetime:

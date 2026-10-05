@@ -48,6 +48,8 @@ def _normalize(value: Any, path: str) -> Any:
             value.dtype.kind == "f" and value.dtype != np.float64
         ):
             raise CanonicalJSONError(f"{path}: arrays of {value.dtype} have no canonical form")
+        if value.ndim == 0:
+            return _normalize(value[()], path)
         return [_normalize(item, f"{path}[{i}]") for i, item in enumerate(value.tolist())]
     if isinstance(value, datetime):
         if value.tzinfo is None or value.utcoffset() is None:
@@ -98,9 +100,26 @@ def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise CanonicalJSONError(f"{text} overflows float64")
+    return value
+
+
 def canonical_loads(data: bytes | str) -> Any:
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CanonicalJSONError(f"not UTF-8: {exc}") from exc
     try:
-        return json.loads(data, parse_constant=_refuse_constant, object_pairs_hook=_unique_keys)
+        return json.loads(
+            data,
+            parse_float=_finite_float,
+            parse_constant=_refuse_constant,
+            object_pairs_hook=_unique_keys,
+        )
     except json.JSONDecodeError as exc:
         raise CanonicalJSONError(f"not JSON: {exc}") from exc
 

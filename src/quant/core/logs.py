@@ -1,9 +1,12 @@
 """Structured logs that never carry a secret (I6).
 
-Every line passes a redactor that replaces known secret values (read from the environment),
-fields named like secrets, and strings shaped like keys. Standard-library loggers, such as
-httpx's, which prints request URLs, go through the same redactor. A last pass scrubs the
-rendered line itself, which catches secrets inside tracebacks and objects rendered by repr.
+Every line passes a redactor that replaces known secret values, fields named like secrets, and
+strings shaped like keys. Known values come from the environment when logging is configured and
+from register_secret afterwards, so a key read from `.env` later is still redacted.
+Standard-library loggers, such as httpx's, which prints request URLs, go through the same
+redactor. A last pass scrubs the rendered line itself, which catches secrets inside tracebacks
+and in objects rendered by repr; at a few lines per bar, scrubbing twice costs nothing that
+matters. Timestamps come from the Clock port (K6), so a replay's logs carry simulated time.
 """
 
 from __future__ import annotations
@@ -13,30 +16,31 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Iterable, Mapping
-from itertools import pairwise
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import structlog
+
+from quant.core.clock import Clock, WallClock
 
 REDACTED = "[REDACTED]"
 
 # Environment variables whose values are secrets (spec §10, .env.example).
 SECRET_ENV_VARS = ("ALPACA_API_KEY", "ALPACA_SECRET_KEY", "TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY")
 
-# Field names that hold secrets, matched word by word so `max_tokens` isn't caught by `token`.
-_SECRET_WORDS = frozenset(
-    {
-        "apikey",
-        "authorization",
-        "cookie",
-        "credential",
-        "credentials",
-        "passwd",
-        "password",
-        "secret",
-        "token",
-    }
+# Field names that hold secrets. A name is split into words (snake_case, kebab-case and camelCase
+# alike), plurals are made singular, and it counts as secret if a word is one of _SECRET_WORDS or
+# the words run together contain one of _SECRET_PARTS. Counts such as `max_tokens` are redacted
+# too: hiding a number costs less than leaking a token.
+_SECRET_WORDS = frozenset({"auth", "bearer", "cookie", "signature", "token"})
+_SECRET_PARTS = (
+    "apikey",
+    "authorization",
+    "credential",
+    "passphrase",
+    "passw",
+    "privatekey",
+    "secret",
 )
 
 # Strings shaped like the keys this project holds, redacted even when the value isn't known.
@@ -53,20 +57,36 @@ _KEY_SHAPES = (
 _MIN_SECRET_LENGTH = 8
 
 
+# Values registered after logging was configured, such as keys read from `.env`.
+_registered: set[str] = set()
+
+
+def _singular(word: str) -> str:
+    return word[:-1] if len(word) > 3 and word.endswith("s") and not word.endswith("ss") else word
+
+
 def is_secret_field(name: str) -> bool:
-    words = [w for w in re.split(r"[_\-.\s]+", name.lower()) if w]
-    return any(w in _SECRET_WORDS for w in words) or ("api", "key") in pairwise(words)
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    words = [_singular(w) for w in re.split(r"[_\-.\s]+", spaced.lower()) if w]
+    joined = "".join(words)
+    return any(w in _SECRET_WORDS for w in words) or any(part in joined for part in _SECRET_PARTS)
+
+
+def register_secret(value: str) -> None:
+    """Redact `value` from every log line from now on, such as a key read from `.env`."""
+    if len(value) >= _MIN_SECRET_LENGTH:
+        _registered.add(value)
 
 
 class Redactor:
     """A structlog processor that removes secrets from event dicts and rendered lines."""
 
     def __init__(self, secrets: Iterable[str]) -> None:
-        unique = {s for s in secrets if len(s) >= _MIN_SECRET_LENGTH}
-        self._secrets = sorted(unique, key=len, reverse=True)
+        self._own = frozenset(s for s in secrets if len(s) >= _MIN_SECRET_LENGTH)
 
     def scrub(self, text: str) -> str:
-        for secret in self._secrets:
+        # Longest first, so a secret containing another is replaced whole.
+        for secret in sorted(self._own | _registered, key=len, reverse=True):
             text = text.replace(secret, REDACTED)
         for shape in _KEY_SHAPES:
             text = shape.sub(REDACTED, text)
@@ -97,6 +117,14 @@ class Redactor:
         }
 
 
+def _stamp_from(clock: Clock) -> Callable[[Any, str, Any], Any]:
+    def stamp(logger: Any, method_name: str, event: Any) -> Any:
+        event["timestamp"] = clock.now().isoformat().replace("+00:00", "Z")
+        return event
+
+    return stamp
+
+
 class _RedactingHandler(logging.StreamHandler):  # type: ignore[type-arg]
     """The one handler configure_logging installs, so a second call replaces it."""
 
@@ -104,15 +132,21 @@ class _RedactingHandler(logging.StreamHandler):  # type: ignore[type-arg]
 
 
 def configure_logging(
-    *, level: str = "INFO", stream: io.TextIOBase | None = None, secrets: Iterable[str] = ()
+    *,
+    level: str = "INFO",
+    stream: io.TextIOBase | None = None,
+    secrets: Iterable[str] = (),
+    clock: Clock | None = None,
 ) -> Redactor:
     """Send structlog and standard-library logs, as JSON lines, through one redactor.
 
-    Known secrets are `secrets` plus the values of SECRET_ENV_VARS in the environment.
+    Known secrets are `secrets`, the values of SECRET_ENV_VARS in the environment, and anything
+    passed to register_secret, now or later. Timestamps come from `clock` (the wall clock by
+    default; the simulated clock in a backtest or replay).
     """
     known = [*secrets, *(value for name in SECRET_ENV_VARS if (value := os.environ.get(name)))]
     redactor = Redactor(known)
-    timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
+    timestamper = _stamp_from(clock or WallClock())
 
     structlog.configure(
         processors=[
@@ -152,8 +186,3 @@ def configure_logging(
     root.addHandler(handler)
     root.setLevel(level)
     return redactor
-
-
-def register_secret(value: str) -> None:
-    """Redact `value` from every log line from now on, such as a key read from `.env`."""
-    raise NotImplementedError("red:B1 review")

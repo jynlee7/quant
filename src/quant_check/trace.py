@@ -28,7 +28,7 @@ STEPS_FILE = "tests/steps.toml"
 # AD1, P1. Build steps (B0) and checkpoints (CP1) are not ids.
 _ID_ROW = re.compile(r"^\|\s*(AD\d+|T-NL\d+|[DAIGCKP]\d+)\b")
 _SECTION = re.compile(r"^#{2,3}\s+(\d+(?:\.\d+)?)\.?\s")
-_ID_SORT = re.compile(r"^([A-Z-]+?)(\d+)$")
+_ID_SORT = re.compile(r"^(\D+?)(\d+(?:\.\d+)*)$")
 
 
 def ids_in_docs(root: Path) -> frozenset[str] | None:
@@ -61,9 +61,12 @@ def step_claims(repo: Repo) -> dict[str, list[str]]:
     return {step: list(entry.get("covers", [])) for step, entry in steps.items()}
 
 
-def _id_key(cid: str) -> tuple[str, int]:
+def id_sort_key(cid: str) -> tuple[str, tuple[int, ...]]:
+    """Ids in reading order: K2 before K10, ARCH§4.3 before ARCH§14."""
     match = _ID_SORT.match(cid)
-    return (match.group(1), int(match.group(2))) if match else (cid, 0)
+    if not match:
+        return (cid, ())
+    return (match.group(1), tuple(int(part) for part in match.group(2).split(".")))
 
 
 def collect(repo: Repo) -> tuple[list[dict[str, Any]], str | None]:
@@ -111,7 +114,7 @@ def check_trace(repo: Repo) -> tuple[list[Finding], str]:
     known = known_ids(repo)
     findings = []
     current = {s for s in [repo.current_step()] if s}
-    steps = sorted(repo.done_steps() | repo.merging_steps() | current, key=_id_key)
+    steps = sorted(repo.done_steps() | repo.merging_steps() | current, key=id_sort_key)
     for step in steps:
         if step not in claims:
             findings.append(Finding("trace", step, f"{step} has no entry in {STEPS_FILE}"))
@@ -131,10 +134,10 @@ def check_trace(repo: Repo) -> tuple[list[Finding], str]:
         for cid in ids:
             claimed_by[cid].append(step)
     lines = ["Trace matrix: id, tests naming it (red ones marked), steps claiming it"]
-    for cid in sorted(set(by_id) | set(claimed_by), key=_id_key):
+    for cid in sorted(set(by_id) | set(claimed_by), key=id_sort_key):
         named = by_id.get(cid, [])
         steps_note = (
-            f"  claimed by {', '.join(sorted(claimed_by[cid], key=_id_key))}"
+            f"  claimed by {', '.join(sorted(claimed_by[cid], key=id_sort_key))}"
             if cid in claimed_by
             else ""
         )
@@ -144,7 +147,3 @@ def check_trace(repo: Repo) -> tuple[list[Finding], str]:
             red = f"  [red:{test['red']}]" if test["red"] else ""
             lines.append(f"          {test['nodeid']}{red}")
     return findings, "\n".join(lines)
-
-
-def id_sort_key(cid: str) -> tuple[str, tuple[float, ...]]:
-    raise NotImplementedError("red:B1 review")

@@ -23,9 +23,11 @@ HOUR_BAR = timedelta(hours=1)
 CLOSE_BAR = timedelta(minutes=30)
 FULL_DAY = timedelta(hours=6, minutes=30)
 
-# The span the calendar is built for: the 2016 history with a margin, through next year.
+# The span the calendar is built for: the 2016 history with a margin, and far enough ahead that
+# no running engine meets the end. Future holidays come from exchange_calendars' rules; the
+# engine cross-checks them against Alpaca's calendar every day (ARCHITECTURE §5).
 CALENDAR_START = date(2015, 12, 1)
-CALENDAR_END = date(2027, 12, 31)
+CALENDAR_END = date(2040, 12, 31)
 
 
 class Slot(StrEnum):
