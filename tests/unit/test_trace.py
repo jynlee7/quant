@@ -28,7 +28,6 @@ def test_every_claimed_id_is_known() -> None:
         assert set(ids) <= known, (step, set(ids) - known)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B1", raises=AssertionError)
 @pytest.mark.spec("P2")
 def test_section_references_are_ids_too() -> None:
     # Requirements written as prose (SPEC §2's data contract, ARCHITECTURE §5's schedule) have no

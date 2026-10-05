@@ -20,16 +20,20 @@ from quant_check.findings import Finding
 from quant_check.repo import Repo, gate_env
 
 DOCS = ("SPEC.md", "ARCHITECTURE.md", "PLAN.md")
+# Section references name requirements written as prose: SPEC§2, ARCH§4.3, PLAN§5.
+SECTION_PREFIX = {"SPEC.md": "SPEC§", "ARCHITECTURE.md": "ARCH§", "PLAN.md": "PLAN§"}
 STEPS_FILE = "tests/steps.toml"
 
 # An id is the first cell of a table row in the approved docs: D1, A1, I1, T-NL1, G1, C1, K1,
 # AD1, P1. Build steps (B0) and checkpoints (CP1) are not ids.
 _ID_ROW = re.compile(r"^\|\s*(AD\d+|T-NL\d+|[DAIGCKP]\d+)\b")
+_SECTION = re.compile(r"^#{2,3}\s+(\d+(?:\.\d+)?)\.?\s")
 _ID_SORT = re.compile(r"^([A-Z-]+?)(\d+)$")
 
 
 def ids_in_docs(root: Path) -> frozenset[str] | None:
-    """Every id defined in a table row of the docs, or None when the docs aren't there."""
+    """Every id the docs define, or None when the docs aren't there. An id is the first cell of a
+    table row (A1, K5, C11), or a numbered section heading (SPEC§2, ARCH§4.3, PLAN§5)."""
     docs = [root / "docs" / name for name in DOCS]
     if not all(path.exists() for path in docs):
         return None
@@ -38,11 +42,13 @@ def ids_in_docs(root: Path) -> frozenset[str] | None:
         for line in path.read_text().splitlines():
             if match := _ID_ROW.match(line):
                 found.add(match.group(1))
+            elif match := _SECTION.match(line):
+                found.add(SECTION_PREFIX[path.name] + match.group(1))
     return frozenset(found)
 
 
 def known_ids(repo: Repo) -> frozenset[str]:
-    """Every id defined in a table row of docs/SPEC.md, ARCHITECTURE.md or PLAN.md."""
+    """Every id defined in docs/SPEC.md, ARCHITECTURE.md or PLAN.md (see ids_in_docs)."""
     return ids_in_docs(repo.root) or frozenset()
 
 
