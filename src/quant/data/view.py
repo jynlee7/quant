@@ -5,6 +5,9 @@ latest version known strictly before as_of (known_at < as_of). In the backtest a
 Live, the engine ingests the bar at tau and reads the view just after, so as_of is that later
 moment; the decision record keeps it, and a replay sees exactly the same versions.
 
+Every read names its purpose, and DataPolicy checks it against the days read (ARCHITECTURE
+§6.3). A view that scores DEV carries the trial ticket that allows it (C11).
+
 The view hashes every row it hands out. The digest names the data a computation actually read,
 so caches keyed on it can't hide a lookahead behind a hit. Versions and known_at times are left
 out of the hash: two stores holding the same visible values give the same digest.
@@ -24,7 +27,7 @@ from quant.core.clock import ensure_utc
 from quant.core.epoch import from_us, to_us
 from quant.core.errors import ClockError
 from quant.data.frames import HourlyBar, MinuteFrame
-from quant.data.policy import DataPolicy, Purpose
+from quant.data.policy import DataPolicy, Purpose, ScoringTicket
 
 # Every query is a fixed string; values are bound parameters. Each picks the latest version of a
 # row known before as_of with a correlated MAX, an index lookup on the (symbol, time, version)
@@ -90,6 +93,7 @@ class PointInTimeView:
         *,
         as_of: datetime | None = None,
         policy: DataPolicy | None = None,
+        ticket: ScoringTicket | None = None,
     ) -> None:
         self.tau = ensure_utc(tau)
         self.as_of = ensure_utc(as_of) if as_of is not None else self.tau
@@ -100,20 +104,25 @@ class PointInTimeView:
             )
         self._conn = conn
         self._policy = policy or DataPolicy()
+        self._ticket = ticket
         self._params = {"tau": to_us(self.tau), "as_of": to_us(self.as_of)}
         self._hash = hashlib.sha256()
 
-    def _check(self, purpose: Purpose, first: date) -> None:
+    def _check(self, purpose: Purpose, first: date, last: date) -> None:
+        self._policy.check(purpose, first, last, ticket=self._ticket)
+
+    def _check_to_tau(self, purpose: Purpose, first: date) -> None:
+        """Check a read of bars, which ends at tau."""
         last = _ny_date(self.tau)
-        self._policy.check(purpose, min(first, last), last)
+        self._check(purpose, min(first, last), last)
 
     def hourly(
         self,
         symbol: str,
         *,
+        purpose: Purpose,
         since: datetime | None = None,
         last: int | None = None,
-        purpose: Purpose = Purpose.OPERATE,
     ) -> list[HourlyBar]:
         """Visible hourly bars in time order: all, those opening at or after `since`, or the
         latest `last`."""
@@ -152,16 +161,16 @@ class PointInTimeView:
             first = _ny_date(since)
         else:
             first = _ny_date(self.tau)
-        self._check(purpose, first)
+        self._check_to_tau(purpose, first)
         for row in rows:
             self._hash.update(canonical_dumps(["hourly", symbol, row[2], *row[4:11]]) + b"\n")
         return bars
 
     def minutes(
-        self, symbol: str, start: datetime, end: datetime, *, purpose: Purpose = Purpose.OPERATE
+        self, symbol: str, start: datetime, end: datetime, *, purpose: Purpose
     ) -> MinuteFrame:
         """Visible minutes starting in [start, end)."""
-        self._check(purpose, _ny_date(start))
+        self._check_to_tau(purpose, _ny_date(start))
         params = {**self._params, "symbol": symbol, "start": to_us(start), "end": to_us(end)}
         rows = self._conn.execute(_MINUTES, params).fetchall()
         if not rows:
@@ -183,7 +192,7 @@ class PointInTimeView:
     def _actions(
         self, table: str, symbol: str, start: date, end: date, purpose: Purpose
     ) -> list[tuple[date, float]]:
-        self._policy.check(purpose, start, end)
+        self._check(purpose, start, end)
         rows = self._conn.execute(
             _ACTIONS[table],
             {**self._params, "symbol": symbol, "start": start.isoformat(), "end": end.isoformat()},
@@ -193,13 +202,13 @@ class PointInTimeView:
         return found
 
     def dividends(
-        self, symbol: str, start: date, end: date, *, purpose: Purpose = Purpose.OPERATE
+        self, symbol: str, start: date, end: date, *, purpose: Purpose
     ) -> list[tuple[date, float]]:
         """(ex_date, amount per share) for dividends known before as_of."""
         return self._actions("dividends", symbol, start, end, purpose)
 
     def splits(
-        self, symbol: str, start: date, end: date, *, purpose: Purpose = Purpose.OPERATE
+        self, symbol: str, start: date, end: date, *, purpose: Purpose
     ) -> list[tuple[date, float]]:
         """(ex_date, ratio) for splits known before as_of."""
         return self._actions("splits", symbol, start, end, purpose)

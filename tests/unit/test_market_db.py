@@ -10,7 +10,8 @@ import pytest
 
 from quant.core.calendar import TradingCalendar
 from quant.core.errors import ConfigError
-from quant.data.market_db import MIGRATIONS, BarStore
+from quant.data.market_db import HISTORY, MIGRATIONS, BarStore, WriteSummary
+from quant.data.policy import Purpose
 from quant.data.synthetic import synthetic_minutes
 from quant.store.sqlite import Migration, connect, migrate
 
@@ -53,17 +54,18 @@ def test_writes_are_idempotent_and_revisions_keep_every_version() -> None:
     cal = TradingCalendar.xnys()
     minutes = synthetic_minutes(cal, date(2019, 7, 2), date(2019, 7, 2), seed=5)
     store = BarStore.memory()
-    first = store.put_minutes("SPY", minutes, source="synthetic")
-    assert (first.inserted, first.revised, first.unchanged) == (390, 0, 0)
-    again = store.put_minutes("SPY", minutes, source="synthetic")
-    assert (again.inserted, again.revised, again.unchanged) == (0, 0, 390)
+    first = store.ingest_minutes("SPY", minutes, known_at=HISTORY, source="synthetic")
+    assert (first.minutes, first.hourly) == (WriteSummary(390, 0, 0), WriteSummary(7, 0, 0))
+    again = store.ingest_minutes("SPY", minutes, known_at=HISTORY, source="synthetic")
+    assert (again.minutes, again.hourly) == (WriteSummary(0, 0, 390), WriteSummary(0, 0, 7))
 
     changed = minutes.with_close(10, minutes.close[10] + 0.01)
     known = datetime(2019, 7, 2, 22, 0, tzinfo=UTC)
-    revision = store.put_minutes("SPY", changed, source="settle", known_at=known)
-    assert (revision.inserted, revision.revised, revision.unchanged) == (0, 1, 389)
+    revision = store.ingest_minutes("SPY", changed, known_at=known, source="settle")
+    assert revision.minutes == WriteSummary(0, 1, 389)
     versions = store.versions("SPY", minutes.at(10))
     assert [v.version for v in versions] == [1, 2]
+    assert [v.source for v in versions] == ["synthetic", "settle"]
     assert versions[1].known_at == known
     assert versions[0].close == minutes.close[10]
 
@@ -76,8 +78,9 @@ def test_dividends_and_splits_are_point_in_time() -> None:
     store.put_split("SPY", ex_date=date(2030, 1, 2), ratio=2.0, known_at=announced)
     before = store.view(announced)
     after = store.view(announced + timedelta(microseconds=1))
-    assert before.dividends("SPY", date(2019, 1, 1), date(2019, 12, 31)) == []
-    assert after.dividends("SPY", date(2019, 1, 1), date(2019, 12, 31)) == [
-        (date(2019, 6, 21), 1.4354)
+    year = (date(2019, 1, 1), date(2019, 12, 31))
+    assert before.dividends("SPY", *year, purpose=Purpose.OPERATE) == []
+    assert after.dividends("SPY", *year, purpose=Purpose.OPERATE) == [(date(2019, 6, 21), 1.4354)]
+    assert after.splits("SPY", date(2030, 1, 1), date(2030, 12, 31), purpose=Purpose.OPERATE) == [
+        (date(2030, 1, 2), 2.0)
     ]
-    assert after.splits("SPY", date(2030, 1, 1), date(2030, 12, 31)) == [(date(2030, 1, 2), 2.0)]

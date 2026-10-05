@@ -3,11 +3,12 @@
 | Segment | Span | May be read to |
 |---|---|---|
 | FIT | 2016-01 to 2018-12 | operate, score, report |
-| DEV | 2019-01 to 2024-12 | operate, score, report |
+| DEV | 2019-01 to 2024-12 | operate, report; score only with a trial ticket that covers the read (C11) |
 | LOCKBOX | 2025-01 to the seal | operate only (features, the filter, refits: C1) |
 | FORWARD | after the seal | operate and report (parity, reports), never score |
 
-Only the go-live lockbox test may score the lockbox (B19); v1 has no way to.
+Only the go-live lockbox test may score the lockbox (B19); v1 has no way to. Days before the data
+starts can't be scored or reported, since no segment holds them.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import StrEnum
+from typing import Protocol
 
 from quant.core.errors import ConfigError, LockboxError, PolicyError
 
@@ -67,16 +69,39 @@ class Segments:
         return {s for s, (lo, hi) in self.spans().items() if lo <= last and first <= hi}
 
 
+class ScoringTicket(Protocol):
+    """What the policy reads from a `TrialTicket`: the trial, and the days it may score.
+
+    Only the trial ledger issues tickets (B10, K5); this is the shape the data layer accepts.
+    """
+
+    @property
+    def trial_id(self) -> str: ...
+
+    @property
+    def first_day(self) -> date: ...
+
+    @property
+    def last_day(self) -> date: ...
+
+
 @dataclass(frozen=True)
 class DataPolicy:
     segments: Segments = Segments()
 
-    def check(self, purpose: Purpose, first: date, last: date) -> None:
+    def check(
+        self, purpose: Purpose, first: date, last: date, *, ticket: ScoringTicket | None = None
+    ) -> None:
         """Raise unless `purpose` may read the days from `first` to `last`."""
         if last < first:
             raise PolicyError(f"empty span {first} to {last}")
         if purpose is Purpose.OPERATE:
             return  # market data may feed features, the filter and refits anywhere (C1)
+        if first < self.segments.fit_start:
+            raise PolicyError(
+                f"a {purpose} read of {first} to {last} starts before the data "
+                f"({self.segments.fit_start})"
+            )
         touched = self.segments.overlapping(first, last)
         if Segment.LOCKBOX in touched:
             seal = self.segments.lockbox_end or "the seal"
@@ -89,3 +114,16 @@ class DataPolicy:
                 f"a score read of {first} to {last} touches forward data, which is for parity "
                 "and reports only"
             )
+        if purpose is Purpose.SCORE and Segment.DEV in touched:
+            dev_first, dev_last = self.segments.spans()[Segment.DEV]
+            need = (max(first, dev_first), min(last, dev_last))
+            if ticket is None:
+                raise PolicyError(
+                    f"scoring {need[0]} to {need[1]} in DEV needs a trial ticket from the "
+                    "ledger (C11, A2)"
+                )
+            if not ticket.first_day <= need[0] <= need[1] <= ticket.last_day:
+                raise PolicyError(
+                    f"trial {ticket.trial_id} may score {ticket.first_day} to "
+                    f"{ticket.last_day}, not {need[0]} to {need[1]}"
+                )

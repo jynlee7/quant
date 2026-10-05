@@ -1,8 +1,10 @@
 """Checks on minute bars before they are stored (ARCHITECTURE §6.1).
 
 Bad data is refused: prices out of order, non-positive or non-finite, negative volume, duplicate
-or unsorted minutes, minutes off the minute or outside a session. A one-minute move over 5% is
-kept but flagged, because it can be real (it is used, and it raises an alert).
+or unsorted minutes, minutes off the minute or outside a session. A move over 5% from one minute's
+close to the next is kept but flagged, because it can be real (it is used, and it raises an
+alert). The next minute is the next one present in the same session, so a missing minute can't
+hide a jump; the overnight gap isn't a one-minute move.
 """
 
 from __future__ import annotations
@@ -72,9 +74,13 @@ def validate_minutes(calendar: TradingCalendar, minutes: MinuteFrame) -> list[Da
     inside = (k >= 0) & (t < closes[np.clip(k, 0, None)])
     _fail_where(~inside, t, "outside regular trading hours")
 
-    consecutive = step == MINUTE_US
+    same_session = k[1:] == k[:-1]
     moves = np.abs(c[1:] / c[:-1] - 1.0) > MOVE_FLAG
     return [
-        DataFlag(from_us(int(t[i])), "move_over_5pct", f"close {c[i - 1]} -> {c[i]}")
-        for i in (np.flatnonzero(consecutive & moves) + 1).tolist()
+        DataFlag(
+            from_us(int(t[i])),
+            "move_over_5pct",
+            f"close {c[i - 1]} -> {c[i]} over {(t[i] - t[i - 1]) // MINUTE_US} min",
+        )
+        for i in (np.flatnonzero(same_session & moves) + 1).tolist()
     ]
