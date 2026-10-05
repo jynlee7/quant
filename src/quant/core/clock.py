@@ -6,8 +6,11 @@ never knows which it runs on. Inside the code every time is a timezone-aware UTC
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
+
+from quant.core.errors import ClockError
 
 
 class Clock(Protocol):
@@ -22,33 +25,42 @@ class Clock(Protocol):
 
 def ensure_utc(value: datetime) -> datetime:
     """`value` in UTC. Naive datetimes are refused: their meaning depends on the machine."""
-    raise NotImplementedError("red:B1")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ClockError(f"naive datetime {value.isoformat()}; times must carry a timezone")
+    return value.astimezone(UTC)
 
 
 class WallClock:
     """Real time, for live trading."""
 
     def now(self) -> datetime:
-        raise NotImplementedError("red:B1")
+        return datetime.now(UTC)
 
     def sleep_until(self, when: datetime) -> None:
-        raise NotImplementedError("red:B1")
+        delay = (ensure_utc(when) - self.now()).total_seconds()
+        if delay > 0:
+            time.sleep(delay)
 
 
 class SimClock:
     """Simulated time, for the backtest and replays. It moves only when told, never backwards."""
 
     def __init__(self, start: datetime) -> None:
-        raise NotImplementedError("red:B1")
+        self._now = ensure_utc(start)
 
     def now(self) -> datetime:
-        raise NotImplementedError("red:B1")
+        return self._now
 
     def advance_to(self, when: datetime) -> None:
-        raise NotImplementedError("red:B1")
+        when = ensure_utc(when)
+        if when < self._now:
+            raise ClockError(
+                f"simulated time can't go back from {self._now.isoformat()} to {when.isoformat()}"
+            )
+        self._now = when
 
     def advance(self, delta: timedelta) -> None:
-        raise NotImplementedError("red:B1")
+        self.advance_to(self._now + delta)
 
     def sleep_until(self, when: datetime) -> None:
-        raise NotImplementedError("red:B1")
+        self.advance_to(when)

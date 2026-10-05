@@ -13,8 +13,6 @@ from quant.core.ids import decision_id
 from quant.core.model import StrictModel
 from quant.core.schedule import decision_schedule
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B1", raises=NotImplementedError)
-
 
 class Example(StrictModel):
     name: str

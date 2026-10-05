@@ -7,9 +7,25 @@ slot-normalized features (F1, F3, F4) compare like with like.
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
+from functools import cache
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from quant.core.errors import CalendarError
+
+NEW_YORK = ZoneInfo("America/New_York")
+OPEN_ET = time(9, 30)
+HOUR_BAR = timedelta(hours=1)
+CLOSE_BAR = timedelta(minutes=30)
+FULL_DAY = timedelta(hours=6, minutes=30)
+
+# The span the calendar is built for: the 2016 history with a margin, through next year.
+CALENDAR_START = date(2015, 12, 1)
+CALENDAR_END = date(2027, 12, 31)
 
 
 class Slot(StrEnum):
@@ -44,27 +60,96 @@ class Session:
 
     @property
     def is_half_day(self) -> bool:
-        raise NotImplementedError("red:B1")
+        return self.close - self.open < FULL_DAY
+
+
+def _bars(day: date, open_utc: datetime, close_utc: datetime) -> tuple[BarSpec, ...]:
+    """Hourly bars from the open, then the 30-minute CLOSE bar. Any other shape is an error,
+    because the features assume it: an unknown session must not be traded as if it were known."""
+    if open_utc.astimezone(NEW_YORK).time() != OPEN_ET:
+        raise CalendarError(f"{day} opens at {open_utc.astimezone(NEW_YORK):%H:%M} ET, not 09:30")
+    hours, rest = divmod(close_utc - open_utc, HOUR_BAR)
+    if rest != CLOSE_BAR or hours < 1:
+        raise CalendarError(
+            f"{day} lasts {close_utc - open_utc}, which isn't whole hours plus a 30-minute close"
+        )
+    bars = []
+    for index in range(hours):
+        t_open = open_utc + index * HOUR_BAR
+        slot = Slot(f"{t_open.astimezone(NEW_YORK):%H:%M}")
+        bars.append(BarSpec(day, index, slot, t_open, t_open + HOUR_BAR))
+    last_open = open_utc + hours * HOUR_BAR
+    bars.append(BarSpec(day, hours, Slot.CLOSE, last_open, close_utc))
+    return tuple(bars)
+
+
+def _utc(timestamp: Any) -> datetime:
+    """A pandas Timestamp from exchange_calendars as a plain UTC datetime."""
+    value: datetime = timestamp.to_pydatetime()
+    return value.astimezone(UTC)
 
 
 class TradingCalendar:
     """Sessions of one exchange, built once from exchange_calendars."""
 
+    def __init__(self, opens_closes: dict[date, tuple[datetime, datetime]]) -> None:
+        self._hours = opens_closes
+        self._days = sorted(opens_closes)
+        self._sessions: dict[date, Session] = {}
+
     @classmethod
     def xnys(cls) -> TradingCalendar:
         """The NYSE calendar, shared by every caller."""
-        raise NotImplementedError("red:B1")
+        return _xnys()
+
+    @classmethod
+    def from_exchange_calendar(cls, calendar: Any) -> TradingCalendar:
+        hours = {
+            row.Index.date(): (_utc(row.open), _utc(row.close))
+            for row in calendar.schedule.itertuples()
+        }
+        return cls(hours)
+
+    def _check_range(self, day: date) -> None:
+        if not CALENDAR_START <= day <= CALENDAR_END:
+            raise CalendarError(
+                f"{day} is outside the calendar ({CALENDAR_START} to {CALENDAR_END})"
+            )
 
     def is_session(self, day: date) -> bool:
-        raise NotImplementedError("red:B1")
+        self._check_range(day)
+        return day in self._hours
 
     def sessions(self, start: date, end: date) -> list[date]:
         """Sessions from `start` to `end`, both included."""
-        raise NotImplementedError("red:B1")
+        self._check_range(start)
+        self._check_range(end)
+        lo = bisect.bisect_left(self._days, start)
+        hi = bisect.bisect_right(self._days, end)
+        return self._days[lo:hi]
 
     def session(self, day: date) -> Session:
-        raise NotImplementedError("red:B1")
+        if not self.is_session(day):
+            raise CalendarError(f"{day} is not a trading session")
+        if day not in self._sessions:
+            open_utc, close_utc = self._hours[day]
+            self._sessions[day] = Session(day, open_utc, close_utc, _bars(day, open_utc, close_utc))
+        return self._sessions[day]
 
     def next_session(self, day: date) -> date:
         """The first session after `day`."""
-        raise NotImplementedError("red:B1")
+        self._check_range(day)
+        index = bisect.bisect_right(self._days, day)
+        if index == len(self._days):
+            raise CalendarError(f"no session after {day} before {CALENDAR_END}")
+        return self._days[index]
+
+
+@cache
+def _xnys() -> TradingCalendar:
+    import exchange_calendars
+
+    calendar = exchange_calendars.get_calendar(
+        "XNYS", start=CALENDAR_START.isoformat(), end=CALENDAR_END.isoformat()
+    )
+    return TradingCalendar.from_exchange_calendar(calendar)

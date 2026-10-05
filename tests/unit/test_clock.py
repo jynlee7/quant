@@ -9,8 +9,6 @@ import pytest
 from quant.core.clock import SimClock, WallClock, ensure_utc
 from quant.core.errors import ClockError
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B1", raises=NotImplementedError)
-
 START = datetime(2019, 7, 2, 14, 46, tzinfo=UTC)
 
 

@@ -15,8 +15,6 @@ from hypothesis import strategies as st
 from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
 from quant.core.errors import CanonicalJSONError
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B1", raises=NotImplementedError)
-
 json_values = st.recursive(
     st.none()
     | st.booleans()

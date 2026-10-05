@@ -11,8 +11,6 @@ from quant.core.calendar import Slot, TradingCalendar
 from quant.core.errors import ConfigError
 from quant.core.schedule import Timing, decision_schedule
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B1", raises=NotImplementedError)
-
 NY = ZoneInfo("America/New_York")
 
 

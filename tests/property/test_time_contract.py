@@ -12,8 +12,6 @@ from hypothesis import strategies as st
 from quant.core.calendar import TradingCalendar
 from quant.core.schedule import Timing, decision_schedule
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B1", raises=NotImplementedError)
-
 
 @pytest.mark.spec("I1", "D2", "SPEC§2")
 @given(day=st.dates(min_value=date(2016, 1, 4), max_value=date(2026, 12, 31)))

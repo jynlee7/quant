@@ -12,8 +12,6 @@ import structlog
 
 from quant.core.logs import REDACTED, configure_logging
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B1", raises=NotImplementedError)
-
 
 @pytest.fixture
 def stream() -> Iterator[io.StringIO]:
