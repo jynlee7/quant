@@ -98,7 +98,12 @@ class DataPolicy:
         self, purpose: Purpose, first: date, last: date, *, ticket: ScoringTicket | None = None
     ) -> None:
         """Raise unless `purpose` may read the days from `first` to `last`."""
-        purpose = Purpose(purpose)  # "score" is Purpose.SCORE; anything unknown raises
+        try:
+            purpose = Purpose(purpose)  # the string "score" names Purpose.SCORE
+        except ValueError:
+            raise PolicyError(
+                f"{purpose!r} is no purpose the policy knows; it may read nothing"
+            ) from None
         if last < first:
             raise PolicyError(f"empty span {first} to {last}")
         if purpose is Purpose.OPERATE:

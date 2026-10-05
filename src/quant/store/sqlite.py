@@ -59,7 +59,8 @@ def _switch_to_wal(conn: sqlite3.Connection) -> str:
         try:
             return str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0])
         except sqlite3.OperationalError as exc:
-            if (exc.sqlite_errorcode & 0xFF) != sqlite3.SQLITE_BUSY:  # busy, of any kind
+            code = getattr(exc, "sqlite_errorcode", None)  # absent unless SQLite raised it
+            if code is None or (code & 0xFF) != sqlite3.SQLITE_BUSY:  # busy, of any kind
                 raise
             time.sleep(_WAL_PAUSE)
     return str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0])

@@ -22,6 +22,8 @@ A revision is known NOW, after the version it replaces.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from enum import Enum
@@ -223,18 +225,27 @@ class MinuteVersion:
     volume: float
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Stamping:
     """How one write stamps known_at: every row with NOW's stamp, or under HISTORY each row with
-    its own time, after the store's last stamp."""
+    its own time, after the store's last stamp. A NOW stamp handed out is used, and the write
+    records it as the store's last stamp (`BarStore._write`)."""
 
     now: int | None
     floor: int | None
+    used: bool = False
+
+    def stamp(self) -> int:
+        """The NOW stamp, handed out and so used."""
+        if self.now is None:
+            raise DataError("a history write has no stamp of its own")
+        self.used = True
+        return self.now
 
     def new(self, available: int) -> int:
         """known_at for the first version of a row, which became available at `available`."""
         if self.now is not None:
-            return self.now
+            return self.stamp()
         if self.floor is not None and available <= self.floor:
             raise DataError(
                 f"history known at {from_us(available).isoformat()} comes at or before the "
@@ -256,7 +267,7 @@ class _Stamping:
                 f"{what}: a revision known at {from_us(self.now).isoformat()} must be known "
                 f"after the version it replaces ({from_us(replaced).isoformat()})"
             )
-        return self.now
+        return self.stamp()
 
 
 def _hourly_values(bar: HourlyBar) -> tuple[object, ...]:
@@ -350,8 +361,7 @@ class BarStore:
         spans = self._spans({spec.session for spec in touched})
         # Stamp, read and write under one write lock: known_at orders with commits, and a
         # concurrent writer can't take the same version.
-        with transaction(self._conn):
-            stamping = self._stamping(known_at)
+        with self._write(known_at) as stamping:
             stored = [row for a, b in spans for row in self._latest_minutes(symbol, a, b)]
             overlay = _overlay(stored, minutes)
             minute_rows, minute_summary = self._minute_versions(
@@ -364,8 +374,6 @@ class BarStore:
             ]
             hourly_rows, hourly_summary = self._hourly_versions(symbol, rebuilt, stamping, spans)
             flag_rows, raised, cleared = self._flag_versions(symbol, overlay, stamping, spans)
-            if minute_rows or hourly_rows or flag_rows:
-                self._use(stamping.now)
             self._conn.executemany(_INSERT_MINUTE, minute_rows)
             self._conn.executemany(_INSERT_HOURLY, hourly_rows)
             self._conn.executemany(_INSERT_FLAG, flag_rows)
@@ -384,6 +392,17 @@ class BarStore:
             previous = day
         return spans
 
+    @contextmanager
+    def _write(self, known_at: Stamp) -> Iterator[_Stamping]:
+        """A write transaction, stamped as `known_at` says. A NOW stamp handed out to rows or a
+        live view becomes the store's last stamp as the transaction commits; one that stamped
+        nothing leaves history's floor where it was."""
+        with transaction(self._conn):
+            stamping = self._stamping(known_at)
+            yield stamping
+            if stamping.used:
+                self._conn.execute(_SET_HIGH_WATER, (stamping.now,))
+
     def _stamping(self, known_at: Stamp) -> _Stamping:
         """How a write is stamped; called under the write lock."""
         if known_at is NOW:
@@ -398,18 +417,12 @@ class BarStore:
 
     def _next_stamp(self) -> int:
         """A NOW stamp, under the write lock: the clock's reading, but after the last stamp
-        used. It counts once `_use` records it, in the transaction that uses it."""
+        used."""
         if self._clock is None:
             raise ClockError("this store has no clock, so it can't stamp NOW")
         stamp = to_us(self._clock.now())
         last = self._high_water()
         return stamp if last is None else max(stamp, last + 1)
-
-    def _use(self, stamp: int | None) -> None:
-        """Record a NOW stamp that stamped rows or a live view as the last one used. A stamp
-        that stamped nothing leaves history's floor where it was."""
-        if stamp is not None:
-            self._conn.execute(_SET_HIGH_WATER, (stamp,))
 
     def _available(self, t: int) -> int:
         """When the minute starting at `t` becomes available: its close plus the feed delay."""
@@ -546,8 +559,7 @@ class BarStore:
             raise DataError(f"{what}: declared on {declared}, after its ex-date")
         latest, insert = _ACTION_SQL[table]
         values = (value, declared.isoformat())
-        with transaction(self._conn):
-            stamping = self._stamping(known_at)
+        with self._write(known_at) as stamping:
             row = self._conn.execute(latest, (symbol, ex_date.isoformat())).fetchone()
             if row is None:
                 version, known = 1, stamping.new(_end_of_day(declared))
@@ -556,7 +568,6 @@ class BarStore:
             else:
                 version, known = row[0] + 1, stamping.revision(what, row[1])
             self._conn.execute(insert, (symbol, ex_date.isoformat(), version, *values, known))
-            self._use(stamping.now)
 
     def put_dividend(
         self, symbol: str, *, ex_date: date, amount: float, declared: date, known_at: Stamp
@@ -598,12 +609,9 @@ class BarStore:
         view says what it knows: tau in a backtest, the recorded as_of in a replay, and NOW
         live, stamped like a write so it orders with every commit."""
         if as_of is NOW:
-            with transaction(self._conn):
-                stamp = self._next_stamp()
-                view = PointInTimeView(
-                    self._conn, tau, as_of=from_us(stamp), policy=policy, ticket=ticket
-                )
-                self._use(stamp)  # only once the view is valid
+            with self._write(NOW) as stamping:  # a view refused for preceding tau stamps nothing
+                as_of = from_us(stamping.stamp())
+                view = PointInTimeView(self._conn, tau, as_of=as_of, policy=policy, ticket=ticket)
             return view
         if as_of is HISTORY:
             raise ValueError("a view's as_of is a time, or NOW for a live read")
