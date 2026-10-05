@@ -8,8 +8,6 @@ from quant_check import trace
 from quant_check.repo import Repo
 from tests.support.planted import REPO
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B0", raises=NotImplementedError)
-
 
 @pytest.mark.spec("P2")
 def test_known_ids_are_the_ids_defined_in_the_docs() -> None:

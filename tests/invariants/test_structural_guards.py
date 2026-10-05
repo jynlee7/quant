@@ -10,9 +10,6 @@ import pytest
 
 from tests.support.planted import PlantedRepo, fake_secret_line
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B0", raises=NotImplementedError)
-
-
 # --- K1–K4 and P11: import rules -----------------------------------------------------------
 
 
@@ -31,7 +28,11 @@ def test_k2_llm_importing_execution_is_caught(planted: PlantedRepo) -> None:
 
 
 @pytest.mark.spec("K3", "I2", "P3")
-@pytest.mark.parametrize("line", ["import hmmlearn.hmm\n", "from quant.eval import smoother\n"])
+@pytest.mark.parametrize(
+    "line",
+    ["import hmmlearn.hmm\n", "from quant.eval import smoother\n"],
+    ids=["hmmlearn", "eval"],
+)
 def test_k3_decide_importing_hmmlearn_or_eval_is_caught(planted: PlantedRepo, line: str) -> None:
     planted.write("src/quant/decide/leak.py", line)
     result = planted.run_gate("--only", "imports")

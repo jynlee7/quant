@@ -1,5 +1,24 @@
 #!/bin/sh
 # Runs the fast build gate before every commit (ARCHITECTURE §13, PLAN §2).
+# Installed with: git config core.hooksPath .githooks   (quant-check fails if it isn't)
+#
+# The gate checks the working tree, so the working tree must be exactly what gets committed:
+# no unstaged edits and no untracked files. Stage everything, or stash what isn't ready.
 set -eu
 root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+if ! git diff --quiet; then
+    echo "pre-commit: unstaged changes; the gate would check something other than this commit." >&2
+    echo "            Stage them (git add) or set them aside (git stash --keep-index) first." >&2
+    exit 1
+fi
+untracked="$(git ls-files --others --exclude-standard)"
+if [ -n "$untracked" ]; then
+    echo "pre-commit: untracked files; add them or ignore them first:" >&2
+    echo "$untracked" | sed 's/^/            /' >&2
+    exit 1
+fi
+
+# Hooks and services call the project's own Python, never `uv run` (PLAN B0).
 exec "${QUANT_CHECK:-$root/.venv/bin/quant-check}"

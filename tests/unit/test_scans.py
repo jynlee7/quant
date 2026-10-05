@@ -10,8 +10,6 @@ import pytest
 
 from quant_check import scans
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B0", raises=NotImplementedError)
-
 # --- K6: the wall clock is read only in quant.core.clock ------------------------------------
 
 K6_CAUGHT = {

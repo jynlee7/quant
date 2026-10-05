@@ -6,8 +6,6 @@ import pytest
 
 from tests.support.planted import PlantedRepo, fake_secret_line
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B0", raises=NotImplementedError)
-
 RED_TEST_THAT_PASSES = """\
 import pytest
 
