@@ -1,0 +1,108 @@
+[project]
+name = "quant"
+version = "0.0.0"
+description = "SPY regime trader: a Gaussian HMM reads the regime, deterministic code trades Alpaca paper"
+readme = "docs/SPEC.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "alpaca-py",
+    "anthropic",
+    "exchange-calendars",
+    "fastapi",
+    "hmmlearn==0.3.3",
+    "httpx",
+    "jinja2",
+    "numpy>=2.4,<2.5",  # hmmlearn 0.3.3 sets ndarray.shape, which NumPy 2.5 deprecates
+    "pandas",
+    "pydantic>=2",
+    "pyyaml",
+    "scikit-learn",
+    "scipy",
+    "statsmodels",
+    "structlog",
+    "typer",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis",
+    "import-linter",
+    "mypy",
+    "pandas-stubs",
+    "pytest",
+    "ruff",
+    "scipy-stubs",
+    "types-pyyaml",
+]
+
+[project.scripts]
+quant-check = "quant_check.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quant", "src/quant_check"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",  # pycodestyle, pyflakes
+    "I",            # import order
+    "B",            # bugbear
+    "UP",           # pyupgrade
+    "SIM", "PIE",   # simplifications
+    "RUF",
+    "N",            # naming
+    "DTZ",          # timezone-aware datetimes only (UTC inside the code, ARCHITECTURE §5)
+    "S",            # bandit subset: no pickle, no eval, no asserts in src
+    "PT",           # pytest style
+    "T20",          # no print in src
+    "PGH",          # no blanket type: ignore / noqa
+]
+# Ranges are written with en dashes in the docs (K1–K4), and in the code that quotes them.
+allowed-confusables = ["–", "×"]
+ignore = [
+    "E501",         # the formatter owns line length
+    "S603", "S607", # subprocess with fixed argument lists is how the tools run
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311", "T20"]
+"src/quant_check/**" = ["T20"]
+"spikes/**" = ["T20", "S101"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["quant", "quant_check"]
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "alpaca.*",
+    "exchange_calendars.*",
+    "hmmlearn.*",
+    "importlinter.*",
+    "sklearn.*",
+    "statsmodels.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-p", "quant_check.pytest_plugin", "--strict-markers", "--strict-config", "-ra"]
+xfail_strict = true
+filterwarnings = ["error"]

@@ -1,0 +1,7 @@
+# The ids each build step claims to cover (PLAN §4 "Covers").
+# `quant-check --trace` joins these claims with the ids tests name in @pytest.mark.spec, and a
+# step can't merge while one of its claimed ids has no green test. Each step adds its own entry
+# in its red commit. Ids are those defined in the tables of SPEC, ARCHITECTURE and PLAN.
+
+[steps.B0]
+covers = ["K1", "K2", "K3", "K4", "K5", "K6", "I2", "I3", "I4", "I6", "P2", "P3", "P4", "P11"]

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Runs the fast build gate before every commit (ARCHITECTURE §13, PLAN §2).
+set -eu
+root="$(git rev-parse --show-toplevel)"
+exec "${QUANT_CHECK:-$root/.venv/bin/quant-check}"

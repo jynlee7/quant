@@ -1,0 +1,1 @@
+"""The `quant` command."""

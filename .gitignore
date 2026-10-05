@@ -1,0 +1,24 @@
+# Secrets: real keys live only in these files (spec §10, I6). Never commit them.
+.env
+.env.*
+!.env.example
+
+# Runtime data: databases, artifacts, journal, backups (ARCHITECTURE §2)
+var/
+
+# Python and tooling
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.grimp_cache/
+.import_linter_cache/
+*.egg-info/
+build/
+dist/
+
+# macOS
+.DS_Store

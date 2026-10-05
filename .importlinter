@@ -1,0 +1,107 @@
+# Import rules K1–K4 (ARCHITECTURE §3) and P11 (PLAN §0.1), checked by quant-check.
+# Each contract id is the rule it enforces, so a broken contract names its rule.
+# quant-check also verifies that K1's and K2's forbidden lists and K4's source list
+# cover every subpackage of quant, so a new subpackage can't slip past them.
+
+[importlinter]
+root_package = quant
+include_external_packages = True
+
+[importlinter:contract:K1]
+name = K1 risk imports only core and store (I3)
+type = forbidden
+source_modules =
+    quant.risk
+forbidden_modules =
+    quant.backtest
+    quant.cli
+    quant.control
+    quant.dashboard
+    quant.data
+    quant.decide
+    quant.engine
+    quant.eval
+    quant.execution
+    quant.features
+    quant.golive
+    quant.harness
+    quant.hmm
+    quant.jobs
+    quant.llm
+    quant.research
+    alpaca
+    anthropic
+    hmmlearn
+
+[importlinter:contract:K2]
+name = K2 llm imports only core
+type = forbidden
+source_modules =
+    quant.llm
+forbidden_modules =
+    quant.backtest
+    quant.cli
+    quant.control
+    quant.dashboard
+    quant.data
+    quant.decide
+    quant.engine
+    quant.eval
+    quant.execution
+    quant.features
+    quant.golive
+    quant.harness
+    quant.hmm
+    quant.jobs
+    quant.research
+    quant.risk
+    quant.store
+    alpaca
+    hmmlearn
+
+[importlinter:contract:K3]
+name = K3 the decision path never imports hmmlearn or eval (I2)
+type = forbidden
+source_modules =
+    quant.data
+    quant.features
+    quant.hmm.filter
+    quant.hmm.labels
+    quant.decide
+    quant.risk
+    quant.execution
+    quant.engine
+forbidden_modules =
+    hmmlearn
+    quant.eval
+
+[importlinter:contract:K4]
+name = K4 only engine, control and cli import the Alpaca broker adapter
+type = forbidden
+source_modules =
+    quant.backtest
+    quant.core
+    quant.dashboard
+    quant.data
+    quant.decide
+    quant.eval
+    quant.features
+    quant.golive
+    quant.harness
+    quant.hmm
+    quant.jobs
+    quant.llm
+    quant.research
+    quant.risk
+    quant.store
+forbidden_modules =
+    quant.execution.alpaca_broker
+
+[importlinter:contract:P11]
+name = P11 src never imports spikes or the build gate
+type = forbidden
+source_modules =
+    quant
+forbidden_modules =
+    spikes
+    quant_check
