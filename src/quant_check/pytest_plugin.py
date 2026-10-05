@@ -16,7 +16,6 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
-import re
 import socket
 from collections.abc import Generator, Iterator
 from pathlib import Path
@@ -24,11 +23,11 @@ from typing import Any
 
 import pytest
 
+from quant_check.redmarks import RED_REASON
 from quant_check.trace import ids_in_docs
 
 TIERS = ("fast", "full", "integration", "all")
-RED_REASON = re.compile(r"^red:(B\d+)$")
-RED_MARK_SHAPE = 'xfail(strict=True, reason="red:BNN", raises=<the failure it expects>)'
+RED_MARK_SHAPE = 'xfail(strict=True, reason="red:B<step>", raises=<the failure it expects>)'
 _XPASS_STRICT = "[XPASS(strict)]"
 
 
@@ -84,10 +83,13 @@ def _is_local(host: object) -> bool:
 
 
 def _block_network() -> None:
-    """Refuse IP connections and name lookups for the rest of this process."""
+    """Refuse IP connections, datagrams and name lookups for the rest of this process."""
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
+    real_sendto = socket.socket.sendto
+    real_sendmsg = socket.socket.sendmsg
     real_getaddrinfo = socket.getaddrinfo
+    real_getnameinfo = socket.getnameinfo
 
     def refuse(what: object) -> OfflineTierError:
         return OfflineTierError(
@@ -105,15 +107,46 @@ def _block_network() -> None:
             raise refuse(address)
         return real_connect_ex(self, address)
 
+    def sendto(self: socket.socket, *args: Any) -> int:
+        if self.family in (socket.AF_INET, socket.AF_INET6):
+            raise refuse(args[-1])
+        return int(real_sendto(self, *args))
+
+    def sendmsg(self: socket.socket, *args: Any) -> int:
+        if self.family in (socket.AF_INET, socket.AF_INET6) and len(args) >= 4:
+            raise refuse(args[3])
+        return real_sendmsg(self, *args)
+
     def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
         if not _is_local(host):
             raise refuse(host)
         return real_getaddrinfo(host, *args, **kwargs)
 
+    def getnameinfo(sockaddr: Any, flags: int) -> Any:
+        if not _is_local(sockaddr[0]):
+            raise refuse(sockaddr[0])
+        return real_getnameinfo(sockaddr, flags)
+
+    def lookup(real: Any) -> Any:
+        def guarded(host: Any, *args: Any) -> Any:
+            if not _is_local(host):
+                raise refuse(host)
+            return real(host, *args)
+
+        return guarded
+
     # setattr, because the replacements take socket.socket where typeshed declares _socket.socket.
-    setattr(socket.socket, "connect", connect)  # noqa: B010
-    setattr(socket.socket, "connect_ex", connect_ex)  # noqa: B010
+    for name, replacement in (
+        ("connect", connect),
+        ("connect_ex", connect_ex),
+        ("sendto", sendto),
+        ("sendmsg", sendmsg),
+    ):
+        setattr(socket.socket, name, replacement)
     socket.getaddrinfo = getaddrinfo
+    socket.getnameinfo = getnameinfo
+    for name in ("gethostbyname", "gethostbyname_ex", "gethostbyaddr"):
+        setattr(socket, name, lookup(getattr(socket, name)))
 
 
 def _tier_of(item: pytest.Item) -> str:
@@ -198,8 +231,9 @@ class _Gate:
         self.config = config
         self.tier = tier
         self.problems: list[dict[str, str]] = []
-        self.results: dict[str, dict[str, str | None]] = {}
+        self.results: dict[str, dict[str, Any]] = {}
         self.red: dict[str, str | None] = {}
+        self.tiers: dict[str, str] = {}
 
     def pytest_collection_modifyitems(self, items: list[pytest.Item]) -> None:
         known = ids_in_docs(self.config.rootpath)
@@ -209,12 +243,13 @@ class _Gate:
         for item in items:
             self.problems.extend(_mark_problems(item, known))
             self.red[item.nodeid] = _red_step(item)
+            self.tiers[item.nodeid] = _tier_of(item)
             trace.append(
                 {
                     "nodeid": item.nodeid,
                     "ids": _spec_ids(item),
                     "red": self.red[item.nodeid],
-                    "tier": _tier_of(item),
+                    "tier": self.tiers[item.nodeid],
                 }
             )
             (keep if _selected(item, self.tier) else drop).append(item)
@@ -256,15 +291,25 @@ class _Gate:
                 "outcome": "error",
                 "message": _message(report),
                 "red": None,
+                "tier": "fast",
+                "duration": 0.0,
             }
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
-        if report.when == "call" or report.failed or (report.when == "setup" and report.skipped):
-            self.results[report.nodeid] = {
-                "outcome": _outcome(report),
-                "message": "" if report.passed else _message(report),
+        entry = self.results.setdefault(
+            report.nodeid,
+            {
+                "outcome": "passed",
+                "message": "",
                 "red": self.red.get(report.nodeid),
-            }
+                "tier": self.tiers.get(report.nodeid, "fast"),
+                "duration": 0.0,
+            },
+        )
+        entry["duration"] += report.duration
+        if report.when == "call" or report.failed or (report.when == "setup" and report.skipped):
+            entry["outcome"] = _outcome(report)
+            entry["message"] = "" if report.passed else _message(report)
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         self.write_report(collected=session.testscollected, exitstatus=int(exitstatus))

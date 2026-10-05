@@ -1,6 +1,6 @@
 # CLAUDE.md: SPY Regime Trader
 
-This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.2, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.1 and [docs/PLAN.md](docs/PLAN.md) v1.0. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
+This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.2, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.2 and [docs/PLAN.md](docs/PLAN.md) v1.0. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
 
 ## Start every session here
 
@@ -25,7 +25,7 @@ Hooks and services call `.venv/bin/...` directly, never `uv run`, because uv liv
 ## Rules for every step (PLAN §2)
 
 1. **Branch** `bNN-name` from `main`.
-2. **Red commit:** stubs that raise `NotImplementedError`, plus the step's tests. Each test is marked `@pytest.mark.xfail(strict=True, reason="red:BNN", raises=NotImplementedError)` and names its ids with `@pytest.mark.spec(...)`. Add the step's claimed ids to `tests/steps.toml`.
+2. **Red commit:** stubs that raise `NotImplementedError`, plus the step's tests. Each test is marked `@pytest.mark.xfail(strict=True, reason="red:B3", raises=NotImplementedError)` and names its ids with `@pytest.mark.spec(...)`. Steps are unpadded (B3, never B03). Add the step's claimed ids to `tests/steps.toml`.
 3. **Green commit:** the implementation goes in and the marks come off. The fast tier passes on every commit; the full tier (`--full`) passes before the merge.
 4. A step that touches the decision path adds its layer to the T-NL1 truncation harness before it is done.
 5. **Review:** an independent code review of the step's diff (the code-review skill), checked against the step's ids. Fix every finding, or write it down in BUILD_LOG.md with a reason.

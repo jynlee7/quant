@@ -10,10 +10,7 @@ import pytest
 from quant_check.testrun import budget_findings
 from tests.support.planted import PlantedRepo
 
-RED = pytest.mark.xfail(strict=True, reason="red:B0", raises=AssertionError)
 
-
-@RED
 @pytest.mark.spec("K4", "P3")
 def test_k4_an_execution_sibling_importing_the_adapter_is_caught(planted: PlantedRepo) -> None:
     planted.write("src/quant/execution/router.py", "from quant.execution import alpaca_broker\n")
@@ -23,7 +20,6 @@ def test_k4_an_execution_sibling_importing_the_adapter_is_caught(planted: Plante
     assert result.caught("K4", "src/quant/execution/manager.py:1"), result.explain()
 
 
-@RED
 @pytest.mark.spec("K1", "P3")
 def test_a_broken_contract_is_a_finding_even_without_import_chains(planted: PlantedRepo) -> None:
     contracts = (planted.root / ".importlinter").read_text()
@@ -38,7 +34,6 @@ def test_a_broken_contract_is_a_finding_even_without_import_chains(planted: Plan
     assert result.caught("LAYERS", ".importlinter"), result.explain()
 
 
-@RED
 @pytest.mark.spec("P2", "P3")
 def test_a_zero_padded_red_mark_is_malformed(planted: PlantedRepo) -> None:
     planted.write(
@@ -52,7 +47,6 @@ def test_a_zero_padded_red_mark_is_malformed(planted: PlantedRepo) -> None:
     assert result.caught("P2", "tests/test_planted.py::test_padded"), result.explain()
 
 
-@RED
 @pytest.mark.spec("P4")
 @pytest.mark.parametrize(
     "reach_out",
@@ -73,7 +67,6 @@ def test_the_fast_tier_blocks_lookups_and_datagrams(planted: PlantedRepo, reach_
     assert "offline" in result.stdout
 
 
-@pytest.mark.xfail(strict=True, reason="red:B0", raises=NotImplementedError)
 @pytest.mark.spec("P4")
 def test_a_fast_tier_over_two_minutes_is_a_finding() -> None:
     results = [
@@ -87,7 +80,6 @@ def test_a_fast_tier_over_two_minutes_is_a_finding() -> None:
     assert budget_findings(results[1:]) == []
 
 
-@RED
 @pytest.mark.full
 @pytest.mark.spec("P2", "P3")
 def test_the_merge_hook_blocks_a_step_that_is_still_red(planted: PlantedRepo) -> None:

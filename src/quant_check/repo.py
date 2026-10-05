@@ -98,6 +98,18 @@ class Repo:
         match = _STEP_BRANCH.match(self.branch() or "")
         return step_id(match.group(1)) if match else None
 
+    def merging_steps(self) -> frozenset[str]:
+        """Steps whose branch is being merged in (MERGE_HEAD), as the merge hook sees them."""
+        if not self.is_git():
+            return frozenset()
+        head = self.git("rev-parse", "--verify", "--quiet", "MERGE_HEAD")
+        if head.returncode != 0:
+            return frozenset()
+        refs = self.git("branch", "--format=%(refname:short)", "--points-at", head.stdout.strip())
+        return frozenset(
+            step_id(m.group(1)) for b in refs.stdout.split() if (m := _STEP_BRANCH.match(b))
+        )
+
     def done_steps(self) -> frozenset[str]:
         """Steps tagged `bNN-done`, as "BN"."""
         if not self.is_git():

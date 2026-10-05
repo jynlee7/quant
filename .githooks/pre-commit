@@ -1,5 +1,6 @@
 #!/bin/sh
-# Runs the fast build gate before every commit (ARCHITECTURE §13, PLAN §2).
+# Runs the build gate before every commit (ARCHITECTURE §13, PLAN §2): the fast gate here, and
+# the full gate when pre-merge-commit calls this script with --full.
 # Installed with: git config core.hooksPath .githooks   (quant-check fails if it isn't)
 #
 # The gate checks the working tree, so the working tree must be exactly what gets committed:
@@ -21,4 +22,4 @@ if [ -n "$untracked" ]; then
 fi
 
 # Hooks and services call the project's own Python, never `uv run` (PLAN B0).
-exec "${QUANT_CHECK:-$root/.venv/bin/quant-check}"
+exec "${QUANT_CHECK:-$root/.venv/bin/quant-check}" "$@"

@@ -166,7 +166,6 @@ K5_COPIES = {
 }
 
 
-@pytest.mark.xfail(strict=True, reason="red:B0", raises=AssertionError)
 @pytest.mark.spec("K5", "I4")
 @pytest.mark.parametrize("source", K5_COPIES.values(), ids=K5_COPIES.keys())
 def test_k5_catches_copies_of_an_approved_instance(source: str) -> None:
@@ -185,7 +184,6 @@ K6_MORE = {
 }
 
 
-@pytest.mark.xfail(strict=True, reason="red:B0", raises=AssertionError)
 @pytest.mark.spec("K6")
 @pytest.mark.parametrize("source", K6_MORE.values(), ids=K6_MORE.keys())
 def test_k6_catches_other_clock_reads(source: str) -> None:
@@ -199,7 +197,6 @@ def test_k6_allows_the_time_of_day_of_a_datetime() -> None:
     assert scans.k6_violations(source, "quant.engine.x") == []
 
 
-@pytest.mark.xfail(strict=True, reason="red:B0", raises=AssertionError)
 @pytest.mark.spec("I2")
 def test_i2_hmmlearn_is_imported_only_by_train_even_in_eval() -> None:
     assert [

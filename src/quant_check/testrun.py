@@ -66,16 +66,26 @@ def run_tests(repo: Repo, tier: str) -> tuple[list[Finding], str]:
             )
         elif outcome in ("failed", "error"):
             findings.append(Finding("tests", result["nodeid"], result["message"]))
+    findings += budget_findings(report["results"])
     if not findings and proc.returncode != 0:
         why = "no tests collected" if proc.returncode == 5 else f"pytest exited {proc.returncode}"
         findings.append(Finding("tests", "-", f"{why}: {tail}"))
 
     summary = ", ".join(f"{n} {outcome}" for outcome, n in sorted(counts.items()))
-    over = tier == "fast" and elapsed > FAST_TIER_BUDGET_S
-    budget = f", OVER the {FAST_TIER_BUDGET_S:.0f}s budget (P4)" if over else ""
-    return findings, f"{summary or 'nothing ran'} in {elapsed:.0f}s{budget}"
+    return findings, f"{summary or 'nothing ran'} in {elapsed:.0f}s"
 
 
 def budget_findings(results: list[dict[str, Any]]) -> list[Finding]:
-    """P4: the fast tier's tests must take under two minutes in total."""
-    raise NotImplementedError("red:B0 review")
+    """P4: the fast tier's tests must take under two minutes in total. In the full tier the
+    fast tests' share is measured too, so the budget is checked before every merge."""
+    fast = sum(float(r.get("duration", 0.0)) for r in results if r.get("tier") == "fast")
+    if fast <= FAST_TIER_BUDGET_S:
+        return []
+    return [
+        Finding(
+            "P4",
+            "-",
+            f"the fast tier's tests took {fast:.0f}s against a {FAST_TIER_BUDGET_S:.0f}s budget; "
+            "mark slow tests full, or make them faster",
+        )
+    ]

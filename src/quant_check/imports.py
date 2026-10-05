@@ -12,7 +12,7 @@ from typing import Any
 
 from quant_check.findings import Finding
 from quant_check.repo import Repo, scrubbed_env
-from quant_check.scans import k4_trading_violations, scan
+from quant_check.scans import k4_violations, scan
 
 CONFIG = ".importlinter"
 
@@ -54,6 +54,10 @@ def _broken_contracts(repo: Repo) -> list[Finding]:
         for name, error in result["invalid"].items()
     ]
     for contract in result["contracts"]:
+        if not contract["kept"] and not contract["chains"]:
+            findings.append(
+                Finding(contract["id"], CONFIG, f"broken: {contract['name']}; run lint-imports")
+            )
         for chain in contract["chains"]:
             first = chain[0]
             lines = first["line_numbers"]
@@ -94,12 +98,13 @@ def _uncovered_subpackages(repo: Repo) -> list[Finding]:
 
 
 def check_imports(repo: Repo) -> list[Finding]:
-    """Broken contracts, contracts that miss a subpackage, and alpaca-py's trading client
-    imported anywhere but the adapter (K4)."""
+    """Broken contracts, contracts that miss a subpackage, and the K4 imports import-linter
+    can't see: alpaca-py's trading client outside the adapter, and the adapter imported by a
+    sibling inside quant.execution."""
     if not (repo.root / CONFIG).exists():
         return [Finding("imports", CONFIG, "the import contracts are missing")]
     return [
         *_broken_contracts(repo),
         *_uncovered_subpackages(repo),
-        *scan(repo, "K4", k4_trading_violations),
+        *scan(repo, "K4", k4_violations),
     ]

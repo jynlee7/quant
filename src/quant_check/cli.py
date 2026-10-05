@@ -11,6 +11,7 @@ Every finding prints as `FAIL <rule> <location> <message>`, and the exit code is
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import subprocess
 import sys
@@ -24,6 +25,8 @@ from quant_check.findings import Finding
 from quant_check.repo import Repo, gate_env, scrubbed_env
 
 StageResult = tuple[list[Finding], str]
+# pre-commit runs the fast gate; pre-merge-commit runs the full gate on `git merge --no-ff`.
+HOOKS = ("pre-commit", "pre-merge-commit")
 
 
 @dataclass(frozen=True)
@@ -119,14 +122,18 @@ def stage_hook(ctx: Context) -> StageResult:
     if not repo.is_git():
         return [], "not a git work tree"
     hooks_path = repo.git("config", "--get", "core.hooksPath").stdout.strip()
-    hook = repo.root / ".githooks" / "pre-commit"
-    if hooks_path != ".githooks" or not hook.exists():
-        return [
-            Finding(
-                "hook", ".githooks/pre-commit", "not installed: git config core.hooksPath .githooks"
+    findings = []
+    for name in HOOKS:
+        hook = repo.root / ".githooks" / name
+        if hooks_path != ".githooks" or not hook.exists() or not os.access(hook, os.X_OK):
+            findings.append(
+                Finding(
+                    "hook",
+                    f".githooks/{name}",
+                    "not installed: git config core.hooksPath .githooks",
+                )
             )
-        ], ""
-    return [], ""
+    return findings, ""
 
 
 def _findings_only(check: Callable[[Repo], list[Finding]]) -> Callable[[Context], StageResult]:
@@ -223,7 +230,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception as exc:  # a crashed stage is a failed stage, and the rest still run
             found, note = [Finding(name, "-", f"stage crashed: {type(exc).__name__}: {exc}")], ""
         status = "ok  " if not found else "FAIL"
-        detail = note if not found else f"{len(found)} finding{'s' if len(found) != 1 else ''}"
+        detail = note
+        if found:
+            count = f"{len(found)} finding{'s' if len(found) != 1 else ''}"
+            detail = f"{count}; {note}" if note else count
         print(f"  {status}  {name:<8} {detail:<48} {time.perf_counter() - t0:6.1f}s")
         findings.extend(found)
 

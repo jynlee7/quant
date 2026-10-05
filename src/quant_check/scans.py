@@ -6,7 +6,8 @@
   `quant.core.clock`.
 - I2: nothing outside `quant.eval` calls a smoother or Viterbi (`predict`, `predict_proba`,
   `decode`, `score_samples`, `quant.eval.smoother`), and only `quant.hmm.train` imports hmmlearn.
-- K4 (the part about alpaca-py): only the adapter imports `alpaca.trading`.
+- K4, the parts import-linter can't see: only the adapter imports `alpaca.trading`, and no
+  sibling inside `quant.execution` imports the adapter.
 
 Each `*_violations` function takes one module's source and returns (line, message) pairs, one per
 offending line. The scans resolve import aliases, so `from time import time as t; t()` is caught.
@@ -48,6 +49,10 @@ _ALTERNATE_CONSTRUCTORS = frozenset(
         "parse_raw",
     }
 )
+# Ways to copy an existing instance, possibly with changes. Flagged when the copied name is
+# annotated with a guarded type. The runtime token and one-time approval ids (B9) back this up.
+_COPY_METHODS = _ALTERNATE_CONSTRUCTORS | {"__copy__", "__deepcopy__", "__replace__", "copy"}
+_COPY_FUNCTIONS = frozenset({"copy.copy", "copy.deepcopy", "copy.replace", "dataclasses.replace"})
 
 # K6: reads of the wall clock, by the dotted name they resolve to.
 CLOCK_MODULE = "quant.core.clock"
@@ -60,7 +65,10 @@ _CLOCK_READS = frozenset(
         "pandas.Timestamp.now",
         "pandas.Timestamp.today",
         "pandas.Timestamp.utcnow",
+        "os.times",
         "time.asctime",
+        "time.clock_gettime",
+        "time.clock_gettime_ns",
         "time.ctime",
         "time.gmtime",
         "time.localtime",
@@ -68,9 +76,26 @@ _CLOCK_READS = frozenset(
         "time.monotonic_ns",
         "time.perf_counter",
         "time.perf_counter_ns",
+        "time.process_time",
+        "time.process_time_ns",
         "time.strftime",
+        "time.thread_time",
+        "time.thread_time_ns",
         "time.time",
         "time.time_ns",
+        "uuid.uuid1",
+        "uuid.uuid6",
+        "uuid.uuid7",
+    }
+)
+# An event loop's `time()` is a clock too.
+_LOOP_GETTERS = frozenset(
+    {
+        "asyncio.events.get_event_loop",
+        "asyncio.events.get_running_loop",
+        "asyncio.get_event_loop",
+        "asyncio.get_running_loop",
+        "asyncio.new_event_loop",
     }
 )
 # Constructors that read the clock when handed the string "now" or "today".
@@ -85,7 +110,9 @@ SMOOTHER_MODULE = "quant.eval.smoother"
 TRAIN_MODULE = "quant.hmm.train"
 _SMOOTHER_METHODS = frozenset({"predict", "predict_proba", "score_samples"})
 
-# K4: alpaca-py's trading client belongs to the adapter alone.
+# K4: alpaca-py's trading client belongs to the adapter alone, and inside quant.execution no
+# sibling may import the adapter (import-linter treats imports within a source package as fine).
+EXECUTION_PACKAGE = "quant.execution"
 TRADING_ADAPTER = "quant.execution.alpaca_broker"
 TRADING_SDK = "alpaca.trading"
 
@@ -182,6 +209,18 @@ def _is_str_in(node: ast.expr, values: frozenset[str]) -> bool:
     return isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in values
 
 
+def _annotation_names(annotation: ast.expr) -> Iterator[ast.expr]:
+    """The names inside an annotation, including quoted ones like `"RiskApprovedOrder"`."""
+    for node in ast.walk(annotation):
+        if isinstance(node, ast.Name | ast.Attribute):
+            yield node
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                yield from _annotation_names(ast.parse(node.value, mode="eval").body)
+            except SyntaxError:
+                continue
+
+
 def k5_violations(source: str, module: str, *, is_package: bool = False) -> list[Violation]:
     tree, scope, _ = _parse(source, module, is_package)
     hits = _Hits()
@@ -193,10 +232,37 @@ def k5_violations(source: str, module: str, *, is_package: bool = False) -> list
         last = name.rpartition(".")[2]
         return last if CONSTRUCTED_ONLY_IN.get(last, module) != module else None
 
+    # Names annotated with a guarded type: parameters and annotated assignments.
+    instances: dict[str, str] = {}
+    for node in ast.walk(tree):
+        target, annotation = None, None
+        if isinstance(node, ast.arg) and node.annotation is not None:
+            target, annotation = node.arg, node.annotation
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target, annotation = node.target.id, node.annotation
+        if target and annotation:
+            for name in _annotation_names(annotation):
+                if kind := guarded(name):
+                    instances[target] = kind
+
+    def instance(expr: ast.expr) -> str | None:
+        return instances.get(expr.id) if isinstance(expr, ast.Name) else None
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
-            target = guarded(node.func)
             func = node.func
+            copied = None
+            if isinstance(func, ast.Attribute) and func.attr in _COPY_METHODS:
+                copied = instance(func.value)
+            if copied is None and scope.qualify(func) in _COPY_FUNCTIONS:
+                copied = next(
+                    (k for arg in node.args if (k := instance(arg) or guarded(arg))), None
+                )
+            if copied:
+                home = CONSTRUCTED_ONLY_IN[copied]
+                hits.add(node.lineno, f"copies a {copied} outside {home}")
+                continue
+            target = guarded(func)
             if (
                 target is None
                 and isinstance(func, ast.Attribute)
@@ -222,6 +288,24 @@ def k6_violations(source: str, module: str, *, is_package: bool = False) -> list
     tree, scope, _ = _parse(source, module, is_package)
     hits = _Hits()
     advice = "take the time from the Clock port in quant.core.clock"
+
+    def is_loop(expr: ast.expr) -> bool:
+        if isinstance(expr, ast.Call):
+            return scope.qualify(expr.func) in _LOOP_GETTERS
+        return isinstance(expr, ast.Name) and expr.id in loops
+
+    loops: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and is_loop(node.value):
+            loops.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "time"
+            and is_loop(node.func.value)
+        ):
+            hits.add(node.lineno, f"an event loop's time() reads the clock; {advice}")
     for node in ast.walk(tree):
         if isinstance(node, ast.Name | ast.Attribute) and isinstance(node.ctx, ast.Load):
             name = scope.qualify(node)
@@ -246,15 +330,16 @@ def _looks_like_viterbi(call: ast.Call) -> bool:
 
 
 def i2_violations(source: str, module: str, *, is_package: bool = False) -> list[Violation]:
-    if _within(module, EVAL_PACKAGE):
-        return []
     tree, scope, package = _parse(source, module, is_package)
     hits = _Hits()
     for line, imported in _imported_names(tree, package):
+        if module != TRAIN_MODULE and _within(imported, "hmmlearn"):
+            hits.add(line, f"imports hmmlearn; only {TRAIN_MODULE} may, and it calls only fit")
+    if _within(module, EVAL_PACKAGE):
+        return hits.sorted()  # eval/ is where smoothing is allowed to run
+    for line, imported in _imported_names(tree, package):
         if _within(imported, SMOOTHER_MODULE):
             hits.add(line, f"imports {SMOOTHER_MODULE}; smoothing runs only in eval/")
-        elif module != TRAIN_MODULE and _within(imported, "hmmlearn"):
-            hits.add(line, f"imports hmmlearn; only {TRAIN_MODULE} may, and it calls only fit")
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             if node.attr in _SMOOTHER_METHODS:
@@ -284,15 +369,18 @@ def i2_violations(source: str, module: str, *, is_package: bool = False) -> list
     return hits.sorted()
 
 
-def k4_trading_violations(source: str, module: str, *, is_package: bool = False) -> list[Violation]:
+def k4_violations(source: str, module: str, *, is_package: bool = False) -> list[Violation]:
     if module == TRADING_ADAPTER:
         return []
     tree, scope, package = _parse(source, module, is_package)
     hits = _Hits()
     message = f"uses {TRADING_SDK}; only {TRADING_ADAPTER} talks to the broker"
+    sibling = f"imports {TRADING_ADAPTER}; inside execution only the engine's wiring may (K4)"
     for line, imported in _imported_names(tree, package):
         if _within(imported, TRADING_SDK):
             hits.add(line, message)
+        elif _within(module, EXECUTION_PACKAGE) and _within(imported, TRADING_ADAPTER):
+            hits.add(line, sibling)
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
             name = scope.qualify(node)

@@ -16,7 +16,8 @@ from pathlib import Path
 from quant_check.findings import Finding
 from quant_check.repo import Repo
 
-RED_REASON = re.compile(r"^red:(B\d+)$")
+# Steps are written without zero padding (B3, not B03), as the plan numbers them.
+RED_REASON = re.compile(r"^red:(B(?:0|[1-9][0-9]*))$")
 
 
 def red_marks(path: Path) -> Iterator[tuple[int, str]]:

@@ -104,7 +104,8 @@ def check_trace(repo: Repo) -> tuple[list[Finding], str]:
     claims = step_claims(repo)
     known = known_ids(repo)
     findings = []
-    steps = sorted(repo.done_steps() | {s for s in [repo.current_step()] if s}, key=_id_key)
+    current = {s for s in [repo.current_step()] if s}
+    steps = sorted(repo.done_steps() | repo.merging_steps() | current, key=_id_key)
     for step in steps:
         if step not in claims:
             findings.append(Finding("trace", step, f"{step} has no entry in {STEPS_FILE}"))
