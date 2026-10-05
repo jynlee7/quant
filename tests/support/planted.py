@@ -80,7 +80,7 @@ def _raise_if_unimplemented(*outputs: str) -> None:
 
 
 def _clean_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST", "QUANT_"))}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST", "QUANT_", "GIT_"))}
     env.pop("PYTHONPATH", None)
     env.update(extra or {})
     return env
@@ -146,6 +146,20 @@ class PlantedRepo:
             self.git("add", "-A")
         proc = subprocess.run(
             ["git", "commit", "-q", "-m", message],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_clean_env({"QUANT_CHECK": str(QUANT_CHECK)}),
+            timeout=600,
+        )
+        _raise_if_unimplemented(proc.stdout, proc.stderr)
+        return proc
+
+    def merge_through_hook(self, branch: str) -> subprocess.CompletedProcess[str]:
+        """`git merge --no-ff`, which runs the pre-merge-commit hook."""
+        proc = subprocess.run(
+            ["git", "merge", "--no-ff", "-q", "-m", f"merge {branch}", branch],
             cwd=self.root,
             capture_output=True,
             text=True,

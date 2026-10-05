@@ -74,3 +74,8 @@ def run_tests(repo: Repo, tier: str) -> tuple[list[Finding], str]:
     over = tier == "fast" and elapsed > FAST_TIER_BUDGET_S
     budget = f", OVER the {FAST_TIER_BUDGET_S:.0f}s budget (P4)" if over else ""
     return findings, f"{summary or 'nothing ran'} in {elapsed:.0f}s{budget}"
+
+
+def budget_findings(results: list[dict[str, Any]]) -> list[Finding]:
+    """P4: the fast tier's tests must take under two minutes in total."""
+    raise NotImplementedError("red:B0 review")

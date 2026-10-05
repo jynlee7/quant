@@ -142,3 +142,66 @@ def test_i2_catches(module: str, source: str) -> None:
 @pytest.mark.parametrize(("module", "source"), I2_ALLOWED.values(), ids=I2_ALLOWED.keys())
 def test_i2_allows(module: str, source: str) -> None:
     assert scans.i2_violations(source, module) == []
+
+
+# --- Review of B0: cases the first version missed --------------------------------------------
+
+K5_COPIES = {
+    "model_copy": (
+        "from quant.risk.engine import RiskApprovedOrder\n"
+        "def f(o: RiskApprovedOrder):\n    return o.model_copy(update={'qty': 9})\n"
+    ),
+    "dataclasses.replace": (
+        "import dataclasses\nfrom quant.risk.engine import RiskApprovedOrder\n"
+        "def f(o: RiskApprovedOrder):\n    return dataclasses.replace(o, qty=9)\n"
+    ),
+    "copy.copy": (
+        "import copy\nfrom quant.risk.engine import RiskApprovedOrder\n"
+        "def f(o: RiskApprovedOrder):\n    return copy.copy(o)\n"
+    ),
+    "copy.replace": (
+        "from copy import replace\nfrom quant.research.ledger import TrialTicket\n"
+        "def f(t: TrialTicket):\n    return replace(t)\n"
+    ),
+}
+
+
+@pytest.mark.xfail(strict=True, reason="red:B0", raises=AssertionError)
+@pytest.mark.spec("K5", "I4")
+@pytest.mark.parametrize("source", K5_COPIES.values(), ids=K5_COPIES.keys())
+def test_k5_catches_copies_of_an_approved_instance(source: str) -> None:
+    last_line = len(source.splitlines())
+    assert [line for line, _ in scans.k5_violations(source, "quant.execution.x")] == [last_line]
+
+
+K6_MORE = {
+    "process_time": "import time\nx = time.process_time()\n",
+    "thread_time": "import time\nx = time.thread_time_ns()\n",
+    "clock_gettime": "import time\nx = time.clock_gettime(0)\n",
+    "os.times": "import os\nx = os.times()\n",
+    "uuid1": "import uuid\nx = uuid.uuid1()\n",
+    "event loop": "import asyncio\nx = asyncio.get_event_loop().time()\n",
+    "running loop": "import asyncio\nloop = asyncio.get_running_loop()\nx = loop.time()\n",
+}
+
+
+@pytest.mark.xfail(strict=True, reason="red:B0", raises=AssertionError)
+@pytest.mark.spec("K6")
+@pytest.mark.parametrize("source", K6_MORE.values(), ids=K6_MORE.keys())
+def test_k6_catches_other_clock_reads(source: str) -> None:
+    last_line = len(source.splitlines())
+    assert [line for line, _ in scans.k6_violations(source, "quant.engine.x")] == [last_line]
+
+
+@pytest.mark.spec("K6")
+def test_k6_allows_the_time_of_day_of_a_datetime() -> None:
+    source = "def f(tau):\n    return tau.time()\n"
+    assert scans.k6_violations(source, "quant.engine.x") == []
+
+
+@pytest.mark.xfail(strict=True, reason="red:B0", raises=AssertionError)
+@pytest.mark.spec("I2")
+def test_i2_hmmlearn_is_imported_only_by_train_even_in_eval() -> None:
+    assert [
+        line for line, _ in scans.i2_violations("import os\nimport hmmlearn\n", "quant.eval.x")
+    ] == [2]
