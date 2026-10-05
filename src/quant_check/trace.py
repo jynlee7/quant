@@ -20,16 +20,20 @@ from quant_check.findings import Finding
 from quant_check.repo import Repo, gate_env
 
 DOCS = ("SPEC.md", "ARCHITECTURE.md", "PLAN.md")
+# Section references name requirements written as prose: SPEC§2, ARCH§4.3, PLAN§5.
+SECTION_PREFIX = {"SPEC.md": "SPEC§", "ARCHITECTURE.md": "ARCH§", "PLAN.md": "PLAN§"}
 STEPS_FILE = "tests/steps.toml"
 
 # An id is the first cell of a table row in the approved docs: D1, A1, I1, T-NL1, G1, C1, K1,
 # AD1, P1. Build steps (B0) and checkpoints (CP1) are not ids.
 _ID_ROW = re.compile(r"^\|\s*(AD\d+|T-NL\d+|[DAIGCKP]\d+)\b")
-_ID_SORT = re.compile(r"^([A-Z-]+?)(\d+)$")
+_SECTION = re.compile(r"^#{2,3}\s+(\d+(?:\.\d+)?)\.?\s")
+_ID_SORT = re.compile(r"^(\D+?)(\d+(?:\.\d+)*)$")
 
 
 def ids_in_docs(root: Path) -> frozenset[str] | None:
-    """Every id defined in a table row of the docs, or None when the docs aren't there."""
+    """Every id the docs define, or None when the docs aren't there. An id is the first cell of a
+    table row (A1, K5, C11), or a numbered section heading (SPEC§2, ARCH§4.3, PLAN§5)."""
     docs = [root / "docs" / name for name in DOCS]
     if not all(path.exists() for path in docs):
         return None
@@ -38,11 +42,13 @@ def ids_in_docs(root: Path) -> frozenset[str] | None:
         for line in path.read_text().splitlines():
             if match := _ID_ROW.match(line):
                 found.add(match.group(1))
+            elif match := _SECTION.match(line):
+                found.add(SECTION_PREFIX[path.name] + match.group(1))
     return frozenset(found)
 
 
 def known_ids(repo: Repo) -> frozenset[str]:
-    """Every id defined in a table row of docs/SPEC.md, ARCHITECTURE.md or PLAN.md."""
+    """Every id defined in docs/SPEC.md, ARCHITECTURE.md or PLAN.md (see ids_in_docs)."""
     return ids_in_docs(repo.root) or frozenset()
 
 
@@ -55,9 +61,12 @@ def step_claims(repo: Repo) -> dict[str, list[str]]:
     return {step: list(entry.get("covers", [])) for step, entry in steps.items()}
 
 
-def _id_key(cid: str) -> tuple[str, int]:
+def id_sort_key(cid: str) -> tuple[str, tuple[int, ...]]:
+    """Ids in reading order: K2 before K10, ARCH§4.3 before ARCH§14."""
     match = _ID_SORT.match(cid)
-    return (match.group(1), int(match.group(2))) if match else (cid, 0)
+    if not match:
+        return (cid, ())
+    return (match.group(1), tuple(int(part) for part in match.group(2).split(".")))
 
 
 def collect(repo: Repo) -> tuple[list[dict[str, Any]], str | None]:
@@ -105,7 +114,7 @@ def check_trace(repo: Repo) -> tuple[list[Finding], str]:
     known = known_ids(repo)
     findings = []
     current = {s for s in [repo.current_step()] if s}
-    steps = sorted(repo.done_steps() | repo.merging_steps() | current, key=_id_key)
+    steps = sorted(repo.done_steps() | repo.merging_steps() | current, key=id_sort_key)
     for step in steps:
         if step not in claims:
             findings.append(Finding("trace", step, f"{step} has no entry in {STEPS_FILE}"))
@@ -125,10 +134,10 @@ def check_trace(repo: Repo) -> tuple[list[Finding], str]:
         for cid in ids:
             claimed_by[cid].append(step)
     lines = ["Trace matrix: id, tests naming it (red ones marked), steps claiming it"]
-    for cid in sorted(set(by_id) | set(claimed_by), key=_id_key):
+    for cid in sorted(set(by_id) | set(claimed_by), key=id_sort_key):
         named = by_id.get(cid, [])
         steps_note = (
-            f"  claimed by {', '.join(sorted(claimed_by[cid], key=_id_key))}"
+            f"  claimed by {', '.join(sorted(claimed_by[cid], key=id_sort_key))}"
             if cid in claimed_by
             else ""
         )

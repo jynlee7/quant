@@ -45,10 +45,12 @@ If a step is blocked on them, continue with the steps that aren't, and come back
 - UTC inside the code, New York time only at the edges. "Now" comes only from `quant.core.clock` (K6).
 - float64 arithmetic, canonical JSON (sorted keys, NaN forbidden) with SHA-256 hashes, explicit seeds.
 - No pickles. Artifacts are `.npz` loaded with `allow_pickle=False`, plus JSON.
+- Any secret read from a file (`.env`, `.env.test`) goes through `quant.core.logs.register_secret` before anything can log, so the redactor knows it (I6).
+- Log with `structlog.get_logger()`. Timestamps come from the Clock passed to `configure_logging`, so backtests and replays log simulated time.
 - Only `quant.hmm.train` imports hmmlearn, and it calls only `fit`. `predict`, `predict_proba`, `decode` and `score_samples` never appear outside `eval/` (I2).
 - `RiskApprovedOrder`, `RiskApprovedCancel` and `RiskApprovedFlatten` are built only in `quant.risk.engine`, and `TrialTicket` only in `quant.research.ledger` (K5).
 - The import rules (K1–K4, P11) live in `.importlinter`. A new subpackage must be placed in K1, K2 and K4, or quant-check fails.
-- Every test names the ids it enforces, for example `@pytest.mark.spec("A1")`. Ids are the first cells of table rows in the three docs.
+- Every test names the ids it enforces, for example `@pytest.mark.spec("A1")`. Ids are the first cells of table rows in the three docs (A1, K5, C11), or numbered sections for requirements written as prose (`SPEC§2`, `ARCH§4.3`, `PLAN§5`).
 - The fast tier is offline and must stay under 2 minutes. Mark slow tests `full` and tests that need the Alpaca test account `integration`.
 - Spikes (`spikes/`) are throwaway vendor checks, exempt from red/green. `src/` never imports them, and they record findings in `docs/VERIFY.md`.
 
