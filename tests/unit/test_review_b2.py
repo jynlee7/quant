@@ -21,6 +21,7 @@ from quant.data.policy import DataPolicy, Purpose
 from quant.data.synthetic import synthetic_minutes
 from quant.data.validate import validate_minutes
 from quant.store import sqlite as store_sqlite
+from tests.support.bars import store_with_days
 
 DAY = date(2019, 7, 2)
 SYMBOL = "SPY"
@@ -118,10 +119,12 @@ def test_two_writers_revising_the_same_minute_both_land(
         SYMBOL, minutes, known_at=market_db.HISTORY, source="backfill"
     )
     slow = BarStore._latest_minutes
+    first_read = threading.Event()
 
     def read_slowly(self: BarStore, *args: object) -> object:
         rows = slow(self, *args)
-        time.sleep(0.2)  # without a write lock around read and write, both writers read v1 here
+        first_read.set()
+        time.sleep(0.2)  # without a write lock around read and write, the second writer reads v1
         return rows
 
     monkeypatch.setattr(BarStore, "_latest_minutes", read_slowly)
@@ -138,13 +141,14 @@ def test_two_writers_revising_the_same_minute_both_land(
         except BaseException as exc:
             errors.append(exc)
 
-    threads = [
-        threading.Thread(target=revise, args=(0.01, datetime(2019, 7, 2, 21, tzinfo=UTC))),
-        threading.Thread(target=revise, args=(0.02, datetime(2019, 7, 2, 22, tzinfo=UTC))),
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
+    # The second writer starts once the first is reading, so their order is fixed: the later
+    # revision must land last, because a revision can't be known before the one it replaces.
+    first = threading.Thread(target=revise, args=(0.01, datetime(2019, 7, 2, 21, tzinfo=UTC)))
+    second = threading.Thread(target=revise, args=(0.02, datetime(2019, 7, 2, 22, tzinfo=UTC)))
+    first.start()
+    assert first_read.wait(timeout=10)
+    second.start()
+    for thread in (first, second):
         thread.join()
     assert errors == []
     assert [v.version for v in BarStore.open(path).versions(SYMBOL, minutes.at(7))] == [1, 2, 3]
@@ -222,3 +226,98 @@ def test_scoring_dev_needs_a_trial_ticket_and_nothing_scores_before_the_data() -
         )
     with pytest.raises(PolicyError):
         policy.check(Purpose.SCORE, date(2015, 12, 1), date(2015, 12, 31))
+
+
+# Found while fixing the gaps above: behavior the fixes need, written red first.
+
+
+@red(AttributeError)
+@pytest.mark.spec("SPEC§2", "ARCH§6.1")
+def test_an_ingest_refuses_bad_minutes_and_stores_nothing() -> None:
+    m = day_minutes()
+    close = m.close.copy()
+    close[200] = np.nan
+    store = BarStore.memory()
+    with pytest.raises(DataError):
+        store.ingest_minutes(
+            SYMBOL,
+            MinuteFrame(m.t, m.open, m.high, m.low, close, m.volume),
+            known_at=market_db.HISTORY,
+            source="backfill",
+        )
+    assert store.versions(SYMBOL, m.at(0)) == []
+
+
+@red(AttributeError)
+@pytest.mark.spec("SPEC§2", "ARCH§6.1")
+def test_an_ingest_keeps_a_big_move_and_records_its_flag() -> None:
+    m = day_minutes()
+    o, h, lo, c = (x.copy() for x in (m.open, m.high, m.low, m.close))
+    for column in (o, h, lo, c):
+        column[100:] *= 1.06
+    store = BarStore.memory()
+    summary = store.ingest_minutes(
+        SYMBOL,
+        MinuteFrame(m.t, o, h, lo, c, m.volume),
+        known_at=market_db.HISTORY,
+        source="backfill",
+    )
+    assert summary.minutes.inserted == 390
+    assert [(f.kind, f.t) for f in summary.flags] == [("move_over_5pct", m.at(100))]
+    assert store.flags(SYMBOL) == list(summary.flags)
+
+
+@red(AttributeError)
+@pytest.mark.spec("I1", "ARCH§6.2")
+def test_history_cant_backdate_a_minute_live_trading_missed() -> None:
+    store = BarStore.memory()
+    minutes = day_minutes()
+    first_bar = minutes.select(minutes.t < to_us(datetime(2019, 7, 2, 14, 30, tzinfo=UTC)))
+    tau = datetime(2019, 7, 2, 14, 46, tzinfo=UTC)
+    fetched = tau + timedelta(seconds=20)
+    # Live trading fetched the bar at tau without its last minute, so it saw an incomplete bar.
+    store.ingest_minutes(
+        SYMBOL, first_bar.select(np.arange(60) < 59), known_at=fetched, source="live"
+    )
+    with pytest.raises(DataError):  # as history, the minute would complete the bar before tau
+        store.ingest_minutes(SYMBOL, first_bar, known_at=market_db.HISTORY, source="backfill")
+    assert store.versions(SYMBOL, first_bar.at(59)) == []  # the refused ingest left nothing
+    retry = tau + timedelta(minutes=1)
+    summary = store.ingest_minutes(SYMBOL, first_bar, known_at=retry, source="live")
+    assert (summary.minutes.inserted, summary.hourly.revised) == (1, 1)
+
+    def bar_known_at(as_of: datetime) -> bool:
+        view = store.view(tau, as_of=as_of)
+        return view.hourly(SYMBOL, purpose=Purpose.OPERATE)[0].complete
+
+    assert not bar_known_at(fetched + timedelta(seconds=1))
+    assert bar_known_at(retry + timedelta(seconds=1))
+
+
+@red(DID_NOT_RAISE)
+@pytest.mark.spec("AD2", "ARCH§6.2")
+def test_a_corporate_action_revision_must_be_known_after_the_version_it_replaces() -> None:
+    store = BarStore.memory()
+    announced = datetime(2019, 6, 20, 20, tzinfo=UTC)
+    ex_date = date(2019, 6, 21)
+    store.put_dividend(SYMBOL, ex_date=ex_date, amount=1.4354, known_at=announced)
+    for known in (announced, announced - timedelta(hours=1)):
+        with pytest.raises(DataError):
+            store.put_dividend(SYMBOL, ex_date=ex_date, amount=1.44, known_at=known)
+    corrected = announced + timedelta(days=1)
+    store.put_dividend(SYMBOL, ex_date=ex_date, amount=1.44, known_at=corrected)
+    view = store.view(corrected + timedelta(seconds=1))
+    assert view.dividends(SYMBOL, ex_date, ex_date, purpose=Purpose.OPERATE) == [(ex_date, 1.44)]
+
+
+@red(TypeError)
+@pytest.mark.spec("C11", "A2", "ARCH§6.3")
+def test_a_view_scores_dev_only_with_a_ticket_that_covers_the_read() -> None:
+    store = store_with_days(date(2019, 1, 2), date(2019, 1, 3))
+    tau = datetime(2019, 1, 4, tzinfo=UTC)
+    ticket = _Ticket("t1", date(2019, 1, 1), date(2024, 12, 31))
+    assert len(store.view(tau, ticket=ticket).hourly(SYMBOL, purpose=Purpose.SCORE)) == 7 + 7
+    short = _Ticket("t2", date(2019, 1, 3), date(2024, 12, 31))
+    for view in (store.view(tau), store.view(tau, ticket=short)):
+        with pytest.raises(PolicyError):
+            view.hourly(SYMBOL, purpose=Purpose.SCORE)
