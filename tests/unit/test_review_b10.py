@@ -63,7 +63,6 @@ class Equal(date):
 # 1. One lockbox, where the spec puts it (R1, C6).
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 @pytest.mark.parametrize(
     ("start", "day"),
@@ -78,7 +77,6 @@ def test_no_caller_moves_where_a_segment_starts(start: str, day: date) -> None:
         Segments(**{start: day})
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 def test_segments_cannot_be_subclassed_to_move_the_lockbox() -> None:
     with pytest.raises(TypeError):
@@ -87,7 +85,6 @@ def test_segments_cannot_be_subclassed_to_move_the_lockbox() -> None:
             lockbox_start = date(2026, 1, 1)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 def test_a_policy_and_its_ledger_agree_on_the_segments(clock: SimClock) -> None:
     unsealed = TrialLedger.memory(clock=clock)
@@ -104,7 +101,6 @@ def test_a_policy_and_its_ledger_agree_on_the_segments(clock: SimClock) -> None:
 # 2. A ticket's days are exactly what the ledger recorded (R2).
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 @pytest.mark.spec("K5", "A2", "C11")
 def test_a_day_that_equals_anything_does_not_pass_for_the_issued_one(clock: SimClock) -> None:
     ledger = TrialLedger.memory(clock=clock)
@@ -118,7 +114,6 @@ def test_a_day_that_equals_anything_does_not_pass_for_the_issued_one(clock: SimC
         )
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 @pytest.mark.spec("K5", "A2", "C11")
 @pytest.mark.parametrize("field", ["first_day", "last_day", "config_hash", "code_hash", "label"])
 def test_a_run_spec_must_hold_plain_dates_and_strings(clock: SimClock, field: str) -> None:
@@ -140,7 +135,6 @@ def test_a_run_spec_must_hold_plain_dates_and_strings(clock: SimClock, field: st
 # 3. Reads come from a checked chain, and a ticket dies with its run entry (R3, C1).
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 @pytest.mark.spec("A2", "K5", "ARCH§10")
 @pytest.mark.parametrize(
     "tamper",
@@ -167,7 +161,6 @@ def test_a_ticket_dies_with_its_run_entry(
         ledger.settle(ticket, records("a"))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 @pytest.mark.spec("A2", "C11", "ARCH§10")
 def test_counts_come_from_a_chain_that_verifies(tmp_path: Path, clock: SimClock) -> None:
     path = tmp_path / "research.db"
@@ -189,7 +182,6 @@ def test_counts_come_from_a_chain_that_verifies(tmp_path: Path, clock: SimClock)
             read()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=ValueError)
 @pytest.mark.spec("A2", "ARCH§10")
 def test_an_unknown_kind_is_a_broken_chain(tmp_path: Path, clock: SimClock) -> None:
     path = tmp_path / "research.db"
@@ -204,7 +196,6 @@ def test_an_unknown_kind_is_a_broken_chain(tmp_path: Path, clock: SimClock) -> N
 # 4. A crashed run of a configuration goes where its identical rerun goes (R4).
 
 
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=AssertionError)
 @pytest.mark.spec("C11")
 def test_a_crashed_run_follows_its_identical_rerun(clock: SimClock) -> None:
     ledger = TrialLedger.memory(clock=clock)

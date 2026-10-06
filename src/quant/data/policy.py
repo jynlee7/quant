@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from enum import StrEnum
-from typing import Protocol
+from typing import ClassVar, Final, Protocol, final
 
 from quant.core.errors import ConfigError, LockboxError, PolicyError
 
@@ -51,16 +51,32 @@ class Purpose(StrEnum):
     REPORT = "report"  # parity replays and reports
 
 
+FIT_START: Final = date(2016, 1, 1)
+DEV_START: Final = date(2019, 1, 1)
+LOCKBOX_START: Final = date(2025, 1, 1)
+
+
+@final
 @dataclass(frozen=True)
 class Segments:
-    fit_start: date = date(2016, 1, 1)
-    dev_start: date = date(2019, 1, 1)
-    lockbox_start: date = date(2025, 1, 1)
+    """Where each segment starts and ends.
+
+    The spec fixes where FIT, DEV and the lockbox start (SPEC §2 splits, A2, C1), so they are
+    class constants: no caller can move them, and Segments can't be subclassed (TypeError). A
+    later lockbox would make 2025 DEV, ticketed and scored; a later DEV would make its first
+    days FIT, scored without a ticket. Only the seal, `lockbox_end`, is configuration.
+    """
+
+    fit_start: ClassVar[date] = FIT_START
+    dev_start: ClassVar[date] = DEV_START
+    lockbox_start: ClassVar[date] = LOCKBOX_START
     lockbox_end: date | None = None  # the seal: the day before the first paper decision
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("Segments can't be subclassed: the spec fixes where they start (A2, C1)")
+
     def __post_init__(self) -> None:
-        ordered = self.fit_start < self.dev_start < self.lockbox_start
-        if not ordered or (self.lockbox_end is not None and self.lockbox_end < self.lockbox_start):
+        if self.lockbox_end is not None and self.lockbox_end < self.lockbox_start:
             raise ConfigError(f"data segments out of order: {self}")
 
     def spans(self) -> dict[Segment, tuple[date, date]]:
@@ -140,10 +156,22 @@ class LedgerPort(Protocol):
 
 @dataclass(frozen=True)
 class DataPolicy:
-    """The segments, and the trial ledger that vouches for tickets (None: no ticket is good)."""
+    """The segments, and the trial ledger that vouches for tickets (None: no ticket is good).
+
+    A ledger that names its own segments (`TrialLedger.segments`) must name these, or the policy
+    refuses to be built (ConfigError): the ledger issues tickets by the same segments the policy
+    checks reads by.
+    """
 
     segments: Segments = Segments()
     ledger: LedgerPort | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.segments) is not Segments:
+            raise ConfigError(f"a policy needs Segments, not {type(self.segments).__qualname__}")
+        bound = getattr(self.ledger, "segments", None)
+        if bound is not None and bound != self.segments:
+            raise ConfigError(f"the policy's {self.segments} differ from its ledger's {bound}")
 
     def check(
         self, purpose: Purpose, first: date, last: date, *, ticket: ScoringTicket | None = None

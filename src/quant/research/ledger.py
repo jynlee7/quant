@@ -25,10 +25,11 @@ the records is known before the ticket exists. A run is therefore placed twice:
 
 The trial count (`trial_count`) is the number of trials holding at least one run, each run placed
 by its records once it has settled and by what it is until then. A run that never settles (it
-crashed or was stopped) was still allowed to read DEV, so it counts until its records show that it
-repeats an earlier run; a rerun of a settled configuration adds nothing even before it settles.
-Trial numbers are never reused, so a trial left empty leaves a gap. G6 uses the count after the
-candidate's own run has settled.
+crashed or was stopped) was still allowed to read DEV, so it counts until a run of the same
+configuration, code and days settles: it then goes where the latest such run went, since it would
+have made the same decisions (C11: a rerun reuses its trial). A rerun of a settled configuration
+adds nothing even before it settles. Trial numbers are never reused, so a trial left empty leaves
+a gap. G6 uses the count after the candidate's own run has settled.
 
 Yardsticks (baselines and cost-sensitivity runs) are not trials (C11). They score under the ticket
 of the run they measure and never settle, so they add nothing to the count.
@@ -38,10 +39,13 @@ between its first and last day. Only `open_run` builds one, with this module's p
 ticket is good only with the ledger object that issued it: `verify_ticket` refuses anything but a
 TrialTicket itself (plain objects, lookalikes, subclasses), one built without the token, one this
 ledger never issued (copies, tickets built with a stolen token, and tickets from any other ledger
-object, even one open on the same file), and one changed since it was issued. DataPolicy asks the
-ledger it is bound to, so a ticket is no use anywhere else. A ticket stays good after its run
-settles, for the yardsticks. No lockbox ticket exists in v1 (P9): `open_run` refuses any span that
-reaches the lockbox, and the go-live test (B19) is the only thing that will ever add one.
+object, even one open on the same file), one changed since it was issued (judged by identity, so
+no field's own `==` can vouch for it), and one whose run entry is no longer in a chain that
+verifies. DataPolicy asks the ledger it is bound to, so a ticket is no use anywhere else. A ticket
+stays good after its run settles, for the yardsticks. No lockbox ticket exists in v1 (P9):
+`open_run` refuses any span that reaches the lockbox, and the go-live test (B19) is the only thing
+that will ever add one. The ledger and every policy bound to it hold the same Segments, whose DEV
+and lockbox starts the spec fixes (quant.data.policy).
 
 **Refusals (A2, ARCHITECTURE §6.3).** A read the bound DataPolicy refuses, and a ticket request
 `open_run` refuses for its span, leaves a `refusal` entry: what was asked for, the days, the error
@@ -56,8 +60,14 @@ row holds its kind, when it was appended (the ledger's clock, epoch microseconds
 canonical JSON, the hash of the entry before it (`prev`; GENESIS for the first) and its own hash,
 `entry_hash(seq, kind, at, body, prev)`. The single `head` row names the last entry and its hash
 and is written in the same transaction as every append, so a row deleted from the end, or one
-added behind the ledger's back, is caught as well. Appends run under the write lock, so two
-ledger objects on one file chain correctly.
+added behind the ledger's back, is caught as well, unless the head is rewritten to match. The
+chain has no anchor outside research.db: a rewrite of the whole file (every row re-chained and the
+head with it, or both tables emptied) passes `verify`. Only the quant user can write research.db
+(ARCHITECTURE §2), and the nightly backups (§9.4) keep earlier copies of the chain, though v1
+checks none against it. A ticket whose run entry such a rewrite removed is refused all the same.
+Every read (`entries`, `trial_count`, `gate_config_hash`, `verify_ticket`) takes the rows and the
+head in one snapshot and raises LedgerError unless they verify. Appends run under the write lock,
+so two ledger objects on one file chain correctly.
 
 | Kind | Body (canonical JSON; days are ISO dates) |
 |---|---|
@@ -281,18 +291,30 @@ class ChainReport:
 
 class TrialLedger:
     """The trial ledger in research.db (A2, C11). Its clock stamps entries and tickets; its
-    segments say where DEV and the lockbox are."""
+    segments say where DEV and the lockbox are, and every policy bound to it must hold the same
+    (quant.data.policy.DataPolicy)."""
 
     def __init__(
         self, conn: sqlite3.Connection, *, clock: Clock, segments: Segments | None = None
     ) -> None:
         """Migrate `conn` to MIGRATIONS (quant.store.sqlite.migrate, name "research.db") and use
         it. `segments` defaults to `Segments()`. The ledger starts with no tickets issued."""
+        segments = Segments() if segments is None else segments
+        if type(segments) is not Segments:
+            raise LedgerError(f"a ledger needs Segments, not {type(segments).__qualname__}")
         migrate(conn, MIGRATIONS, name="research.db")
         self._conn = conn
         self._clock = clock
-        self._segments = segments or Segments()
+        self._segments = segments
         self._issued: dict[TrialTicket, tuple[object, ...]] = {}
+        # The run entries of the chain last found to verify, and what the file looked like then.
+        self._seen: tuple[int, int] | None = None
+        self._runs_seen: dict[str, dict[str, Any]] = {}
+
+    @property
+    def segments(self) -> Segments:
+        """Where DEV and the lockbox are, for this ledger and every policy bound to it."""
+        return self._segments
 
     @classmethod
     def open(cls, path: Path, *, clock: Clock, segments: Segments | None = None) -> TrialLedger:
@@ -324,6 +346,8 @@ class TrialLedger:
         """Append a `run` entry for `spec`, then issue its ticket (A2, C11).
 
         Checks first, appending nothing for a bad request:
+        - the days must be exactly `date`s and the hashes and label exactly `str`s, so that no
+          subclass's own comparisons judge the span (LedgerError);
         - `config_hash` and `code_hash` must be 64 lowercase hex characters: LedgerError;
         - the span must lie inside DEV. One that reaches the lockbox raises LockboxError, since
           no lockbox ticket exists in v1 (P9); any other span outside DEV, or one that ends
@@ -337,6 +361,9 @@ class TrialLedger:
         appends the entry. Only after the commit does it build the ticket and keep it as issued.
         If the append fails, the error propagates and no ticket exists.
         """
+        for name, kind in _SPEC_TYPES.items():
+            if type(getattr(spec, name)) is not kind:
+                raise LedgerError(f"a RunSpec's {name} must be exactly a {kind.__name__}")
         _check_hash(spec.config_hash, "config_hash")
         _check_hash(spec.code_hash, "code_hash")
         try:
@@ -424,19 +451,25 @@ class TrialLedger:
         """The number of trials holding at least one run, as the module docstring defines it:
         the count G6's Deflated Sharpe deflates by. Refusals, gate configs and yardsticks add
         nothing."""
-        _, placements, _ = _runs(self.entries())
+        _, placements, _ = _runs(self._checked_entries())
         return len(set(placements.values()))
 
     # --- tickets and refusals (K5, ARCHITECTURE §6.3) -------------------------------------------
 
     def verify_ticket(self, ticket: object) -> TrialTicket:
-        """`ticket`, if this ledger object issued it and it is unchanged; otherwise TicketError.
+        """`ticket`, if this ledger object issued it, it is unchanged and its run entry stands;
+        otherwise TicketError.
 
         Refused, each with a message saying why: anything whose type is not exactly TrialTicket;
         a TrialTicket whose token is missing or not the private one; one this ledger object never
         issued, judged by identity (a copy, one built with the token by anyone else, one issued by
-        another ledger object); and one whose fields differ from what was issued. It reads no
-        database, so DataPolicy can call it on every read. This is DataPolicy's LedgerPort.
+        another ledger object); one any of whose fields is not the very object issued (identity,
+        so no field's own `==` can vouch for it); one when the chain doesn't verify; and one whose
+        `run` entry is gone from the chain or no longer names the ticket's trial, days and hashes.
+
+        The chain is rechecked only when the file has changed since it last verified (SQLite's
+        `data_version` for other connections, `total_changes` for this one), so DataPolicy can call
+        it on every read. This is DataPolicy's LedgerPort.
         """
         if type(ticket) is not TrialTicket:
             raise TicketError("ticket must be exactly a TrialTicket")
@@ -445,8 +478,23 @@ class TrialLedger:
         issued = self._issued.get(ticket)
         if issued is None:
             raise TicketError("ticket was never issued by this ledger object")
-        if _ticket_fields(ticket) != issued:
+        if any(now is not then for now, then in zip(_ticket_fields(ticket), issued, strict=True)):
             raise TicketError("ticket changed after it was issued")
+        try:
+            run = self._verified_runs().get(ticket.run_id)
+        except LedgerError as exc:
+            raise TicketError(
+                f"the ledger's chain does not verify, so no ticket is good: {exc}"
+            ) from exc
+        expected = {
+            "trial": ticket.trial_id,
+            "config_hash": ticket.config_hash,
+            "code_hash": ticket.code_hash,
+            "first_day": ticket.first_day.isoformat(),
+            "last_day": ticket.last_day.isoformat(),
+        }
+        if run is None or any(run.get(key) != value for key, value in expected.items()):
+            raise TicketError(f"run {ticket.run_id}'s entry is not in the ledger as issued")
         return ticket
 
     def record_refusal(self, refusal: Refusal) -> None:
@@ -492,28 +540,41 @@ class TrialLedger:
 
     def gate_config_hash(self) -> str | None:
         """The config_hash of the last gate configuration recorded, or None."""
-        return _gate_config_hash(self.entries())
+        return _gate_config_hash(self._checked_entries())
 
     # --- the chain (ARCHITECTURE §10) ---------------------------------------------------------
 
     def entries(self) -> list[LedgerEntry]:
-        """Every entry, in order."""
-        return [
-            LedgerEntry(seq, EntryKind(kind), from_us(at), canonical_loads(body), prev, digest)
-            for seq, kind, at, body, prev, digest in self._conn.execute(
-                "SELECT seq, kind, at, body, prev, hash FROM entries ORDER BY seq"
-            )
-        ]
+        """Every entry, in order, read in one snapshot: LedgerError unless the chain verifies."""
+        return self._checked_entries()
 
     def verify(self) -> ChainReport:
         """Recheck the whole chain; see `verify_file`."""
         return _verify(self._conn)
 
     def _checked_entries(self) -> list[LedgerEntry]:
-        report = self.verify()
+        rows, heads = _read(self._conn)
+        report = _check(rows, heads)
         if not report.ok:
             raise LedgerError("; ".join(report.problems))
-        return self.entries()
+        return [
+            LedgerEntry(seq, EntryKind(kind), from_us(at), canonical_loads(body), prev, digest)
+            for seq, kind, at, body, prev, digest in rows
+        ]
+
+    def _verified_runs(self) -> dict[str, dict[str, Any]]:
+        """The `run` entries' bodies by run id, from a chain that verifies (LedgerError if not).
+
+        Rechecked only when the file may have changed: `data_version` moves when another
+        connection commits, `total_changes` when this one writes. Both are read before the
+        snapshot, so a change made during the check is seen next time."""
+        seen = (self._conn.execute("PRAGMA data_version").fetchone()[0], self._conn.total_changes)
+        if seen != self._seen:
+            self._seen = None
+            runs, _, _ = _runs(self._checked_entries())
+            self._runs_seen = {run["run"]: run for run in runs}
+            self._seen = seen
+        return self._runs_seen
 
     def _append(
         self, kind: EntryKind, body: Mapping[str, Any], entries: list[LedgerEntry]
@@ -560,6 +621,15 @@ def _check_hash(value: str, name: str) -> None:
         raise LedgerError(f"{name} must be 64 lowercase SHA-256 hex characters")
 
 
+_SPEC_TYPES: Final[dict[str, type]] = {
+    "config_hash": str,
+    "code_hash": str,
+    "first_day": date,
+    "last_day": date,
+    "label": str,
+}
+
+
 def _ticket_fields(ticket: TrialTicket) -> tuple[object, ...]:
     return tuple(getattr(ticket, name, None) for name in TrialTicket.__slots__)
 
@@ -567,6 +637,7 @@ def _ticket_fields(ticket: TrialTicket) -> tuple[object, ...]:
 def _runs(
     entries: list[LedgerEntry],
 ) -> tuple[list[dict[str, Any]], dict[str, str], list[dict[str, Any]]]:
+    """The run bodies, each run's placement (module docstring) and the result bodies, in order."""
     runs = []
     placements = {}
     results = []
@@ -577,7 +648,19 @@ def _runs(
         elif entry.kind is EntryKind.RESULT:
             results.append(entry.body)
             placements[entry.body["run"]] = entry.body["trial"]
+    # A run that hasn't settled goes where the latest settled run of its identity went (C11).
+    settled = {result["run"] for result in results}
+    twins = {_identity(run): run["run"] for run in runs if run["run"] in settled}
+    for run in runs:
+        twin = twins.get(_identity(run))
+        if run["run"] not in settled and twin is not None:
+            placements[run["run"]] = placements[twin]
     return runs, placements, results
+
+
+def _identity(run: Mapping[str, Any]) -> tuple[Any, ...]:
+    """What a run is (C11): its configuration, its code and the days it scores."""
+    return (run["config_hash"], run["code_hash"], run["first_day"], run["last_day"])
 
 
 def _next_trial(entries: list[LedgerEntry]) -> str:
@@ -596,7 +679,11 @@ def _gate_config_hash(entries: list[LedgerEntry]) -> str | None:
 
 
 def _verify(conn: sqlite3.Connection) -> ChainReport:
-    # The rows and head must describe one snapshot, even while another writer appends.
+    return _check(*_read(conn))
+
+
+def _read(conn: sqlite3.Connection) -> tuple[list[Any], list[Any]]:
+    """The entry rows and the head rows, from one snapshot even while another writer appends."""
     own_snapshot = not conn.in_transaction
     if own_snapshot:
         conn.execute("BEGIN")
@@ -608,6 +695,10 @@ def _verify(conn: sqlite3.Connection) -> ChainReport:
     finally:
         if own_snapshot:
             conn.execute("ROLLBACK")
+    return rows, heads
+
+
+def _check(rows: list[Any], heads: list[Any]) -> ChainReport:
     problems = []
     previous = GENESIS
     for expected, (seq, kind, at, text, prev, digest) in enumerate(rows, 1):
