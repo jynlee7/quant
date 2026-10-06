@@ -12,8 +12,8 @@ from datetime import UTC, date, datetime
 import pytest
 
 from quant.core.errors import LockboxError, PolicyError
-from quant.data.policy import DataPolicy, Purpose, Segment, Segments
-from tests.support.bars import SYMBOL, Ticket, store_with_days
+from quant.data.policy import Purpose, Segment, Segments
+from tests.support.bars import SYMBOL, Ticket, store_with_days, vouched_policy
 
 TRIAL = Ticket("t1", date(2019, 1, 1), date(2024, 12, 31))
 
@@ -34,7 +34,7 @@ def test_days_fall_in_the_segments_the_spec_names() -> None:
 
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
 def test_the_policy_refuses_to_score_or_report_on_the_lockbox() -> None:
-    policy = DataPolicy(Segments(lockbox_end=date(2026, 10, 20)))
+    policy = vouched_policy(Segments(lockbox_end=date(2026, 10, 20)))
     policy.check(Purpose.OPERATE, date(2016, 1, 4), date(2026, 11, 30))  # C1: market data only
     policy.check(Purpose.SCORE, date(2016, 1, 4), date(2024, 12, 31), ticket=TRIAL)
     policy.check(Purpose.REPORT, date(2026, 10, 21), date(2026, 11, 30))
@@ -58,5 +58,5 @@ def test_the_view_enforces_the_policy_on_every_read() -> None:
     with pytest.raises(LockboxError):
         view.minutes(SYMBOL, datetime(2025, 1, 2, 14, tzinfo=UTC), tau, purpose=Purpose.SCORE)
     dev_end = datetime(2024, 12, 31, 23, tzinfo=UTC)
-    dev_only = store.view(dev_end, as_of=dev_end, ticket=TRIAL)
+    dev_only = store.view(dev_end, as_of=dev_end, policy=vouched_policy(), ticket=TRIAL)
     assert len(dev_only.hourly(SYMBOL, purpose=Purpose.SCORE)) == 7 + 7

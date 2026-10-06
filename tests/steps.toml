@@ -14,3 +14,6 @@ covers = ["I1", "A2", "C1", "AD2", "SPEC§2", "ARCH§6.1", "ARCH§6.2", "ARCH§6
 
 [steps.B3]
 covers = ["SPEC§3", "D3", "P8", "I1"]
+
+[steps.B10]
+covers = ["A2", "C11", "K5"]

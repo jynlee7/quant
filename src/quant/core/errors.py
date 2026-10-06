@@ -43,3 +43,14 @@ class FeatureError(ModelError):
     """A feature can't be computed or used: a missing, incomplete or invalid bar, a bar out of
     order, a value with no finite form, or a row still in the warm-up. A model error, so rule 6
     applies (spec §3)."""
+
+
+class TicketError(PolicyError):
+    """A trial ticket the ledger can't vouch for: not a TrialTicket, built without the ledger's
+    token, never issued by this ledger (copies and other ledgers' tickets), or changed since it
+    was issued (K5, A2)."""
+
+
+class LedgerError(QuantError):
+    """The trial ledger can't do what was asked: a broken chain, a run settled twice, a hash
+    that isn't SHA-256 hex, or no ledger at the path given (A2)."""

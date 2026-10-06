@@ -1,6 +1,6 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.4 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). Each change is tagged where it lands.
+**Status:** APPROVED v1.5 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). Each change is tagged where it lands.
 **Builds on:** [SPEC.md](SPEC.md) v1.2, which is v1.0 plus this document's C1–C10 and the plan's C11–C17
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
@@ -191,7 +191,7 @@ Steps 2–11 are the pure core. Features, the filter and every accumulator are s
 ### 4.4 Typed choke points
 
 - **`RiskApprovedOrder`** is a frozen type whose constructor demands a private token held by `risk.engine`. It carries the intent, an approval id and an expiry at the end of the bar. The Alpaca adapter's `submit` accepts nothing else, refuses expired approvals, and spends each approval id once (persisted, so a restart can't reuse one). Cancels and kill-switch closes use `RiskApprovedCancel` and `RiskApprovedFlatten`, which the risk engine always issues because they only reduce risk. The adapter has no other method that changes anything at the broker. (I4)
-- **`TrialTicket`** is issued only by the trial ledger, after it has appended the trial. The walk-forward refuses to score the development period without one. (A2)
+- **`TrialTicket`** is issued only by the trial ledger, after it has appended the trial. The walk-forward refuses to score the development period without one. (A2) It also refuses a ticket whose `config_hash` or `code_hash` differs from the release and code it runs, and it runs yardsticks (baselines and cost-sensitivity runs) only inside the measured run's own walk-forward, under that run's ticket (B10, built in B11).
 - **Live broker client:** the constructor requires `TRADING_MODE=live` *and* `golive.verify()` to pass. v1 ships with the checklist unsigned, so the constructor always refuses. (I5)
 
 ## 5. Time and schedule
@@ -249,7 +249,7 @@ On half days the calendar shifts everything earlier. With a 13:00 close, decisio
 - The purposes (B2): **operate** (features, the filter, refits) reads anything; **score** (strategy P&L, trades, gate results) reads FIT, and DEV with a trial ticket; **calibrate** (calibration and Kelly edge estimates) reads FIT, DEV with a trial ticket, and FORWARD; **report** (parity and reports) reads anything but the lockbox. Only operate may read the lockbox.
 - Kelly edge estimates and calibration skip the lockbox span: they use DEV walk-forward history, then FORWARD. On DEV that history is a trial's walk-forward, and Kelly's shadow returns are strategy P&L, so calibrate needs the trial's ticket there (C11).
 - DEV stays dark during the build as well: nothing computes strategy P&L on DEV before trial #1, which is the seed release r1, run at checkpoint CP2 (C11).
-- `quant lockbox seal` writes the closing date into `gates.yaml` when paper trading starts. It is committed like `risk.yaml`, and the engine won't trade paper until it is.
+- `quant lockbox seal` writes the closing date into `gates.yaml` when paper trading starts. It is committed like `risk.yaml`, and the engine won't trade paper until it is. The starts of FIT, DEV and the lockbox are constants in code; the seal is the only segment boundary that is configured (B10).
 - At go-live, item 7 scores 2025-01 → today as the spec says. The report shows the sealed part and the forward part separately, because only the sealed part was truly hidden.
 
 ## 7. Models
@@ -384,7 +384,7 @@ Every night at 02:00, SQLite's online backup copies all four databases and rsync
 - **Speed:** the streaming decision loop covers 2019–2024 in seconds. Refits dominate the cost: about 73 refits × 50 restarts. Fits are cached by feature config, HMM config, data hash, window end, previous model and training-code version. A playbook-only proposal reuses the champion's models and finishes in minutes. A feature or HMM change refits everything, which should take on the order of an hour on 4 cores; the build will measure it.
 - **Gates:** G1–G6 as in spec §11. The Deflated Sharpe uses the ledger's trial count and the variance of the Sharpe ratios across trials. The Newey–West lag is ⌊4(n/100)^(2/9)⌋.
 - **Baselines:** buy-and-hold SPY, walk-forward trend-following and walk-forward mean reversion. Each static family re-picks its parameters monthly from a fixed grid by the best Sharpe on its training window, and G5 requires beating all three (C14).
-- **Trial ledger:** append-only, and each row hashes the one before it. `quant ledger verify` re-checks the chain. Trials, lockbox openings and any gate-config change are all recorded.
+- **Trial ledger:** append-only, and each row hashes the one before it. `quant ledger verify` re-checks the chain. Trials, lockbox openings and any gate-config change are all recorded. The chain has no anchor outside `research.db`, so a rewrite of the whole file (every row re-chained with its head, or both tables emptied) passes `ledger verify`. v1 accepts this because only the quant user writes `research.db` (§2, §9.1); the nightly backups keep earlier copies, which v1 doesn't compare (B10).
 
 ## 11. Nightly loop
 
