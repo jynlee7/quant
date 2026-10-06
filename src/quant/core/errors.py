@@ -37,3 +37,9 @@ class PolicyError(QuantError):
 
 class LockboxError(PolicyError):
     """Scoring or reporting on the lockbox before the go-live test (A2, C1)."""
+
+
+class FeatureError(ModelError):
+    """A feature can't be computed or used: a missing, incomplete or invalid bar, a bar out of
+    order, a value with no finite form, or a row still in the warm-up. A model error, so rule 6
+    applies (spec §3)."""
