@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
+from typing import cast
 
 from quant.core.calendar import TradingCalendar
 from quant.core.clock import SimClock
 from quant.core.epoch import to_us
 from quant.data.frames import HourlyBar, MinuteFrame
 from quant.data.market_db import HISTORY, NOW, BarStore
+from quant.data.policy import DataPolicy, Refusal, ScoringTicket, Segments
 from quant.data.synthetic import synthetic_minutes
 
 SYMBOL = "SPY"
@@ -65,3 +67,23 @@ class Ticket:
     trial_id: str
     first_day: date
     last_day: date
+
+
+@dataclass
+class VouchingLedger:
+    """Stands in for the trial ledger in tests of the policy's segment rules: it vouches for
+    any ticket and keeps the refusals it is told of. The real ledger refuses forged and foreign
+    tickets; that is B10's to test (tests/unit/test_trial_tickets.py)."""
+
+    refusals: list[Refusal] = field(default_factory=list)
+
+    def verify_ticket(self, ticket: object) -> ScoringTicket:
+        return cast(ScoringTicket, ticket)
+
+    def record_refusal(self, refusal: Refusal) -> None:
+        self.refusals.append(refusal)
+
+
+def vouched_policy(segments: Segments | None = None) -> DataPolicy:
+    """A policy bound to a VouchingLedger, so a stand-in Ticket can score DEV."""
+    return DataPolicy(segments or Segments(), ledger=VouchingLedger())

@@ -17,11 +17,11 @@ from quant.core.errors import DataError, PolicyError
 from quant.data import market_db
 from quant.data.frames import MinuteFrame
 from quant.data.market_db import BarStore
-from quant.data.policy import DataPolicy, Purpose
+from quant.data.policy import Purpose
 from quant.data.synthetic import synthetic_minutes
 from quant.data.validate import validate_minutes
 from quant.store import sqlite as store_sqlite
-from tests.support.bars import Ticket, store_with_days, with_close
+from tests.support.bars import Ticket, store_with_days, vouched_policy, with_close
 
 DAY = date(2019, 7, 2)
 SYMBOL = "SPY"
@@ -191,7 +191,7 @@ def test_a_big_move_across_a_missing_minute_is_flagged() -> None:
 
 @pytest.mark.spec("C11", "A2", "ARCH§6.3")
 def test_scoring_dev_needs_a_trial_ticket_and_nothing_scores_before_the_data() -> None:
-    policy = DataPolicy()
+    policy = vouched_policy()
     policy.check(Purpose.SCORE, date(2016, 1, 4), date(2018, 12, 31))  # FIT needs no ticket
     with pytest.raises(PolicyError):
         policy.check(Purpose.SCORE, date(2019, 1, 2), date(2019, 3, 29))
@@ -305,11 +305,13 @@ def test_a_view_scores_dev_only_with_a_ticket_that_covers_the_read() -> None:
     store = store_with_days(date(2019, 1, 2), date(2019, 1, 3))
     tau = datetime(2019, 1, 4, tzinfo=UTC)
     ticket = Ticket("t1", date(2019, 1, 1), date(2024, 12, 31))
-    assert (
-        len(store.view(tau, as_of=tau, ticket=ticket).hourly(SYMBOL, purpose=Purpose.SCORE))
-        == 7 + 7
-    )
+    policy = vouched_policy()
+    view = store.view(tau, as_of=tau, policy=policy, ticket=ticket)
+    assert len(view.hourly(SYMBOL, purpose=Purpose.SCORE)) == 7 + 7
     short = Ticket("t2", date(2019, 1, 3), date(2024, 12, 31))
-    for view in (store.view(tau, as_of=tau), store.view(tau, as_of=tau, ticket=short)):
+    for view in (
+        store.view(tau, as_of=tau, policy=policy),
+        store.view(tau, as_of=tau, policy=policy, ticket=short),
+    ):
         with pytest.raises(PolicyError):
             view.hourly(SYMBOL, purpose=Purpose.SCORE)

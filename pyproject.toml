@@ -37,6 +37,7 @@ dev = [
 ]
 
 [project.scripts]
+quant = "quant.cli.main:app"
 quant-check = "quant_check.cli:main"
 
 [build-system]

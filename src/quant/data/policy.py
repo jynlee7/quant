@@ -13,6 +13,16 @@ walk-forward, and Kelly's shadow returns are strategy P&L, so they need its tick
 only FIT and DEV. Only the go-live lockbox test may score the lockbox (B19); v1 has no way to.
 Days before the data starts can't be read for any purpose but operating, since no segment holds
 them.
+
+Tickets are checked by the trial ledger the policy is bound to (B10, K5). Only the ledger holds
+the private token a TrialTicket is built with, and only it knows which tickets it issued, so the
+policy asks it (`LedgerPort.verify_ticket`) rather than trusting anything shaped like a ticket.
+A policy with no ledger can't score or calibrate DEV at all, which keeps DEV dark by default. A
+policy bound to a ledger also records there every read it refuses, so a refused attempt leaves a
+ledger entry (A2, ARCHITECTURE §6.3).
+
+This module never imports the ledger (quant.research.ledger imports it), so the data layer stays
+below research.
 """
 
 from __future__ import annotations
@@ -77,7 +87,8 @@ class Segments:
 class ScoringTicket(Protocol):
     """What the policy reads from a `TrialTicket`: the trial, and the days it may score.
 
-    Only the trial ledger issues tickets (B10, K5); this is the shape the data layer accepts.
+    Only the trial ledger issues tickets (B10, K5). A ticket's shape proves nothing: the policy
+    reads these fields only from a ticket its ledger has verified.
     """
 
     @property
@@ -91,13 +102,69 @@ class ScoringTicket(Protocol):
 
 
 @dataclass(frozen=True)
+class Refusal:
+    """A read the policy refused, as its ledger records it (A2, ARCHITECTURE §6.3).
+
+    - `purpose`: the purpose the read named, as text (`str(purpose)`), or "ticket" for a ticket
+      request the ledger refused;
+    - `first`, `last`: the days the read asked for, as passed to `DataPolicy.check`;
+    - `error`, `reason`: the name of the error raised (PolicyError, LockboxError, TicketError)
+      and its message;
+    - `ticket`: None when no ticket was shown; otherwise the shown object's type
+      (`type(ticket).__qualname__`), followed by a space and its `trial_id` when that is a str,
+      as in "TrialTicket T3" or "SimpleNamespace T1".
+    """
+
+    purpose: str
+    first: date
+    last: date
+    error: str
+    reason: str
+    ticket: str | None
+
+
+class LedgerPort(Protocol):
+    """What the policy asks of the trial ledger it is bound to: `quant.research.ledger.TrialLedger`.
+
+    Tests of the segment rules may bind a stand-in; the ledger's own checks are B10's tests.
+    """
+
+    def verify_ticket(self, ticket: object) -> ScoringTicket:
+        """`ticket`, if this ledger issued it and it is unchanged; otherwise raise TicketError."""
+        ...
+
+    def record_refusal(self, refusal: Refusal) -> None:
+        """Append a refusal entry."""
+        ...
+
+
+@dataclass(frozen=True)
 class DataPolicy:
+    """The segments, and the trial ledger that vouches for tickets (None: no ticket is good)."""
+
     segments: Segments = Segments()
+    ledger: LedgerPort | None = None
 
     def check(
         self, purpose: Purpose, first: date, last: date, *, ticket: ScoringTicket | None = None
     ) -> None:
-        """Raise unless `purpose` may read the days from `first` to `last`."""
+        """Raise unless `purpose` may read the days from `first` to `last`.
+
+        The segment rules are the module's table. A score or calibrate read that touches DEV
+        needs a ticket for the DEV days it reads (C11, A2, K5), checked in this order:
+
+        1. no ticket: PolicyError;
+        2. no ledger: PolicyError, since no ticket can be vouched for;
+        3. `self.ledger.verify_ticket(ticket)` raises TicketError for a forged, foreign or
+           changed ticket, and the policy lets it propagate;
+        4. the verified ticket must cover the DEV days read: PolicyError otherwise.
+
+        Every refusal, by any rule and for any purpose, is recorded in `self.ledger` when there
+        is one (`record_refusal`, with a `Refusal` built as its docstring says) before the error
+        is raised; the error raised is the refusal's own. If recording fails, that failure is
+        raised instead, and the read is refused either way. A read that is allowed records
+        nothing, and a ticket shown for a read outside DEV is not checked.
+        """
         try:
             purpose = Purpose(purpose)  # the string "score" names Purpose.SCORE
         except ValueError:
