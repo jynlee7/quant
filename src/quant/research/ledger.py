@@ -67,7 +67,11 @@ head with it, or both tables emptied) passes `verify`. Only the quant user can w
 checks none against it. A ticket whose run entry such a rewrite removed is refused all the same.
 Every read (`entries`, `trial_count`, `gate_config_hash`, `verify_ticket`) takes the rows and the
 head in one snapshot and raises LedgerError unless they verify. Appends run under the write lock,
-so two ledger objects on one file chain correctly.
+so two ledger objects (or processes) on one file chain correctly. An append checks only what is
+new: the entry the ledger object last verified or wrote must still be there unchanged, and every
+entry after it, the head and the new one must chain from it. So an append refuses a tail rewritten
+since it last saw it, even one that `verify` passes, but an edit further back is left for `verify`
+and the reads to find.
 
 | Kind | Body (canonical JSON; days are ISO dates) |
 |---|---|
@@ -84,8 +88,8 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Mapping
-from contextlib import closing
+from collections.abc import Iterator, Mapping
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from enum import StrEnum
@@ -178,7 +182,7 @@ class TrialTicket:
     - `trial_id`: the trial the run opened with ("T3");
     - `run_id`: the run ("R5"), the n-th run this ledger file has opened;
     - `first_day`, `last_day`, `config_hash`, `code_hash`: from the run's RunSpec;
-    - `issued_at`: the ledger's clock when it issued the ticket.
+    - `issued_at`: when the run's entry was appended (its `at`).
     """
 
     __slots__ = (
@@ -307,6 +311,8 @@ class TrialLedger:
         self._clock = clock
         self._segments = segments
         self._issued: dict[TrialTicket, tuple[object, ...]] = {}
+        # The chain as this object last verified or wrote it: appends check only what follows.
+        self._chain: list[LedgerEntry] = []
         # The run entries of the chain last found to verify, and what the file looked like then.
         self._seen: tuple[int, int] | None = None
         self._runs_seen: dict[str, dict[str, Any]] = {}
@@ -354,12 +360,13 @@ class TrialLedger:
           before it starts, raises PolicyError. Each of these refusals is recorded first as a
           `refusal` entry, `Refusal(purpose="ticket", ...)` with ticket None.
 
-        Under one write transaction it then reads the chain, gives the run the next run id
-        (R1, R2, ... over this file's `run` entries) and a trial as the module docstring says
-        (the trial, as it stands, of the latest earlier run with the same config_hash, code_hash,
-        first_day and last_day; otherwise the next trial number, T1, T2, ..., never reused), and
-        appends the entry. Only after the commit does it build the ticket and keep it as issued.
-        If the append fails, the error propagates and no ticket exists.
+        Under one write transaction it then reads the chain (checking what is new, as the module
+        docstring says), gives the run the next run id (R1, R2, ... over this file's `run`
+        entries) and a trial as the module docstring says (the trial, as it stands, of the latest
+        earlier run with the same config_hash, code_hash, first_day and last_day; otherwise the
+        next trial number, T1, T2, ..., never reused), and appends the entry. Only after the
+        commit does it build the ticket, issued at the entry's `at`, and keep it as issued. If
+        the append fails, the error propagates and no ticket exists.
         """
         for name, kind in _SPEC_TYPES.items():
             if type(getattr(spec, name)) is not kind:
@@ -383,8 +390,7 @@ class TrialLedger:
                 Refusal("ticket", spec.first_day, spec.last_day, type(exc).__name__, str(exc), None)
             )
             raise
-        with transaction(self._conn):
-            entries = self._checked_entries()
+        with self._writing() as entries:
             runs, placements, _ = _runs(entries)
             run_id = f"R{len(runs) + 1}"
             body = canonical_loads(canonical_dumps(asdict(spec)))
@@ -395,7 +401,7 @@ class TrialLedger:
             )
             trial_id = placements[prior["run"]] if prior is not None else _next_trial(entries)
             body.update(run=run_id, trial=trial_id)
-            self._append(EntryKind.RUN, body, entries)
+            entry = self._append(EntryKind.RUN, body, entries)
         ticket = TrialTicket(
             token=_TOKEN,
             trial_id=trial_id,
@@ -404,7 +410,7 @@ class TrialLedger:
             last_day=spec.last_day,
             config_hash=spec.config_hash,
             code_hash=spec.code_hash,
-            issued_at=ensure_utc(self._clock.now()),
+            issued_at=entry.at,
         )
         self._issued[ticket] = _ticket_fields(ticket)
         return ticket
@@ -419,8 +425,7 @@ class TrialLedger:
         """
         ticket = self.verify_ticket(ticket)
         _check_hash(records_hash, "records_hash")
-        with transaction(self._conn):
-            entries = self._checked_entries()
+        with self._writing() as entries:
             _, placements, results = _runs(entries)
             if any(result["run"] == ticket.run_id for result in results):
                 raise LedgerError(f"run {ticket.run_id} has already settled")
@@ -499,7 +504,7 @@ class TrialLedger:
 
     def record_refusal(self, refusal: Refusal) -> None:
         """Append a `refusal` entry: purpose, first_day, last_day, error, reason, ticket."""
-        with transaction(self._conn):
+        with self._writing() as entries:
             self._append(
                 EntryKind.REFUSAL,
                 {
@@ -510,7 +515,7 @@ class TrialLedger:
                     "reason": refusal.reason,
                     "ticket": refusal.ticket,
                 },
-                self._checked_entries(),
+                entries,
             )
 
     # --- gate configuration (ARCHITECTURE §10) ------------------------------------------------
@@ -522,8 +527,7 @@ class TrialLedger:
         # Freeze the caller's mapping before hashing and recording the same value.
         config = canonical_loads(canonical_dumps(config))
         digest = sha256_hex(config)
-        with transaction(self._conn):
-            entries = self._checked_entries()
+        with self._writing() as entries:
             previous = _gate_config_hash(entries)
             if digest == previous:
                 return None
@@ -557,10 +561,7 @@ class TrialLedger:
         report = _check(rows, heads)
         if not report.ok:
             raise LedgerError("; ".join(report.problems))
-        return [
-            LedgerEntry(seq, EntryKind(kind), from_us(at), canonical_loads(body), prev, digest)
-            for seq, kind, at, body, prev, digest in rows
-        ]
+        return [_entry(row) for row in rows]
 
     def _verified_runs(self) -> dict[str, dict[str, Any]]:
         """The `run` entries' bodies by run id, from a chain that verifies (LedgerError if not).
@@ -576,10 +577,39 @@ class TrialLedger:
             self._seen = seen
         return self._runs_seen
 
+    @contextmanager
+    def _writing(self) -> Iterator[list[LedgerEntry]]:
+        """One write transaction over the chain as it stands, checked as far as is new
+        (`_checked_tail`). `_append` adds to the list it yields, and the ledger object takes that
+        list as the chain it last verified only once the transaction has committed."""
+        with transaction(self._conn):
+            chain = self._checked_tail()
+            yield chain
+        self._chain = chain
+
+    def _checked_tail(self) -> list[LedgerEntry]:
+        """Under the write lock: the chain this object last verified, followed by the entries
+        appended since (by anyone). LedgerError unless the last entry it verified is still there,
+        hashing as it did, and the rows after it and the head chain from it."""
+        last = self._chain[-1] if self._chain else None
+        first = last.seq if last is not None else 1
+        rows = self._conn.execute(
+            "SELECT seq, kind, at, body, prev, hash FROM entries WHERE seq >= ? ORDER BY seq",
+            (first,),
+        ).fetchall()
+        heads = self._conn.execute("SELECT id, seq, hash FROM head").fetchall()
+        if last is not None and (not rows or (rows[0][0], rows[0][5]) != (last.seq, last.hash)):
+            raise LedgerError(f"entry {last.seq} is no longer the one this ledger last verified")
+        report = _check(rows, heads, first=first, previous=GENESIS if last is None else last.prev)
+        if not report.ok:
+            raise LedgerError("; ".join(report.problems))
+        return [*self._chain, *(_entry(row) for row in rows[0 if last is None else 1 :])]
+
     def _append(
         self, kind: EntryKind, body: Mapping[str, Any], entries: list[LedgerEntry]
     ) -> LedgerEntry:
-        """Append under the caller's write lock, updating the head in the same transaction."""
+        """Append under the caller's write lock, updating the head in the same transaction, and
+        add the new entry to `entries`."""
         seq = len(entries) + 1
         prev = entries[-1].hash if entries else GENESIS
         at = ensure_utc(self._clock.now())
@@ -594,7 +624,9 @@ class TrialLedger:
             "ON CONFLICT(id) DO UPDATE SET seq=excluded.seq, hash=excluded.hash",
             (seq, digest),
         )
-        return LedgerEntry(seq, kind, at, canonical_loads(text), prev, digest)
+        entry = LedgerEntry(seq, kind, at, canonical_loads(text), prev, digest)
+        entries.append(entry)
+        return entry
 
 
 def verify_file(path: Path) -> ChainReport:
@@ -606,11 +638,17 @@ def verify_file(path: Path) -> ChainReport:
     the same bytes); `prev` isn't the hash of the entry before (GENESIS for the first); a hash
     isn't `entry_hash` of its row; or the head doesn't name the last entry and its hash (an empty
     ledger has no head row). The chain holds when there are no problems.
+
+    A closed ledger has no -wal or -shm file beside it, and opening it read-only would still
+    create both (or fail where the directory can't be written), so it is opened as immutable:
+    SQLite then reads the one file, takes no locks and writes nothing. A ledger in use is read
+    through its -wal and -shm files. If a writer opens a closed ledger during the check and
+    checkpoints into it, the check may report a problem that a rerun doesn't.
     """
+    in_use = any(path.with_name(path.name + suffix).exists() for suffix in ("-wal", "-shm"))
+    uri = path.resolve().as_uri() + ("?mode=ro" if in_use else "?mode=ro&immutable=1")
     try:
-        with closing(
-            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
-        ) as conn:
+        with closing(sqlite3.connect(uri, uri=True, isolation_level=None)) as conn:
             return _verify(conn)
     except sqlite3.Error as exc:
         raise LedgerError(f"no readable ledger at {path}: {exc}") from exc
@@ -678,6 +716,11 @@ def _gate_config_hash(entries: list[LedgerEntry]) -> str | None:
     return None
 
 
+def _entry(row: Any) -> LedgerEntry:
+    seq, kind, at, body, prev, digest = row
+    return LedgerEntry(seq, EntryKind(kind), from_us(at), canonical_loads(body), prev, digest)
+
+
 def _verify(conn: sqlite3.Connection) -> ChainReport:
     return _check(*_read(conn))
 
@@ -698,10 +741,13 @@ def _read(conn: sqlite3.Connection) -> tuple[list[Any], list[Any]]:
     return rows, heads
 
 
-def _check(rows: list[Any], heads: list[Any]) -> ChainReport:
+def _check(
+    rows: list[Any], heads: list[Any], *, first: int = 1, previous: str = GENESIS
+) -> ChainReport:
+    """The problems with `rows`, the entries from `first` on (the whole chain by default), whose
+    first must link to `previous`, and with the head."""
     problems = []
-    previous = GENESIS
-    for expected, (seq, kind, at, text, prev, digest) in enumerate(rows, 1):
+    for expected, (seq, kind, at, text, prev, digest) in enumerate(rows, first):
         prefix = f"entry {seq}"
         if seq != expected:
             problems.append(f"{prefix}: expected sequence {expected}")

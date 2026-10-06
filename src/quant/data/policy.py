@@ -32,6 +32,8 @@ from datetime import date, timedelta
 from enum import StrEnum
 from typing import ClassVar, Final, Protocol, final
 
+import structlog
+
 from quant.core.errors import ConfigError, LockboxError, PolicyError
 
 
@@ -189,8 +191,10 @@ class DataPolicy:
 
         Every refusal, by any rule and for any purpose, is recorded in `self.ledger` when there
         is one (`record_refusal`, with a `Refusal` built as its docstring says) before the error
-        is raised; the error raised is the refusal's own. If recording fails, that failure is
-        raised instead, and the read is refused either way. A read that is allowed records
+        is raised; the error raised is the refusal's own, so `except PolicyError` (or
+        LockboxError, or TicketError) still catches it. If recording fails (a broken chain, a
+        locked file), the refusal's error is raised all the same, with a note saying why the
+        ledger couldn't record it, and the failure is logged. A read that is allowed records
         nothing, and a ticket shown for a read outside DEV is not checked.
         """
         try:
@@ -203,16 +207,20 @@ class DataPolicy:
                     trial = getattr(ticket, "trial_id", None)
                     if isinstance(trial, str):
                         shown += f" {trial}"
-                self.ledger.record_refusal(
-                    Refusal(
-                        str(purpose),
-                        first,
-                        last,
-                        type(exc).__name__,
-                        str(exc),
-                        shown,
+                refusal = Refusal(str(purpose), first, last, type(exc).__name__, str(exc), shown)
+                try:
+                    self.ledger.record_refusal(refusal)
+                except Exception as failure:  # the read stays refused, by its own error
+                    reason = f"{type(failure).__name__}: {failure}"
+                    exc.add_note(f"the ledger could not record this refusal: {reason}")
+                    structlog.get_logger().error(
+                        "refusal_not_recorded",
+                        purpose=refusal.purpose,
+                        first=first.isoformat(),
+                        last=last.isoformat(),
+                        error=refusal.error,
+                        failure=reason,
                     )
-                )
             raise
 
     def _check(

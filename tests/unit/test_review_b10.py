@@ -22,7 +22,7 @@ import pytest
 
 from quant.core.canonical import canonical_dumps, canonical_loads
 from quant.core.clock import SimClock
-from quant.core.errors import ConfigError, LedgerError, PolicyError, TicketError
+from quant.core.errors import ConfigError, LedgerError, TicketError
 from quant.data.policy import DataPolicy, Purpose, Segments
 from quant.research.ledger import TrialLedger
 from tests.support.ledger import LEDGER_START, records, run_spec
@@ -155,7 +155,7 @@ def test_a_ticket_dies_with_its_run_entry(
     _write(path, *tamper)
     with pytest.raises(TicketError):
         ledger.verify_ticket(ticket)
-    with pytest.raises((PolicyError, LedgerError)):
+    with pytest.raises(TicketError):  # recorded or not, the refusal's own error
         policy.check(Purpose.SCORE, date(2019, 1, 2), date(2019, 3, 29), ticket=ticket)
     with pytest.raises(TicketError):
         ledger.settle(ticket, records("a"))

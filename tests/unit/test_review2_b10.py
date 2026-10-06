@@ -57,7 +57,6 @@ def _refusal(n: int) -> Refusal:
 
 
 @pytest.mark.spec("A2", "K5", "ARCH§6.3")
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=LedgerError)
 def test_a_dead_ticket_is_refused_as_a_ticket_when_nothing_can_be_recorded(
     tmp_path: Path, clock: SimClock
 ) -> None:
@@ -73,7 +72,6 @@ def test_a_dead_ticket_is_refused_as_a_ticket_when_nothing_can_be_recorded(
 
 
 @pytest.mark.spec("A2", "C1", "ARCH§6.3")
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=LedgerError)
 def test_a_lockbox_read_is_refused_as_one_when_nothing_can_be_recorded(
     tmp_path: Path, clock: SimClock
 ) -> None:
@@ -89,7 +87,6 @@ def test_a_lockbox_read_is_refused_as_one_when_nothing_can_be_recorded(
 
 
 @pytest.mark.spec("A2", "ARCH§10")
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=AssertionError)
 def test_verifying_a_closed_ledger_leaves_no_files_behind(tmp_path: Path) -> None:
     path = tmp_path / "research.db"
     filled_ledger(path, SimClock(LEDGER_START))
@@ -108,7 +105,6 @@ def _read_only(directory: Path) -> Iterator[None]:
 
 
 @pytest.mark.spec("A2", "ARCH§10")
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=LedgerError)
 def test_a_ledger_in_a_read_only_directory_verifies(tmp_path: Path) -> None:
     path = tmp_path / "ro" / "research.db"
     path.parent.mkdir()
@@ -139,7 +135,6 @@ def test_a_ledger_held_open_by_a_writer_verifies(tmp_path: Path, clock: SimClock
 
 
 @pytest.mark.spec("A2", "ARCH§10")
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=AssertionError)
 def test_an_append_rehashes_only_what_is_new(
     clock: SimClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -201,10 +196,9 @@ def _plant_bad_row(path: Path) -> None:
 
 # A rewrite that re-chains the tail (or empties the file) passes `verify`, which has no anchor
 # outside research.db; a ledger object that has seen the head refuses to append over it.
-UNANCHORED = pytest.mark.xfail(strict=True, reason="red:B10", raises=pytest.fail.Exception)
 TAMPERS = [
     pytest.param(_edit_last_body, id="edit the last row"),
-    pytest.param(_rehash_last, id="edit and rehash the last row and the head", marks=UNANCHORED),
+    pytest.param(_rehash_last, id="edit and rehash the last row and the head"),
     pytest.param(_plant_bad_row, id="plant a row with a bad hash"),
     pytest.param(
         lambda path: _write(path, "DELETE FROM entries WHERE seq = (SELECT MAX(seq) FROM entries)"),
@@ -217,7 +211,6 @@ TAMPERS = [
     pytest.param(
         lambda path: _write(path, "DELETE FROM entries", "DELETE FROM head"),
         id="wipe both tables",
-        marks=UNANCHORED,
     ),
 ]
 
@@ -329,7 +322,6 @@ class TickingClock(SimClock):
 
 
 @pytest.mark.spec("K5", "ARCH§10")
-@pytest.mark.xfail(strict=True, reason="red:B10", raises=AssertionError)
 def test_a_ticket_is_issued_at_its_run_entrys_time() -> None:
     ledger = TrialLedger.memory(clock=TickingClock(LEDGER_START))
     ledger.record_refusal(_refusal(0))
