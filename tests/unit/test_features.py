@@ -110,7 +110,12 @@ def test_a_snapshot_is_canonical_json_of_fixed_size_and_restores_bit_for_bit() -
     assert (fresh.last_t_open, fresh.last_session, fresh.prev_close) == (None, None, None)
     assert fresh.sessions == 0
     assert fresh.returns == []
-    for history in (fresh.slot_returns, fresh.slot_ranges, fresh.slot_volumes):
+    for history in (
+        fresh.slot_numbers,
+        fresh.slot_returns,
+        fresh.slot_ranges,
+        fresh.slot_volumes,
+    ):
         assert history == {slot.value: [] for slot in Slot}
 
     whole = FeatureStream(config)
@@ -128,16 +133,31 @@ def test_a_snapshot_is_canonical_json_of_fixed_size_and_restores_bit_for_bit() -
     assert [bits(row) for row in rows] == [bits(row) for row in expected[half:]]
     assert canonical_dumps(resumed.snapshot()) == canonical_dumps(whole.snapshot())
 
-    # Fixed size: after a year every history sits at its bound, however long the stream runs.
+    # Fixed size: after a year each slot keeps exactly its bars of the last N sessions, however
+    # long the stream runs: N, or N - 1 for the afternoon slots a half day in them lacks.
     final = whole.snapshot()
     assert final.sessions == len({bar.session for bar in bars}) == whole.sessions
     assert final.last_t_open == to_us(bars[-1].t_open)
     assert final.last_session == bars[-1].session.isoformat()
     assert final.prev_close == bars[-1].close
     assert len(final.returns) == config.rvol.bars
+    n = config.slot_sessions
+    recent = sorted({bar.session for bar in bars})[-n:]
+    assert HALF_DAY in recent
+    numbers = {slot.value: [] for slot in Slot}
+    for bar in bars:
+        if bar.session in recent:
+            numbers[bar.slot.value].append(final.sessions - n + 1 + recent.index(bar.session))
+    assert final.slot_numbers == numbers
+    assert [len(numbers[slot.value]) for slot in (Slot.S1230, Slot.S1330, Slot.S1430)] == [
+        n - 1
+    ] * 3
+    assert len(numbers[Slot.CLOSE.value]) == n
     for history in (final.slot_returns, final.slot_ranges, final.slot_volumes):
         assert sorted(history) == sorted(slot.value for slot in Slot)
-        assert all(len(values) == config.slot_sessions for values in history.values())
+        assert {slot: len(values) for slot, values in history.items()} == {
+            slot: len(values) for slot, values in numbers.items()
+        }
     assert final.ema_fast is not None
     assert final.ema_slow is not None
 
@@ -157,6 +177,15 @@ def test_a_snapshot_restores_only_under_its_own_config() -> None:
     no_close = state.model_copy(update={"prev_close": None})
     with pytest.raises(ConfigError):
         FeatureStream.restore(config, no_close)
+    numbers = state.slot_numbers
+    for bad_numbers in (
+        {**numbers, "09:30": numbers["09:30"][1:]},  # fewer numbers than values
+        {**numbers, "09:30": numbers["09:30"][::-1]},  # out of order
+        {**numbers, "09:30": [*numbers["09:30"][:-1], state.sessions + 1]},  # a future session
+        {key: value for key, value in numbers.items() if key != "CLOSE"},  # a slot missing
+    ):
+        with pytest.raises(ConfigError):
+            FeatureStream.restore(config, state.model_copy(update={"slot_numbers": bad_numbers}))
     off = FeatureStream(_minimal())
     for bar in _bars()[:50]:
         off.update(bar)
@@ -220,7 +249,6 @@ def test_the_close_slot_is_normalized_against_close_history_only() -> None:
     assert all(rows[t].values[0] != moved_rows[t].values[0] for t in later_close)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=AssertionError)
 @pytest.mark.spec("SPEC§3", "ARCH§6.1")
 def test_a_slot_history_spans_the_prior_n_sessions_across_a_half_day() -> None:
     # Spec §3: a slot's history is its values "over the prior 60 sessions", counted in

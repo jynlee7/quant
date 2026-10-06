@@ -1,12 +1,12 @@
 """Streaming features F1–F5 over hourly bars (spec §3, D3, ARCHITECTURE §4.2).
 
 A `FeatureStream` consumes one symbol's hourly bars in time order, one `update` per bar, and
-returns that bar's `FeatureRow`. Its state is small and fixed-size: per-slot histories of at most
-N = `slot_sessions` values, the last B = `rvol.bars` returns, two EMAs and the previous close. It
-snapshots to canonical JSON for EngineState (`FeatureState`), and a restored stream continues bit
-for bit. A model's window is featurized by the same stream (`compute_features`), and a decision
-runs it through the point-in-time view (`features_for`), so live trading, the backtest and model
-fits share one implementation of every feature.
+returns that bar's `FeatureRow`. Its state is small and fixed-size: per-slot histories of the
+last N = `slot_sessions` sessions, the last B = `rvol.bars` returns, two EMAs and the previous
+close. It snapshots to canonical JSON for EngineState (`FeatureState`), and a restored stream
+continues bit for bit. A model's window is featurized by the same stream (`compute_features`),
+and a decision runs it through the point-in-time view (`features_for`), so live trading, the
+backtest and model fits share one implementation of every feature.
 
 **Definitions.** "The bars" are the bars the stream has consumed, in order, and "the previous
 bar" is the last one consumed before bar t. For bar t with close C_t, high H_t, low L_t and
@@ -17,12 +17,17 @@ volume V_t:
   bar (a half day's too), so the opening bar's return carries the overnight gap. The stream's
   first bar has no return.
 - x_t = (H_t - L_t) / C_{t-1}, the range ratio. The stream's first bar has none.
-- A slot's history of a quantity: its values on the most recent bars consumed before t with the
-  same `HourlyBar.slot`, at most N of them, oldest first. Each session has each slot at most
-  once, so on full days this is the slot's previous N sessions. The final 30-minute bar of every
-  session, full or half day, is the CLOSE slot, so CLOSE bars are compared only with CLOSE bars
-  (ARCHITECTURE §6.1). Half days have no 12:30, 13:30 or 14:30 bar, so those histories reach
-  back past them. Until N values exist, a history holds the k < N values seen so far.
+- Sessions are numbered 1, 2, ... in the order the stream consumes them: a bar whose session
+  differs from the previous bar's starts the next number. A half day is a session like any
+  other; a session none of whose bars was consumed gets no number.
+- A slot's history of a quantity: its values on the bars consumed before t with the same
+  `HourlyBar.slot` whose sessions are among the prior N sessions, numbers k - N to k - 1 for
+  t's session k (spec §3: "the same time slot over the prior 60 sessions"), oldest first. Each
+  session has each slot at most once, so a history holds at most N values. The final 30-minute
+  bar of every session, full or half day, is the CLOSE slot, so CLOSE bars are compared only
+  with CLOSE bars (ARCHITECTURE §6.1). Half days have no 12:30, 13:30 or 14:30 bar, so for the
+  N sessions after one those histories hold N - 1 values. Early on a history holds the values
+  of the sessions seen so far.
 
 - F1 ret = r_t / sigma, where sigma = sqrt(mean of r² over the slot's return history): an RMS, with no
   mean subtracted.
@@ -48,9 +53,10 @@ turn numpy warnings into errors, and Python's float division and `math.log` rais
 test the operands first. NaN is never stored in the state: x_t = 0 and V_t = 0 are stored as the
 numbers they are.
 
-**Warm-up.** The stream counts the distinct sessions it has consumed (a bar whose session differs
-from the previous bar's starts a new one). Rows of the first WARMUP_SESSIONS = 60 sessions are not
-warm and are dropped (spec §3), whatever N is.
+**Warm-up.** Rows of sessions 1 to WARMUP_SESSIONS = 60 are not warm and are dropped (spec §3),
+whatever N is. With N > 60, or a slow EMA span of hundreds of bars, the first warm rows still read
+short histories, or EMAs that carry their seed (the first close). Fits and live trading agree all
+the same, because both stream from the start of history (see `compute_features`).
 
 **Missing and bad bars.** An incomplete bar (its last minute missing: `complete` False) is
 missing data, and decisions treat it as missing. A bar with a price that isn't finite and
@@ -70,6 +76,7 @@ compare the stream with a slow reference within 1e-12, so the summation order is
 
 from __future__ import annotations
 
+import bisect
 import math
 import statistics
 from collections.abc import Sequence
@@ -134,8 +141,11 @@ class FeatureState(StrictModel):
       session and its close), all None before the first.
     - `sessions`: distinct sessions consumed, the warm-up count.
     - `returns`: the returns of the last up-to-B bars (F2).
-    - `slot_returns`, `slot_ranges`, `slot_volumes`: per slot, the up-to-N histories of r, x and
-      V (F1, F3, F4).
+    - `slot_numbers`: per slot, the session numbers of the slot's bars still in its window,
+      oldest first: at most N of them, in order, each from `sessions` - N to `sessions`.
+    - `slot_returns`, `slot_ranges`, `slot_volumes`: per slot, the histories of r, x and V
+      (F1, F3, F4). Each holds the values of the slot's last len(history) bars in
+      `slot_numbers` (the stream's first bar has a volume but no r or x).
     - `ema_fast`, `ema_slow`: F5's EMAs after the last bar.
     """
 
@@ -145,6 +155,7 @@ class FeatureState(StrictModel):
     sessions: int
     prev_close: float | None
     returns: list[float]
+    slot_numbers: dict[str, list[int]]
     slot_returns: dict[str, list[float]]
     slot_ranges: dict[str, list[float]]
     slot_volumes: dict[str, list[float]]
@@ -169,6 +180,7 @@ class FeatureStream:
             sessions=0,
             prev_close=None,
             returns=[],
+            slot_numbers={slot.value: [] for slot in Slot},
             slot_returns={slot.value: [] for slot in Slot},
             slot_ranges={slot.value: [] for slot in Slot},
             slot_volumes={slot.value: [] for slot in Slot},
@@ -218,7 +230,18 @@ class FeatureStream:
         ):
             raise FeatureError(f"invalid or incomplete feature bar at {bar.t_open.isoformat()}")
 
+        n = config.slot_sessions
+        session = bar.session.isoformat()
+        sessions = state.sessions + (session != state.last_session)  # this bar's session number
+        if sessions != state.sessions:  # a new session: every slot's window moves on
+            for name, numbers in state.slot_numbers.items():
+                _trim(
+                    numbers,
+                    (state.slot_returns[name], state.slot_ranges[name], state.slot_volumes[name]),
+                    bisect.bisect_left(numbers, sessions - n),
+                )
         slot = bar.slot.value
+        numbers = state.slot_numbers[slot]
         ret_hist = state.slot_returns[slot]
         range_hist = state.slot_ranges[slot]
         vol_hist = state.slot_volumes[slot]
@@ -244,15 +267,21 @@ class FeatureStream:
             slow = _ema(bar.close, slow, config.trend.slow)
             values.append(_log(fast / slow))
 
-        # Histories are updated only after the current row has read the prior slot values.
+        # Histories are updated only after the current row has read the prior slot values. The
+        # slot's next bar comes in a later session, whose window starts after session k - N,
+        # so this slot keeps at most its last N sessions.
+        numbers.append(sessions)
         if state.prev_close is not None:
-            _append(ret_hist, ret, config.slot_sessions)
+            ret_hist.append(ret)
             if config.range is not None:
-                _append(range_hist, ratio, config.slot_sessions)
+                range_hist.append(ratio)
         if config.volume is not None:
-            _append(vol_hist, bar.volume, config.slot_sessions)
-        session = bar.session.isoformat()
-        sessions = state.sessions + (session != state.last_session)
+            vol_hist.append(bar.volume)
+        _trim(
+            numbers,
+            (ret_hist, range_hist, vol_hist),
+            max(bisect.bisect_right(numbers, sessions - n), len(numbers) - n),
+        )
         self._state = state.model_copy(
             update={
                 "last_t_open": t_open,
@@ -287,7 +316,9 @@ class FeatureStream:
         doesn't fit the config: a slot map whose keys aren't exactly the seven Slot values, a
         history longer than its bound (N for slot histories, B for `returns`), a non-empty
         history or a non-None EMA for a transform that is off, or some but not all of
-        `last_t_open`, `last_session` and `prev_close` set.
+        `last_t_open`, `last_session` and `prev_close` set; or session numbers that don't fit:
+        more than N for a slot, out of order, outside `sessions` - N to `sessions`, or fewer
+        than one of the slot's histories has values.
         """
         if state.config_hash != config.config_hash():
             raise ConfigError("feature state belongs to a different config")
@@ -304,6 +335,18 @@ class FeatureStream:
                 for values in history.values()
             ):
                 raise ConfigError("slot histories do not fit the feature config")
+        oldest = max(1, state.sessions - config.slot_sessions)
+        if set(state.slot_numbers) != slots or any(
+            len(numbers) > config.slot_sessions
+            or numbers != sorted(numbers)
+            or any(not oldest <= number <= state.sessions for number in numbers)
+            or any(
+                len(history.get(slot, ())) > len(numbers)
+                for history in (state.slot_returns, state.slot_ranges, state.slot_volumes)
+            )
+            for slot, numbers in state.slot_numbers.items()
+        ):
+            raise ConfigError("slot session numbers do not fit the feature config")
         if len(state.returns) > config.rvol.bars or any(
             not math.isfinite(value) for value in state.returns
         ):
@@ -410,6 +453,13 @@ def compute_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Featur
     stream refuses raises its FeatureError. A warm row holding a NaN raises FeatureError naming
     its bar's t_open, because a model can't be fit on it. No bars, or none warm, gives a matrix
     with zero rows and the config's columns.
+
+    A row depends on every bar before it, not only on the last N sessions: F5's EMAs are seeded
+    with the first close, and the warm-up counts sessions from the first bar. So a fit passes the
+    bars from the start of history (2016-01), the same bars the live stream started from, and
+    cuts its training window with `FeatureMatrix.window`. Then the fit and live trading share
+    one seed, and a fit's rows equal the live stream's. Rows of `bars[:k]` equal the same rows
+    of `bars`: no row reads a later bar (I1).
     """
     stream = FeatureStream(config)
     opens, available, values = [], [], []
@@ -474,3 +524,13 @@ def _append(history: list[float], value: float, bound: int) -> None:
     history.append(value)
     if len(history) > bound:
         del history[0]
+
+
+def _trim(numbers: list[int], histories: Sequence[list[float]], drop: int) -> None:
+    """Drop a slot's `drop` oldest bars: their session numbers and their values. A history
+    with fewer values than `numbers` lacks them for the oldest bars, so it loses fewer."""
+    if drop <= 0:
+        return
+    for history in histories:
+        del history[: max(0, drop - (len(numbers) - len(history)))]
+    del numbers[:drop]

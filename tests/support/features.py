@@ -90,7 +90,8 @@ def _ema(closes: Sequence[float], i: int, span: int) -> float:
 
 def reference_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Reference:
     """Every bar's features, warm or not, with spec §3's definitions as the stream module states
-    them. A bar's slot history is its slot's last N bars before it."""
+    them. A bar's slot history is its slot's values in the prior N sessions, sessions numbered
+    in the order the bars bring them, a half day included."""
     n_hist = config.slot_sessions
     n_rvol = config.rvol.bars
     names = ["ret", "rvol"]
@@ -109,15 +110,21 @@ def reference_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Refe
     rows: list[list[float]] = []
     warm: list[bool] = []
     sessions: list[date] = []
+    number: list[int] = []  # each bar's session number, 1 for the first session
     for i, bar in enumerate(bars):
         if not sessions or sessions[-1] != bar.session:
             sessions.append(bar.session)
-        warm.append(len(sessions) > WARMUP)
+        k = len(sessions)
+        number.append(k)
+        warm.append(k > WARMUP)
 
-        same_slot = [j for j in range(i) if bars[j].slot == bar.slot]
-        ret_hist = [r[j] for j in same_slot if j > 0][-n_hist:]
-        range_hist = [x[j] for j in same_slot if j > 0][-n_hist:]
-        vol_hist = [bars[j].volume for j in same_slot][-n_hist:]
+        # The slot over the prior N sessions: sessions k - N to k - 1.
+        same_slot = [
+            j for j in range(i) if bars[j].slot == bar.slot and k - n_hist <= number[j] < k
+        ]
+        ret_hist = [r[j] for j in same_slot if j > 0]
+        range_hist = [x[j] for j in same_slot if j > 0]
+        vol_hist = [bars[j].volume for j in same_slot]
 
         values: dict[str, float] = {}
         # F1: the return over the RMS of the slot's earlier returns.

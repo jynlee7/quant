@@ -34,6 +34,7 @@ from quant.features.stream import (
     FeatureMatrix,
     FeatureRow,
     FeatureStream,
+    compute_features,
     features_for,
 )
 from tests.support.bars import SYMBOL, revise_close, store_with_days, synthetic_days
@@ -42,6 +43,7 @@ from tests.support.features import bits, stream_rows, synthetic_bars, with_price
 FIRST, LAST = date(2016, 9, 1), date(2016, 12, 9)  # 70 sessions: the last day is warm
 AFTER = datetime(2016, 12, 10, tzinfo=UTC)
 CHANGES = ("prices", "volume", "drop", "nan", "huge", "negative", "shuffle", "revise", "append")
+VALID = ("prices", "volume", "drop", "revise", "append")  # every bar stays one the stream takes
 
 
 @cache
@@ -52,6 +54,19 @@ def _bars() -> tuple[HourlyBar, ...]:
 @cache
 def _base() -> dict[datetime, FeatureRow]:
     return stream_rows(_bars(), r1_features())
+
+
+Rows = tuple[bytes, bytes, bytes]
+
+
+def _up_to(matrix: FeatureMatrix, t_open: datetime) -> Rows:
+    """The exact bits of a matrix's rows whose bars open at or before `t_open`."""
+    keep = matrix.t_open <= to_us(t_open)
+    return (
+        matrix.t_open[keep].tobytes(),
+        matrix.available_at[keep].tobytes(),
+        matrix.values[keep].tobytes(),
+    )
 
 
 def _change_after(bars: tuple[HourlyBar, ...], cut: int, change: str, seed: int) -> list[HourlyBar]:
@@ -79,7 +94,12 @@ def _change_after(bars: tuple[HourlyBar, ...], cut: int, change: str, seed: int)
     elif change == "append":
         last = bars[-1]
         tail += [
-            replace(last, t_open=last.t_open + timedelta(days=k), close=last.close * (1 + k))
+            replace(
+                last,
+                t_open=last.t_open + timedelta(days=k),
+                close=last.close * (1 + k),
+                high=last.close * (1 + k),
+            )
             for k in range(1, 4)
         ]
     return head + tail
@@ -98,12 +118,19 @@ def test_changing_bars_after_t_leaves_every_feature_at_t_unchanged(
 
 
 def _check_unchanged_up_to(cut: int, change: str, seed: int) -> None:
-    """Assert that changing the bars after index `cut` leaves every row up to it unchanged."""
+    """Assert that changing the bars after index `cut` leaves every row up to it unchanged,
+    bar by bar through the stream and in one batch through `compute_features`. The batch sees
+    the whole list at once, so it is where reading ahead could happen."""
     bars = _bars()
     base = _base()
-    changed = stream_rows(_change_after(bars, cut, change, seed), r1_features())
+    changed_bars = _change_after(bars, cut, change, seed)
+    changed = stream_rows(changed_bars, r1_features())
     for bar in bars[: cut + 1]:
         assert bits(changed[bar.t_open]) == bits(base[bar.t_open]), (cut, change, bar.t_open)
+    if change in VALID:  # a bad bar makes a batch raise, by design
+        whole = compute_features(bars, r1_features())
+        after = compute_features(changed_bars, r1_features())
+        assert _up_to(after, bars[cut].t_open) == _up_to(whole, bars[cut].t_open), (cut, change)
 
 
 def _peeking(bars: Sequence[HourlyBar], config: FeatureConfig) -> FeatureMatrix:
@@ -113,13 +140,41 @@ def _peeking(bars: Sequence[HourlyBar], config: FeatureConfig) -> FeatureMatrix:
     return FeatureMatrix(real.columns, real.t_open, real.available_at, leaked)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=pytest.fail.Exception)
 @pytest.mark.spec("I1", "SPEC§3")
 def test_the_lookahead_check_catches_a_planted_leak(monkeypatch: pytest.MonkeyPatch) -> None:
     # The check must be able to fail: a batch path that reads a later bar is caught.
-    monkeypatch.setattr(sys.modules[__name__], "compute_features", _peeking, raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "compute_features", _peeking)
     with pytest.raises(AssertionError):
         _check_unchanged_up_to(len(_bars()) - 20, "prices", 0)
+
+
+@pytest.mark.spec("I1", "SPEC§3", "ARCH§4.2")
+def test_a_batch_over_the_first_k_bars_gives_the_rows_of_all_the_bars() -> None:
+    bars = _bars()
+    whole = compute_features(bars, r1_features())
+    warm_cuts = 0
+    for k in [1, 100, 420, *range(len(bars) - 70, len(bars) + 1, 3)]:
+        prefix = compute_features(bars[:k], r1_features())
+        assert len(prefix) == len(np.flatnonzero(whole.t_open <= to_us(bars[k - 1].t_open)))
+        assert _up_to(prefix, bars[k - 1].t_open) == _up_to(whole, bars[k - 1].t_open), k
+        warm_cuts += len(prefix) > 0
+    assert warm_cuts > 20
+
+
+@pytest.mark.spec("I1", "SPEC§3", "ARCH§6.2")
+def test_a_decision_with_later_bars_in_view_reads_only_the_bars_up_to_it() -> None:
+    store = store_with_days(FIRST, LAST)
+    view = store.view(AFTER, as_of=AFTER)  # every bar of LAST is visible, later ones included
+    bars = view.hourly(SYMBOL, purpose=Purpose.OPERATE)
+    whole = compute_features(bars, r1_features())
+    for decision in _decisions(LAST):
+        vector = features_for(FeatureStream(r1_features()), view, SYMBOL, decision.bar)
+        k = next(i for i, bar in enumerate(bars) if bar.t_open == decision.bar.t_open) + 1
+        prefix = compute_features(bars[:k], r1_features())
+        assert prefix.t_open[-1] == to_us(decision.bar.t_open)
+        assert vector.tobytes() == prefix.values[-1].tobytes()
+        row = np.flatnonzero(whole.t_open == to_us(decision.bar.t_open))
+        assert vector.tobytes() == whole.values[row[0]].tobytes()
 
 
 def _decisions(day: date) -> tuple[Decision, ...]:
