@@ -157,7 +157,7 @@ def test_quant_ledger_verify_passes_an_intact_ledger(tmp_path: Path) -> None:
     assert report.head is not None
     code, output = _verify_cli(path)
     assert code == 0
-    assert "6" in output
+    assert output.startswith("6 entries; head ")
     assert report.head in output
 
 
