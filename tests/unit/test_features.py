@@ -220,6 +220,49 @@ def test_the_close_slot_is_normalized_against_close_history_only() -> None:
     assert all(rows[t].values[0] != moved_rows[t].values[0] for t in later_close)
 
 
+@pytest.mark.xfail(strict=True, reason="red:B3", raises=AssertionError)
+@pytest.mark.spec("SPEC§3", "ARCH§6.1")
+def test_a_slot_history_spans_the_prior_n_sessions_across_a_half_day() -> None:
+    # Spec §3: a slot's history is its values "over the prior 60 sessions", counted in
+    # sessions, not in bars. The half day 2016-11-25 has no 12:30, 13:30 or 14:30 bar, so for
+    # 60 sessions after it those slots' histories hold 59 values, not the last 60 bars.
+    config = r1_features()
+    n = config.slot_sessions
+    bars = _bars()
+    rows = stream_rows(bars, config)
+    number: dict[date, int] = {}
+    for bar in bars:
+        number.setdefault(bar.session, len(number) + 1)
+
+    checked, short = 0, 0
+    for i, bar in enumerate(bars):
+        row = rows[bar.t_open]
+        if not row.warm:
+            continue
+        k = number[bar.session]
+        prior = [
+            j for j in range(i) if bars[j].slot is bar.slot and k - n <= number[bars[j].session] < k
+        ]
+        # The stream's first bar has a volume but no return or range ratio.
+        returns = [math.log(bars[j].close / bars[j - 1].close) for j in prior if j > 0]
+        ranges = [(bars[j].high - bars[j].low) / bars[j - 1].close for j in prior if j > 0]
+        volumes = [bars[j].volume for j in prior]
+        sigma = math.sqrt(math.fsum(v * v for v in returns) / len(returns))
+        expect = {
+            "ret": math.log(bar.close / bars[i - 1].close) / sigma,
+            "range": math.log((bar.high - bar.low) / bars[i - 1].close)
+            - math.log(statistics.median(ranges)),
+            "volume": math.log(bar.volume / statistics.median(volumes)),
+        }
+        got = dict(zip(config.columns, row.values, strict=True))
+        for name, value in expect.items():
+            assert got[name] == pytest.approx(value, rel=0, abs=1e-12), (bar.t_open, name)
+        checked += 1
+        short += len(prior) == n - 1
+    assert checked > 300
+    assert short > 100  # the afternoon slots after the half day
+
+
 @pytest.mark.spec("SPEC§3")
 @pytest.mark.parametrize("slot_sessions", [20, 60, 120])
 def test_the_warm_up_drops_60_sessions(slot_sessions: int) -> None:

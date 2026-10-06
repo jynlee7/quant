@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 import random
+import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from functools import cache
@@ -18,6 +20,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+import quant.features.stream as stream_module
 from quant.core.calendar import TradingCalendar
 from quant.core.clock import SimClock
 from quant.core.epoch import to_us
@@ -26,8 +29,13 @@ from quant.core.schedule import Decision, decision_schedule
 from quant.data.frames import HourlyBar
 from quant.data.market_db import HISTORY, BarStore
 from quant.data.policy import Purpose
-from quant.features.menu import r1_features
-from quant.features.stream import FeatureRow, FeatureStream, features_for
+from quant.features.menu import FeatureConfig, r1_features
+from quant.features.stream import (
+    FeatureMatrix,
+    FeatureRow,
+    FeatureStream,
+    features_for,
+)
 from tests.support.bars import SYMBOL, revise_close, store_with_days, synthetic_days
 from tests.support.features import bits, stream_rows, synthetic_bars, with_prices
 
@@ -86,12 +94,32 @@ def _change_after(bars: tuple[HourlyBar, ...], cut: int, change: str, seed: int)
 def test_changing_bars_after_t_leaves_every_feature_at_t_unchanged(
     position: int, change: str, seed: int
 ) -> None:
+    _check_unchanged_up_to(position % (len(_bars()) - 1), change, seed)
+
+
+def _check_unchanged_up_to(cut: int, change: str, seed: int) -> None:
+    """Assert that changing the bars after index `cut` leaves every row up to it unchanged."""
     bars = _bars()
-    cut = position % (len(bars) - 1)
     base = _base()
     changed = stream_rows(_change_after(bars, cut, change, seed), r1_features())
     for bar in bars[: cut + 1]:
         assert bits(changed[bar.t_open]) == bits(base[bar.t_open]), (cut, change, bar.t_open)
+
+
+def _peeking(bars: Sequence[HourlyBar], config: FeatureConfig) -> FeatureMatrix:
+    """A planted leak: the real batch features shifted by the last bar's close."""
+    real = stream_module.compute_features(bars, config)
+    leaked = real.values + bars[-1].close
+    return FeatureMatrix(real.columns, real.t_open, real.available_at, leaked)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B3", raises=pytest.fail.Exception)
+@pytest.mark.spec("I1", "SPEC§3")
+def test_the_lookahead_check_catches_a_planted_leak(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The check must be able to fail: a batch path that reads a later bar is caught.
+    monkeypatch.setattr(sys.modules[__name__], "compute_features", _peeking, raising=False)
+    with pytest.raises(AssertionError):
+        _check_unchanged_up_to(len(_bars()) - 20, "prices", 0)
 
 
 def _decisions(day: date) -> tuple[Decision, ...]:
