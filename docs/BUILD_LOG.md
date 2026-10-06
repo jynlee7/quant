@@ -2,6 +2,81 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B3 · Features and the scaler (done 2026-10-06, tag `b03-done`)
+
+**Built**
+
+- `features.stream`: `FeatureStream` computes F1–F5 bar by bar from a small fixed-size state: each slot's values over the last N sessions with their session numbers, the last B returns, two EMAs and the previous close.
+  - The state snapshots to canonical JSON (`FeatureState`) and restores bit for bit, only under its own config. `restore` refuses a state that can't be one: negative ranges or volumes, a session that isn't an ISO date, a session count that no slot's numbers match, or histories out of step with their numbers.
+  - `update` refuses a bad bar with FeatureError and leaves the state as it was: a price that isn't finite and positive, prices out of order, a bad volume, a bar out of order, or prices too far apart for float64. An incomplete bar is missing data and is skipped.
+  - `compute_features` featurizes a fit's bars with the same stream, keeps the warm rows in a frozen `FeatureMatrix`, and drops a warm row holding a NaN, with a "feature row dropped" warning. A fit streams from 2016-01, as live trading does, and cuts its window with `FeatureMatrix.window` (SPEC v1.3).
+  - `features_for` gives a decision its vector through the point-in-time view, with purpose operate. A missing decision bar, a warm-up row or a NaN raises FeatureError, a model error, so rule 6 applies.
+- `features.scaler`: `Scaler.fit` takes the mean and the ddof 0 std of the rows whose `available_at` lies in [start, end), and nothing else. The scaler is frozen, refuses a constant column (std ≤ `STD_RTOL` × |mean|, also on load), and `transform` refuses columns from another config and any result that isn't finite.
+- `features.menu`: `FeatureConfig`, a StrictModel with PLAN §5's bounds. F1 and F2 are required, F3–F5 are optional, and the trend's fast span must be below its slow one. `config_hash` hashes canonical JSON, and `r1_features()` is r1's config.
+- `core.errors`: FeatureError, a ModelError.
+- `tests/support/features.py`: the slow reference, written as plain loops from SPEC §3 and used only by tests.
+
+A Claude agent wrote the stubs and tests (10d3191), and a Codex agent wrote the implementation (15c2cc9).
+
+**Tests:** 65 new (64 fast, 1 full), for 356 fast and 361 in all. Highlights:
+
+- The stream matches the reference within 1e-12 on every bar, warm-up included, for r1, every lower bound, and F1 and F2 at their upper bounds. Two runs agree bit for bit, and a restored snapshot continues bit for bit.
+- I1: changing any bar after t leaves every feature at t unchanged (hypothesis), through the stream and through `compute_features`, and a planted batch featurizer that reads the last bar fails the check. `compute_features(bars[:k])` gives the same rows as the full list. A decision reads only through the view, and a revision known after `as_of` can't reach it.
+- Slots: the CLOSE slot is compared only with CLOSE bars, a half day's included. For the N sessions after a half day, the 12:30, 13:30 and 14:30 histories hold N−1 values.
+- The warm-up drops 60 sessions. A bad bar is refused with the state unchanged, an overflow too, and a NaN or missing feature at decision time is a model error.
+- The scaler reads only its window, is frozen and applies forward. It refuses constant columns (0.1, 1e-20, −3.3 and 123456.789), and small values that really vary still fit.
+- The menu refuses unknown transforms and parameters, out-of-bounds values, fast ≥ slow and configs without F1 or F2. The config hash ignores key order and changes with every parameter.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| Fast gate | about 16 s (356 tests in 14 s) |
+| Full gate | 34 s |
+| Ten years of features (17,535 synthetic bars, r1, 17,115 warm rows) | 0.28 s; the target is 5 s |
+| One `update` | 13 µs |
+| One snapshot | 0.2 ms |
+
+**Review** (code-review skill and a Codex review in parallel, after the green). Each candidate was probed against the code before a test was written, and the candidates were fixed in two rounds.
+
+**Round 1**, fixed as red tests (f722e12) and a green commit (06a409e):
+
+- **R1/C4.** A slot's history held its last N bars, not its values in the prior N sessions as SPEC §3 says. A half day has no 12:30, 13:30 or 14:30 bar, so those histories reached back past N sessions: F1 at 2016-11-28 12:30 ET was −0.17990, against −0.17841 by the SPEC. The stream now numbers the sessions it reads and keeps each value's session number (`FeatureState.slot_numbers`), and the reference follows the SPEC.
+- **C3.** The lookahead property drove the stream bar by bar, so it couldn't fail: a planted batch featurizer that reads the last bar passed it. It now also checks `compute_features`, and new tests compare `compute_features(bars[:k])` and `features_for` with the prefix and the full batch.
+
+**Round 2**, fixed as red tests (6d59500) and a green commit (bce0792), in `tests/unit/test_review2_b3.py`:
+
+- **R2.** Finite prices too far apart for float64 (1e-300, then 1e300) gave a NaN return that the state kept, so the snapshot had no canonical JSON. The range ratio and V / median overflowed the same way. `update` now computes every value before it changes the state, and refuses with FeatureError, state unchanged, a return that rounds to infinity or 0, an overflowing range ratio, an EMA that isn't finite and positive, or any infinite row value.
+- **R3/C1.** A constant 0.1 column fit with a std of about 1e-17, because float64 can't hold 0.1. The scaler refuses a column whose std is at most `STD_RTOL` (1e-9) × |mean|. The check is in `__post_init__`, so a loaded scaler gets it too.
+- **R4.** A z-score that overflowed raised RuntimeWarning. `transform` runs under `np.errstate` and raises FeatureError.
+- **C5.** Int prices and volumes put ints in the snapshot, and a JSON round trip changed its canonical form. They become float64 before they are stored.
+- **C7.** One flat bar (H = L) in a fit window raised FeatureError and aborted the fit. `compute_features` drops the row and logs it; at decision time the row is still a model error (SPEC §3). The test that expected an all-flat batch to raise now expects zero rows, and a scaler fit on them to raise.
+- **C8.** `restore` accepted negative ranges or volumes, a last session that isn't an ISO date, an inconsistent session count, and histories out of step with their numbers. It refuses all four.
+- **C9.** `transform` couldn't refuse a vector from another config of the same width. It now takes the column names, which must match, and only a float64 ndarray (deviations).
+- **C10.** One helper, `freeze_arrays`, freezes the arrays of FeatureMatrix and Scaler.
+
+Not fixed, with reasons:
+
+- **C2. The warm-up stays 60 sessions whatever N is**, not max(60, N). SPEC §3 and PLAN B3 both say 60 sessions are dropped, and max(60, N) would change an approved decision for N > 60 while making no difference to r1. Fits and live trading agree all the same, because both stream from 2016-01 and share the EMA seed. The docstrings say so, and SPEC v1.3 states it.
+- **C6, in part.** The wedge it describes, a stored complete bar the stream refuses, can't happen: `check_minutes` rejects bad bars at ingest. The late-completed bar is real: a live stream that skipped an incomplete 10:30 bar diverged from the fit once the missing minute arrived (F2 −3.4591 live, against −3.5027 from the fit). The fix is a rebuild policy, which belongs to the engine (open items).
+
+The fixes weren't reviewed again. Each has its test, and the full gate passes.
+
+**Deviations** (documents updated in this merge)
+
+- SPEC v1.3, §3, written down from how B3 reads it, with no approved decision changed:
+  - one stream over every hourly bar from 2016-01, shared by fits and live trading, and a fit cuts its window from those rows;
+  - sessions are numbered in the order they are read, a half day counts as one, and "the prior N sessions" means sessions k−N to k−1, so after a half day the 12:30, 13:30 and 14:30 slots hold N−1 values;
+  - σ_slot is the RMS with no mean removed, an even count's median averages the two middle values, F3 is the log of the median, and each EMA uses α = 2/(n+1) and starts at the first close;
+  - the scaler takes the mean and the ddof 0 std of the warm rows with `available_at` in [start, end), and the warm-up drops 60 sessions whatever N is.
+- `Scaler.transform(values, *, columns)`: the red stub took `values` alone. The column names are required so that a vector from another config is refused (C9). No document names the signature; callers from B4 on pass the matrix's `columns`.
+
+**Open items**
+
+- **B14 or B5: the late-completed bar** (C6). The live stream skips an incomplete bar, and if its missing minute arrives later the stream no longer matches a fit over the same bars. It needs a rebuild policy: re-stream from history, or detect the late bar and apply rule 6.
+- **B5:** add the features and scaler layer to the T-NL1 truncation harness (CLAUDE.md rule 4). B3 touches the decision path, but the harness doesn't exist yet.
+- **B4** branched from main before this merge, so it must bring main in to use the features and the scaler.
+
 ## B10 · The trial ledger and TrialTicket (done 2026-10-06, tag `b10-done`)
 
 **Built**
