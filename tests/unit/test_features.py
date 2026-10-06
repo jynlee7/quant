@@ -23,6 +23,7 @@ from quant.core.epoch import to_us
 from quant.core.errors import ConfigError, FeatureError, ModelError
 from quant.data.frames import HourlyBar
 from quant.features.menu import FeatureConfig, Range, Ret, Rvol, Trend, Volume, r1_features
+from quant.features.scaler import Scaler
 from quant.features.stream import (
     WARMUP_SESSIONS,
     FeatureState,
@@ -410,8 +411,12 @@ def test_a_nan_feature_is_a_model_error() -> None:
         assert np.isfinite(row.values[2:]).all()
     with pytest.raises(FeatureError):
         warm[0].vector()
+    # A fit can't use a NaN row, so the batch drops it (and logs it); with every warm row NaN
+    # none is left, and fitting a scaler on the window is the model error.
+    matrix = compute_features(flat, r1_features())
+    assert len(matrix) == 0
     with pytest.raises(FeatureError):
-        compute_features(flat, r1_features())
+        Scaler.fit(matrix, start=warm[0].available_at, end=warm[-1].available_at)
 
 
 @pytest.mark.full

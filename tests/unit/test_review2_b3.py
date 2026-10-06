@@ -56,7 +56,6 @@ def _overflow(kind: str) -> tuple[list[HourlyBar], HourlyBar]:
     return before, after
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§3", "ARCH§4.3")
 @pytest.mark.parametrize("kind", ["return-up", "return-down", "range", "volume-ratio"])
 def test_a_bar_whose_features_overflow_is_refused_and_the_state_stays_canonical(
@@ -77,7 +76,6 @@ def test_a_bar_whose_features_overflow_is_refused_and_the_state_stays_canonical(
     FeatureStream.restore(config, FeatureState.model_validate(canonical_loads(snapshot)))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=AssertionError)
 @pytest.mark.spec("SPEC§3", "ARCH§4.3")
 def test_integer_bar_values_give_a_float_state_that_round_trips() -> None:
     # C5: int volumes and prices are stored as float64, so the snapshot's canonical JSON is the
@@ -99,7 +97,6 @@ def test_integer_bar_values_give_a_float_state_that_round_trips() -> None:
     assert all(type(v) is float for values in state.slot_volumes.values() for v in values)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§3")
 @pytest.mark.parametrize("value", [0.1, 1e-20, -3.3, 123456.789])
 def test_a_near_constant_column_is_refused(value: float) -> None:
@@ -121,17 +118,15 @@ def test_a_small_but_real_deviation_is_kept() -> None:
     assert centered.std[0] == pytest.approx(1e-9, rel=1e-12)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=RuntimeWarning)
 @pytest.mark.spec("SPEC§3")
 def test_a_standardized_value_that_overflows_is_a_model_error() -> None:
     # R4: finite parameters and a finite input can still give an infinite z-score. It must be
     # the model error, not a numpy warning or an infinity handed to the filter.
     scaler = Scaler.fit(_matrix([[-1e-160], [1e-160]]), start=START, end=END)
     with pytest.raises(FeatureError):
-        scaler.transform(np.array([1e308]))
+        scaler.transform(np.array([1e308]), columns=("a",))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=TypeError)
 @pytest.mark.spec("SPEC§3")
 def test_the_scaler_refuses_columns_it_was_not_fit_on() -> None:
     # C9: a vector of the same width from another config is scaled only if its names match the
@@ -148,7 +143,6 @@ def test_the_scaler_refuses_columns_it_was_not_fit_on() -> None:
             scaler.transform(bad, columns=("ret", "rvol"))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=FeatureError)
 @pytest.mark.spec("SPEC§3")
 def test_a_batch_drops_a_warm_row_with_a_nan_feature_and_logs_it() -> None:
     # C7: one flat bar (H == L, so F3 is ln 0) deep in a fit window must not abort the fit. A fit
@@ -197,7 +191,6 @@ def _restore_cases(state: FeatureState) -> dict[str, dict[str, Any]]:
     }
 
 
-@pytest.mark.xfail(strict=True, reason="red:B3", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§3", "ARCH§4.3")
 @pytest.mark.parametrize("case", sorted(_restore_cases(FeatureStream(r1_features()).snapshot())))
 def test_restore_refuses_values_out_of_range_or_out_of_step(case: str) -> None:

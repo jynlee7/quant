@@ -91,24 +91,24 @@ def test_a_fitted_scaler_is_frozen_and_applies_forward() -> None:
         scaler.std[0] = 1.0
 
     forward = matrix.window(END, LATER)
-    z = scaler.transform(forward.values)
+    z = scaler.transform(forward.values, columns=scaler.columns)
     assert z.shape == forward.values.shape
     assert z.dtype == np.float64
     np.testing.assert_allclose(z, (forward.values - mean) / std, rtol=1e-12, atol=0)
-    assert scaler.transform(forward.values[0]).tobytes() == z[0].tobytes()
+    assert scaler.transform(forward.values[0], columns=scaler.columns).tobytes() == z[0].tobytes()
     assert scaler.mean.tobytes() == mean.tobytes()  # applying it changed nothing
 
     # Inside the window the standardized rows have mean 0 and deviation 1.
-    inside = scaler.transform(matrix.window(start, END).values)
+    inside = scaler.transform(matrix.window(start, END).values, columns=scaler.columns)
     np.testing.assert_allclose(inside.mean(axis=0), 0.0, atol=1e-9)
     np.testing.assert_allclose(inside.std(axis=0), 1.0, rtol=1e-9)
 
     bad = forward.values[0].copy()
     bad[1] = np.nan
     with pytest.raises(FeatureError):
-        scaler.transform(bad)
+        scaler.transform(bad, columns=scaler.columns)
     with pytest.raises(FeatureError):
-        scaler.transform(forward.values[:, :2])
+        scaler.transform(forward.values[:, :2], columns=scaler.columns)
 
 
 @pytest.mark.spec("SPEC§3")

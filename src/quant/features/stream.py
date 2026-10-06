@@ -51,7 +51,14 @@ previous close (the stream's first bar), an empty history, sigma = 0, S = 0, or 
 bar with H == L or V == 0, or a zero median). Computing one must neither raise nor warn: the tests
 turn numpy warnings into errors, and Python's float division and `math.log` raise on zero, so
 test the operands first. NaN is never stored in the state: x_t = 0 and V_t = 0 are stored as the
-numbers they are.
+numbers they are. Every value from a bar is stored as a float64, so an int volume or price can't
+change the state's canonical JSON when it round-trips.
+
+**Overflow.** Valid prices can still be too far apart for float64: C_t / C_{t-1} rounds to
+infinity or to 0, x_t to infinity, an EMA leaves the finite positive numbers, or a row value
+(V_t / m, r_t / sigma, EMA_fast / EMA_slow) is infinite. That is no feature value, so `update`
+refuses the bar like bad data: FeatureError, with the state as it was. Neither NaN nor an
+infinity from arithmetic reaches the state, and no row value is ever infinite.
 
 **Warm-up.** Rows of sessions 1 to WARMUP_SESSIONS = 60 are not warm and are dropped (spec §3),
 whatever N is. With N > 60, or a slow EMA span of hundreds of bars, the first warm rows still read
@@ -61,11 +68,12 @@ the same, because both stream from the start of history (see `compute_features`)
 **Missing and bad bars.** An incomplete bar (its last minute missing: `complete` False) is
 missing data, and decisions treat it as missing. A bar with a price that isn't finite and
 positive, prices out of order (low above open or close, high below either), a negative or
-non-finite volume, or a t_open not after the previous bar's is bad data. `update` refuses both
-with FeatureError and leaves the state as it was. The stream then continues from its previous
-bar, so the next bar's return and range span the gap. A missing or NaN feature at decision time
-is a model error, so rule 6 applies (spec §3): `FeatureRow.vector` and `features_for` raise
-FeatureError, a ModelError.
+non-finite volume, or a t_open not after the previous bar's is bad data. `update` refuses both,
+and a bar that overflows, with FeatureError and leaves the state as it was. The stream then
+continues from its previous bar, so the next bar's return and range span the gap. A missing or
+NaN feature at decision time is a model error, so rule 6 applies (spec §3): `FeatureRow.vector`
+and `features_for` raise FeatureError, a ModelError. A model fit has no τ: `compute_features`
+drops a warm row holding a NaN, and logs it, rather than abort the fit.
 
 **Determinism.** Plain float64 arithmetic on the bars' values, with no clock, randomness or I/O,
 so identical bars give bit-identical rows (spec §3, ARCHITECTURE §14). Recompute each window
@@ -85,6 +93,7 @@ from datetime import date, datetime, timedelta
 from typing import Final
 
 import numpy as np
+import structlog
 
 from quant.core.calendar import BarSpec, Slot
 from quant.core.epoch import from_us, to_us
@@ -212,45 +221,52 @@ class FeatureStream:
         - a bar whose t_open isn't strictly after the last bar's;
         - open, high, low or close not finite and > 0, low > min(open, close), or
           high < max(open, close);
-        - a volume that is negative or not finite.
+        - a volume that is negative or not finite;
+        - a value that isn't a number float64 can hold (`float()` fails);
+        - a bar whose features overflow float64 (see "Overflow" in the module docstring).
 
-        Every other bar is consumed, even when some of its values are undefined (NaN in its
-        row): it is real data, and later bars need its close and its place in the histories.
+        Every check runs before the state changes. Every other bar is consumed, even when some
+        of its values are undefined (NaN in its row): it is real data, and later bars need its
+        close and its place in the histories.
         """
         state, config = self._state, self._config
         t_open = to_us(bar.t_open)
+        try:  # float64 from here on, so an int volume or price never reaches the state
+            open_, high, low, close, volume = (
+                float(value) for value in (bar.open, bar.high, bar.low, bar.close, bar.volume)
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise FeatureError(f"invalid feature bar at {bar.t_open.isoformat()}") from None
         if (
             not bar.complete
             or (state.last_t_open is not None and t_open <= state.last_t_open)
-            or any(not math.isfinite(p) or p <= 0 for p in (bar.open, bar.high, bar.low, bar.close))
-            or bar.low > min(bar.open, bar.close)
-            or bar.high < max(bar.open, bar.close)
-            or not math.isfinite(bar.volume)
-            or bar.volume < 0
+            or any(not math.isfinite(p) or p <= 0 for p in (open_, high, low, close))
+            or low > min(open_, close)
+            or high < max(open_, close)
+            or not math.isfinite(volume)
+            or volume < 0
         ):
             raise FeatureError(f"invalid or incomplete feature bar at {bar.t_open.isoformat()}")
 
+        # Everything is computed before the state changes, so a refused bar leaves it as it was.
         n = config.slot_sessions
         session = bar.session.isoformat()
         sessions = state.sessions + (session != state.last_session)  # this bar's session number
-        if sessions != state.sessions:  # a new session: every slot's window moves on
-            for name, numbers in state.slot_numbers.items():
-                _trim(
-                    numbers,
-                    (state.slot_returns[name], state.slot_ranges[name], state.slot_volumes[name]),
-                    bisect.bisect_left(numbers, sessions - n),
-                )
         slot = bar.slot.value
         numbers = state.slot_numbers[slot]
-        ret_hist = state.slot_returns[slot]
-        range_hist = state.slot_ranges[slot]
-        vol_hist = state.slot_volumes[slot]
+        window = len(numbers) - bisect.bisect_left(numbers, sessions - n)  # bars in k - N .. k - 1
+        ret_hist = _last(state.slot_returns[slot], window)
+        range_hist = _last(state.slot_ranges[slot], window)
+        vol_hist = _last(state.slot_volumes[slot], window)
         ret = math.nan
         ratio = math.nan
         returns = state.returns.copy()
         if state.prev_close is not None:
-            ret = _log(bar.close / state.prev_close)
-            ratio = (bar.high - bar.low) / state.prev_close
+            quotient = close / state.prev_close
+            ratio = (high - low) / state.prev_close
+            if not (math.isfinite(quotient) and quotient > 0 and math.isfinite(ratio)):
+                raise FeatureError(f"feature bar at {bar.t_open.isoformat()} overflows float64")
+            ret = math.log(quotient)
             _append(returns, ret, config.rvol.bars)
         sigma = math.sqrt(math.fsum(r * r for r in ret_hist) / len(ret_hist)) if ret_hist else 0.0
         total = math.fsum(r * r for r in returns)
@@ -260,26 +276,38 @@ class FeatureStream:
             values.append(_log(ratio) - _log(median_range))
         if config.volume is not None:
             median_volume = statistics.median(vol_hist) if vol_hist else 0.0
-            values.append(_log(bar.volume / median_volume) if median_volume > 0 else math.nan)
+            values.append(_log(volume / median_volume) if median_volume > 0 else math.nan)
         fast, slow = state.ema_fast, state.ema_slow
         if config.trend is not None:
-            fast = _ema(bar.close, fast, config.trend.fast)
-            slow = _ema(bar.close, slow, config.trend.slow)
+            fast = _ema(close, fast, config.trend.fast)
+            slow = _ema(close, slow, config.trend.slow)
+            if not all(math.isfinite(ema) and ema > 0 for ema in (fast, slow)):
+                raise FeatureError(f"feature bar at {bar.t_open.isoformat()} overflows float64")
             values.append(_log(fast / slow))
+        if any(math.isinf(value) for value in values):
+            raise FeatureError(f"features at {bar.t_open.isoformat()} overflow float64")
 
-        # Histories are updated only after the current row has read the prior slot values. The
-        # slot's next bar comes in a later session, whose window starts after session k - N,
-        # so this slot keeps at most its last N sessions.
+        # Histories are updated only after the current row has read the prior slot values. A new
+        # session moves every slot's window on. The slot's next bar comes in a later session,
+        # whose window starts after session k - N, so this slot keeps at most its last N sessions.
+        if sessions != state.sessions:
+            for name, slot_numbers in state.slot_numbers.items():
+                _trim(
+                    slot_numbers,
+                    (state.slot_returns[name], state.slot_ranges[name], state.slot_volumes[name]),
+                    bisect.bisect_left(slot_numbers, sessions - n),
+                )
+        histories = (state.slot_returns[slot], state.slot_ranges[slot], state.slot_volumes[slot])
         numbers.append(sessions)
         if state.prev_close is not None:
-            ret_hist.append(ret)
+            histories[0].append(ret)
             if config.range is not None:
-                range_hist.append(ratio)
+                histories[1].append(ratio)
         if config.volume is not None:
-            vol_hist.append(bar.volume)
+            histories[2].append(volume)
         _trim(
             numbers,
-            (ret_hist, range_hist, vol_hist),
+            histories,
             max(bisect.bisect_right(numbers, sessions - n), len(numbers) - n),
         )
         self._state = state.model_copy(
@@ -287,7 +315,7 @@ class FeatureStream:
                 "last_t_open": t_open,
                 "last_session": session,
                 "sessions": sessions,
-                "prev_close": bar.close,
+                "prev_close": close,
                 "returns": returns,
                 "ema_fast": fast,
                 "ema_slow": slow,
@@ -316,9 +344,14 @@ class FeatureStream:
         doesn't fit the config: a slot map whose keys aren't exactly the seven Slot values, a
         history longer than its bound (N for slot histories, B for `returns`), a non-empty
         history or a non-None EMA for a transform that is off, or some but not all of
-        `last_t_open`, `last_session` and `prev_close` set; or session numbers that don't fit:
-        more than N for a slot, out of order, outside `sessions` - N to `sessions`, or fewer
-        than one of the slot's histories has values.
+        `last_t_open`, `last_session` and `prev_close` set; values out of range: a range or
+        volume below 0, or a `last_session` that isn't an ISO date (YYYY-MM-DD); or session
+        numbers that don't fit: more than N for a slot, out of order, outside `sessions` - N to
+        `sessions`, or none equal to `sessions` (the last bar's session) when a bar has been
+        consumed; or histories out of step with them. A slot's volumes, when F4 is on, have one
+        value per session number; its returns, and its ranges when F3 is on, have one fewer
+        only when its oldest number is 1 and only in one slot (the stream's first bar has no
+        return or range), else one per number.
         """
         if state.config_hash != config.config_hash():
             raise ConfigError("feature state belongs to a different config")
@@ -335,18 +368,39 @@ class FeatureStream:
                 for values in history.values()
             ):
                 raise ConfigError("slot histories do not fit the feature config")
+        if any(
+            value < 0
+            for history in (state.slot_ranges, state.slot_volumes)
+            for values in history.values()
+            for value in values
+        ):
+            raise ConfigError("slot ranges and volumes can't be negative")
         oldest = max(1, state.sessions - config.slot_sessions)
         if set(state.slot_numbers) != slots or any(
             len(numbers) > config.slot_sessions
             or numbers != sorted(numbers)
             or any(not oldest <= number <= state.sessions for number in numbers)
-            or any(
-                len(history.get(slot, ())) > len(numbers)
-                for history in (state.slot_returns, state.slot_ranges, state.slot_volumes)
-            )
-            for slot, numbers in state.slot_numbers.items()
+            for numbers in state.slot_numbers.values()
         ):
             raise ConfigError("slot session numbers do not fit the feature config")
+        if state.sessions > 0 and not any(
+            numbers and numbers[-1] == state.sessions for numbers in state.slot_numbers.values()
+        ):
+            raise ConfigError("no slot holds the last bar's session")
+        lacking = 0  # slots whose returns lack a value: only the stream's first bar's slot
+        for slot, numbers in state.slot_numbers.items():
+            returns = len(state.slot_returns[slot])
+            lacks = len(numbers) - returns
+            lacking += lacks
+            if (
+                lacks not in (0, 1)
+                or (lacks and numbers[0] != 1)
+                or (config.range is not None and len(state.slot_ranges[slot]) != returns)
+                or (config.volume is not None and len(state.slot_volumes[slot]) != len(numbers))
+            ):
+                raise ConfigError("slot histories are out of step with their session numbers")
+        if lacking > 1:
+            raise ConfigError("only the stream's first bar lacks a return")
         if len(state.returns) > config.rvol.bars or any(
             not math.isfinite(value) for value in state.returns
         ):
@@ -356,6 +410,8 @@ class FeatureStream:
         ]
         if any(present) and not all(present):
             raise ConfigError("last bar time, session and close must be set together")
+        if state.last_session is not None and not _iso_date(state.last_session):
+            raise ConfigError("the last session must be an ISO date")
         emas = (state.ema_fast, state.ema_slow)
         if config.trend is None and any(value is not None for value in emas):
             raise ConfigError("a disabled trend must have no EMAs")
@@ -425,10 +481,7 @@ class FeatureMatrix:
             raise FeatureError(
                 "feature values must be a finite float64 matrix with matching columns"
             )
-        for name in ("t_open", "available_at", "values"):
-            frozen = getattr(self, name).copy()
-            frozen.flags.writeable = False
-            object.__setattr__(self, name, frozen)
+        freeze_arrays(self, "t_open", "available_at", "values")
 
     def __len__(self) -> int:
         """The number of rows."""
@@ -450,9 +503,16 @@ def compute_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Featur
     This is how a model's window is featurized (ARCHITECTURE §4.2): the decision path's streaming
     code over the bars a view returned. An incomplete bar is missing data and is skipped: it gets
     no row and leaves the stream untouched, exactly as if it weren't in the list. Any other bar the
-    stream refuses raises its FeatureError. A warm row holding a NaN raises FeatureError naming
-    its bar's t_open, because a model can't be fit on it. No bars, or none warm, gives a matrix
-    with zero rows and the config's columns.
+    stream refuses raises its FeatureError. No bars, or none warm, gives a matrix with zero rows
+    and the config's columns.
+
+    A warm row holding a NaN (a flat bar's F3, a zero volume's F4) is dropped from the matrix and
+    logged as a warning, "feature row dropped", with its bar's t_open (ISO) and the names of its
+    NaN columns. A model can't be fit on the row, and one such bar must not abort a fit of years
+    of bars, or every refit whose window holds it. Its bar was still consumed, so its close and
+    its place in the histories count for the rows after it, as they do live. At decision time
+    the same row is a model error (spec §3: "a missing or NaN feature at τ"): `vector` and
+    `features_for` raise. A window with too few rows left fails later, in `Scaler.fit`.
 
     A row depends on every bar before it, not only on the last N sessions: F5's EMAs are seeded
     with the first close, and the warm-up counts sessions from the first bar. So a fit passes the
@@ -467,10 +527,21 @@ def compute_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Featur
         if not bar.complete:
             continue
         row = stream.update(bar)
-        if row.warm:
-            values.append(row.vector())
-            opens.append(to_us(row.t_open))
-            available.append(to_us(row.available_at))
+        if not row.warm:
+            continue
+        missing = [
+            name
+            for name, value in zip(config.columns, row.values, strict=True)
+            if math.isnan(value)
+        ]
+        if missing:
+            structlog.get_logger().warning(
+                "feature row dropped", t_open=row.t_open.isoformat(), columns=missing
+            )
+            continue
+        values.append(row.vector())
+        opens.append(to_us(row.t_open))
+        available.append(to_us(row.available_at))
     return FeatureMatrix(
         config.columns,
         np.array(opens, dtype=np.int64),
@@ -508,9 +579,32 @@ def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar:
     raise FeatureError(f"decision bar at {bar.t_open.isoformat()} is missing or already consumed")
 
 
+def freeze_arrays(instance: object, *names: str) -> None:
+    """Replace each named array attribute of a frozen dataclass with a read-only copy, from its
+    `__post_init__`, so writing to one raises ValueError and the caller's array stays its own."""
+    for name in names:
+        frozen = getattr(instance, name).copy()
+        frozen.flags.writeable = False
+        object.__setattr__(instance, name, frozen)
+
+
 def _log(value: float) -> float:
-    """Undefined logarithms become missing features without a warning."""
-    return math.log(value) if value > 0 and math.isfinite(value) else math.nan
+    """Undefined logarithms (of NaN, zero or less) become missing features without a warning.
+    The log of infinity stays infinite, so `update` can refuse an overflow."""
+    return math.log(value) if value > 0 else math.nan
+
+
+def _iso_date(text: str) -> bool:
+    """Whether `text` is a date in the form `date.isoformat` writes."""
+    try:
+        return date.fromisoformat(text).isoformat() == text
+    except ValueError:
+        return False
+
+
+def _last(history: list[float], count: int) -> list[float]:
+    """The newest `count` values of a history, or all of it when it holds fewer."""
+    return history[max(0, len(history) - count) :]
 
 
 def _ema(close: float, previous: float | None, span: int) -> float:

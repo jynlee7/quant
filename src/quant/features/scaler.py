@@ -9,13 +9,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Final
 
 import numpy as np
 
 from quant.core.clock import ensure_utc
 from quant.core.errors import FeatureError
 from quant.data.frames import Floats
-from quant.features.stream import FeatureMatrix
+from quant.features.stream import FeatureMatrix, freeze_arrays
+
+# A column whose standard deviation is no more than this times its |mean| is constant: what is
+# left is the rounding error of a mean float64 can't hold exactly (about 1e-16 relative), and
+# z-scores on it would be about 1e16. Real feature columns vary far more than this.
+STD_RTOL: Final = 1e-9
 
 
 @dataclass(frozen=True)
@@ -36,10 +42,10 @@ class Scaler:
 
     def __post_init__(self) -> None:
         """Raise FeatureError unless `columns` is a non-empty tuple of names, `mean` and `std`
-        are 1-D float64 arrays with one finite value per column, every std is > 0, `rows` >= 2,
-        and start < end. `start` and `end` must be timezone-aware (a naive one raises
-        ClockError) and are kept in UTC. Replace the arrays with read-only copies
-        (`object.__setattr__`), so writing to them raises ValueError."""
+        are 1-D float64 arrays with one finite value per column, every std is > 0 and more than
+        STD_RTOL times its column's |mean|, `rows` >= 2, and start < end. `start` and `end` must
+        be timezone-aware (a naive one raises ClockError) and are kept in UTC. Replace the arrays
+        with read-only copies (`freeze_arrays`), so writing to them raises ValueError."""
         start, end = ensure_utc(self.start), ensure_utc(self.end)
         if (
             not isinstance(self.columns, tuple)
@@ -58,11 +64,9 @@ class Scaler:
                 or not np.isfinite(values).all()
             ):
                 raise FeatureError(f"scaler {name} must hold one finite float64 per column")
-            if name == "std" and (values <= 0).any():
-                raise FeatureError("scaler standard deviations must be positive")
-            frozen = values.copy()
-            frozen.flags.writeable = False
-            object.__setattr__(self, name, frozen)
+        if (self.std <= 0).any() or (self.std <= STD_RTOL * np.abs(self.mean)).any():
+            raise FeatureError("a scaler column is constant: its deviation is only rounding")
+        freeze_arrays(self, "mean", "std")
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
 
@@ -73,7 +77,9 @@ class Scaler:
 
         Rows outside the window can't reach the result, so data after the refit time can't
         either. Raises FeatureError when the window has fewer than 2 rows or a column is
-        constant there (std 0).
+        constant there: std 0, or no more than STD_RTOL times the column's |mean|, which is
+        what rounding leaves of a constant that float64 can't hold exactly (0.1 gives about
+        1e-17).
         """
         window = matrix.window(start, end)
         if len(window) < 2:
@@ -87,16 +93,28 @@ class Scaler:
             len(window),
         )
 
-    def transform(self, values: Floats) -> Floats:
+    def transform(self, values: Floats, *, columns: tuple[str, ...]) -> Floats:
         """`(values - mean) / std` as a new float64 array, with the frozen parameters.
 
-        `values` is one row, shape (d,), or a matrix, shape (n, d), with d = len(columns).
-        Raises FeatureError on any other shape, or a value that isn't finite.
+        `values` is one row, shape (d,), or a matrix, shape (n, d), of float64, and `columns`
+        names its columns, which must be exactly the scaler's `columns`: a vector of the same
+        width from another feature config is refused. Raises FeatureError for any other names,
+        shape or dtype, input that isn't a numpy array, a value that isn't finite, or a result
+        that isn't (a z-score that overflows float64 is a model error, not a warning).
         """
         if (
-            values.ndim not in (1, 2)
+            columns != self.columns
+            or not isinstance(values, np.ndarray)
+            or values.dtype != np.float64
+            or values.ndim not in (1, 2)
             or values.shape[-1] != len(self.columns)
             or not np.isfinite(values).all()
         ):
-            raise FeatureError("scaler input must be a finite row or matrix with matching columns")
-        return (np.asarray(values, dtype=np.float64) - self.mean) / self.std
+            raise FeatureError(
+                "scaler input must be a finite float64 row or matrix of the scaler's columns"
+            )
+        with np.errstate(over="ignore", invalid="ignore"):
+            scaled = (values - self.mean) / self.std
+        if not np.isfinite(scaled).all():
+            raise FeatureError("standardized features overflow float64")
+        return scaled
