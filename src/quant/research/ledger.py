@@ -72,17 +72,22 @@ research.db will also hold proposals, gate runs, walk-forward results and the fi
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Mapping
-from dataclasses import dataclass
+from contextlib import closing
+from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, final
 
-from quant.core.clock import Clock
-from quant.data.policy import Refusal, Segments
-from quant.store.sqlite import Migration
+from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
+from quant.core.clock import Clock, ensure_utc
+from quant.core.epoch import from_us, to_us
+from quant.core.errors import LedgerError, LockboxError, PolicyError, TicketError
+from quant.data.policy import Refusal, Segment, Segments
+from quant.store.sqlite import Migration, connect, migrate, transaction
 
 GENESIS: Final = "0" * 64
 """The `prev` of the first entry."""
@@ -128,7 +133,7 @@ def entry_hash(
 
     `at` is the timezone-aware time the entry was appended, so canonical JSON writes it in UTC
     with a Z. The hash covers every column of the row but the hash itself."""
-    raise NotImplementedError
+    return sha256_hex({"at": at, "body": body, "kind": str(kind), "prev": prev, "seq": seq})
 
 
 @dataclass(frozen=True)
@@ -198,25 +203,38 @@ class TrialTicket:
         code_hash: str,
         issued_at: datetime,
     ) -> None:
-        raise NotImplementedError
+        if token is not _TOKEN:
+            raise TicketError("a TrialTicket requires the ledger's private token")
+        fields = {
+            "_token": token,
+            "trial_id": trial_id,
+            "run_id": run_id,
+            "first_day": first_day,
+            "last_day": last_day,
+            "config_hash": config_hash,
+            "code_hash": code_hash,
+            "issued_at": issued_at,
+        }
+        for name, value in fields.items():
+            object.__setattr__(self, name, value)
 
     def __setattr__(self, name: str, value: object) -> None:
-        raise NotImplementedError
+        raise AttributeError("TrialTicket is immutable")
 
     def __delattr__(self, name: str) -> None:
-        raise NotImplementedError
+        raise AttributeError("TrialTicket is immutable")
 
     def __copy__(self) -> TrialTicket:
-        raise NotImplementedError
+        raise TypeError("TrialTicket cannot be copied")
 
     def __deepcopy__(self, memo: dict[int, object]) -> TrialTicket:
-        raise NotImplementedError
+        raise TypeError("TrialTicket cannot be copied")
 
     def __reduce_ex__(self, protocol: object) -> tuple[object, ...]:
-        raise NotImplementedError
+        raise TypeError("TrialTicket cannot be pickled")
 
     def __repr__(self) -> str:
-        raise NotImplementedError
+        return f"TrialTicket({self.trial_id}, {self.run_id}, {self.first_day} to {self.last_day})"
 
 
 @dataclass(frozen=True)
@@ -270,21 +288,35 @@ class TrialLedger:
     ) -> None:
         """Migrate `conn` to MIGRATIONS (quant.store.sqlite.migrate, name "research.db") and use
         it. `segments` defaults to `Segments()`. The ledger starts with no tickets issued."""
-        raise NotImplementedError
+        migrate(conn, MIGRATIONS, name="research.db")
+        self._conn = conn
+        self._clock = clock
+        self._segments = segments or Segments()
+        self._issued: dict[TrialTicket, tuple[object, ...]] = {}
 
     @classmethod
     def open(cls, path: Path, *, clock: Clock, segments: Segments | None = None) -> TrialLedger:
         """The ledger in the file at `path` (WAL mode, `quant.store.sqlite.connect`), created and
         migrated if needed."""
-        raise NotImplementedError
+        conn = connect(path)
+        try:
+            return cls(conn, clock=clock, segments=segments)
+        except BaseException:
+            conn.close()
+            raise
 
     @classmethod
     def memory(cls, *, clock: Clock, segments: Segments | None = None) -> TrialLedger:
         """A ledger in an in-memory database, for tests."""
-        raise NotImplementedError
+        conn = connect(":memory:")
+        try:
+            return cls(conn, clock=clock, segments=segments)
+        except BaseException:
+            conn.close()
+            raise
 
     def close(self) -> None:
-        raise NotImplementedError
+        self._conn.close()
 
     # --- runs and trials (C11) ----------------------------------------------------------------
 
@@ -305,7 +337,50 @@ class TrialLedger:
         appends the entry. Only after the commit does it build the ticket and keep it as issued.
         If the append fails, the error propagates and no ticket exists.
         """
-        raise NotImplementedError
+        _check_hash(spec.config_hash, "config_hash")
+        _check_hash(spec.code_hash, "code_hash")
+        try:
+            if spec.last_day < spec.first_day:
+                raise PolicyError(f"empty span {spec.first_day} to {spec.last_day}")
+            if Segment.LOCKBOX in self._segments.overlapping(spec.first_day, spec.last_day):
+                raise LockboxError("no lockbox ticket exists in v1 (P9)")
+            if (
+                not self._segments.dev_start
+                <= spec.first_day
+                <= spec.last_day
+                < self._segments.lockbox_start
+            ):
+                raise PolicyError("a trial ticket must cover DEV days only")
+        except PolicyError as exc:
+            self.record_refusal(
+                Refusal("ticket", spec.first_day, spec.last_day, type(exc).__name__, str(exc), None)
+            )
+            raise
+        with transaction(self._conn):
+            entries = self._checked_entries()
+            runs, placements, _ = _runs(entries)
+            run_id = f"R{len(runs) + 1}"
+            body = canonical_loads(canonical_dumps(asdict(spec)))
+            identity = ("config_hash", "code_hash", "first_day", "last_day")
+            prior = next(
+                (run for run in reversed(runs) if all(run[key] == body[key] for key in identity)),
+                None,
+            )
+            trial_id = placements[prior["run"]] if prior is not None else _next_trial(entries)
+            body.update(run=run_id, trial=trial_id)
+            self._append(EntryKind.RUN, body, entries)
+        ticket = TrialTicket(
+            token=_TOKEN,
+            trial_id=trial_id,
+            run_id=run_id,
+            first_day=spec.first_day,
+            last_day=spec.last_day,
+            config_hash=spec.config_hash,
+            code_hash=spec.code_hash,
+            issued_at=ensure_utc(self._clock.now()),
+        )
+        self._issued[ticket] = _ticket_fields(ticket)
+        return ticket
 
     def settle(self, ticket: TrialTicket, records_hash: str) -> Settlement:
         """Record the run's decision records and place the run by them (C11).
@@ -315,13 +390,42 @@ class TrialLedger:
         lowercase hex characters (LedgerError), and a run settles once (LedgerError the second
         time). Appends a `result` entry as the module docstring says, and returns its Settlement.
         """
-        raise NotImplementedError
+        ticket = self.verify_ticket(ticket)
+        _check_hash(records_hash, "records_hash")
+        with transaction(self._conn):
+            entries = self._checked_entries()
+            _, placements, results = _runs(entries)
+            if any(result["run"] == ticket.run_id for result in results):
+                raise LedgerError(f"run {ticket.run_id} has already settled")
+            repeat = next(
+                (result for result in results if result["records_hash"] == records_hash), None
+            )
+            trial_id = placements[ticket.run_id]
+            if repeat is not None:
+                trial_id = placements[repeat["run"]]
+            elif any(placements[result["run"]] == trial_id for result in results):
+                trial_id = _next_trial(entries)
+            settled = Settlement(
+                ticket.run_id, trial_id, records_hash, repeat["run"] if repeat is not None else None
+            )
+            self._append(
+                EntryKind.RESULT,
+                {
+                    "run": settled.run_id,
+                    "trial": settled.trial_id,
+                    "records_hash": settled.records_hash,
+                    "repeat_of": settled.repeat_of,
+                },
+                entries,
+            )
+        return settled
 
     def trial_count(self) -> int:
         """The number of trials holding at least one run, as the module docstring defines it:
         the count G6's Deflated Sharpe deflates by. Refusals, gate configs and yardsticks add
         nothing."""
-        raise NotImplementedError
+        _, placements, _ = _runs(self.entries())
+        return len(set(placements.values()))
 
     # --- tickets and refusals (K5, ARCHITECTURE §6.3) -------------------------------------------
 
@@ -334,11 +438,32 @@ class TrialLedger:
         another ledger object); and one whose fields differ from what was issued. It reads no
         database, so DataPolicy can call it on every read. This is DataPolicy's LedgerPort.
         """
-        raise NotImplementedError
+        if type(ticket) is not TrialTicket:
+            raise TicketError("ticket must be exactly a TrialTicket")
+        if getattr(ticket, "_token", None) is not _TOKEN:
+            raise TicketError("ticket is missing the ledger's private token")
+        issued = self._issued.get(ticket)
+        if issued is None:
+            raise TicketError("ticket was never issued by this ledger object")
+        if _ticket_fields(ticket) != issued:
+            raise TicketError("ticket changed after it was issued")
+        return ticket
 
     def record_refusal(self, refusal: Refusal) -> None:
         """Append a `refusal` entry: purpose, first_day, last_day, error, reason, ticket."""
-        raise NotImplementedError
+        with transaction(self._conn):
+            self._append(
+                EntryKind.REFUSAL,
+                {
+                    "purpose": refusal.purpose,
+                    "first_day": refusal.first,
+                    "last_day": refusal.last,
+                    "error": refusal.error,
+                    "reason": refusal.reason,
+                    "ticket": refusal.ticket,
+                },
+                self._checked_entries(),
+            )
 
     # --- gate configuration (ARCHITECTURE §10) ------------------------------------------------
 
@@ -346,21 +471,69 @@ class TrialLedger:
         """Append a `gate_config` entry if `config`'s canonical hash differs from the last one
         recorded (or none was), and return it; return None, appending nothing, when it is the
         same. `previous` is the last recorded config_hash, or None for the first."""
-        raise NotImplementedError
+        # Freeze the caller's mapping before hashing and recording the same value.
+        config = canonical_loads(canonical_dumps(config))
+        digest = sha256_hex(config)
+        with transaction(self._conn):
+            entries = self._checked_entries()
+            previous = _gate_config_hash(entries)
+            if digest == previous:
+                return None
+            return self._append(
+                EntryKind.GATE_CONFIG,
+                {
+                    "config": config,
+                    "config_hash": digest,
+                    "previous": previous,
+                    "reason": reason,
+                },
+                entries,
+            )
 
     def gate_config_hash(self) -> str | None:
         """The config_hash of the last gate configuration recorded, or None."""
-        raise NotImplementedError
+        return _gate_config_hash(self.entries())
 
     # --- the chain (ARCHITECTURE §10) ---------------------------------------------------------
 
     def entries(self) -> list[LedgerEntry]:
         """Every entry, in order."""
-        raise NotImplementedError
+        return [
+            LedgerEntry(seq, EntryKind(kind), from_us(at), canonical_loads(body), prev, digest)
+            for seq, kind, at, body, prev, digest in self._conn.execute(
+                "SELECT seq, kind, at, body, prev, hash FROM entries ORDER BY seq"
+            )
+        ]
 
     def verify(self) -> ChainReport:
         """Recheck the whole chain; see `verify_file`."""
-        raise NotImplementedError
+        return _verify(self._conn)
+
+    def _checked_entries(self) -> list[LedgerEntry]:
+        report = self.verify()
+        if not report.ok:
+            raise LedgerError("; ".join(report.problems))
+        return self.entries()
+
+    def _append(
+        self, kind: EntryKind, body: Mapping[str, Any], entries: list[LedgerEntry]
+    ) -> LedgerEntry:
+        """Append under the caller's write lock, updating the head in the same transaction."""
+        seq = len(entries) + 1
+        prev = entries[-1].hash if entries else GENESIS
+        at = ensure_utc(self._clock.now())
+        text = canonical_dumps(body).decode()
+        digest = entry_hash(seq, kind, at, body, prev)
+        self._conn.execute(
+            "INSERT INTO entries (seq, kind, at, body, prev, hash) VALUES (?, ?, ?, ?, ?, ?)",
+            (seq, str(kind), to_us(at), text, prev, digest),
+        )
+        self._conn.execute(
+            "INSERT INTO head (id, seq, hash) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET seq=excluded.seq, hash=excluded.hash",
+            (seq, digest),
+        )
+        return LedgerEntry(seq, kind, at, canonical_loads(text), prev, digest)
 
 
 def verify_file(path: Path) -> ChainReport:
@@ -373,4 +546,91 @@ def verify_file(path: Path) -> ChainReport:
     isn't `entry_hash` of its row; or the head doesn't name the last entry and its hash (an empty
     ledger has no head row). The chain holds when there are no problems.
     """
-    raise NotImplementedError
+    try:
+        with closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+        ) as conn:
+            return _verify(conn)
+    except sqlite3.Error as exc:
+        raise LedgerError(f"no readable ledger at {path}: {exc}") from exc
+
+
+def _check_hash(value: str, name: str) -> None:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise LedgerError(f"{name} must be 64 lowercase SHA-256 hex characters")
+
+
+def _ticket_fields(ticket: TrialTicket) -> tuple[object, ...]:
+    return tuple(getattr(ticket, name, None) for name in TrialTicket.__slots__)
+
+
+def _runs(
+    entries: list[LedgerEntry],
+) -> tuple[list[dict[str, Any]], dict[str, str], list[dict[str, Any]]]:
+    runs = []
+    placements = {}
+    results = []
+    for entry in entries:
+        if entry.kind is EntryKind.RUN:
+            runs.append(entry.body)
+            placements[entry.body["run"]] = entry.body["trial"]
+        elif entry.kind is EntryKind.RESULT:
+            results.append(entry.body)
+            placements[entry.body["run"]] = entry.body["trial"]
+    return runs, placements, results
+
+
+def _next_trial(entries: list[LedgerEntry]) -> str:
+    highest = max(
+        (int(e.body["trial"][1:]) for e in entries if e.kind in (EntryKind.RUN, EntryKind.RESULT)),
+        default=0,
+    )
+    return f"T{highest + 1}"
+
+
+def _gate_config_hash(entries: list[LedgerEntry]) -> str | None:
+    for entry in reversed(entries):
+        if entry.kind is EntryKind.GATE_CONFIG:
+            return str(entry.body["config_hash"])
+    return None
+
+
+def _verify(conn: sqlite3.Connection) -> ChainReport:
+    # The rows and head must describe one snapshot, even while another writer appends.
+    own_snapshot = not conn.in_transaction
+    if own_snapshot:
+        conn.execute("BEGIN")
+    try:
+        rows = conn.execute(
+            "SELECT seq, kind, at, body, prev, hash FROM entries ORDER BY seq"
+        ).fetchall()
+        heads = conn.execute("SELECT id, seq, hash FROM head").fetchall()
+    finally:
+        if own_snapshot:
+            conn.execute("ROLLBACK")
+    problems = []
+    previous = GENESIS
+    for expected, (seq, kind, at, text, prev, digest) in enumerate(rows, 1):
+        prefix = f"entry {seq}"
+        if seq != expected:
+            problems.append(f"{prefix}: expected sequence {expected}")
+        try:
+            EntryKind(kind)
+        except ValueError:
+            problems.append(f"{prefix}: unknown kind {kind!r}")
+        if prev != previous:
+            problems.append(f"{prefix}: prev does not match the preceding entry")
+        try:
+            body = canonical_loads(text)
+            if not isinstance(body, dict) or canonical_dumps(body).decode() != text:
+                problems.append(f"{prefix}: body is not a canonical JSON object")
+            if not isinstance(at, int) or entry_hash(seq, kind, from_us(at), body, prev) != digest:
+                problems.append(f"{prefix}: hash does not match its row")
+        except (ValueError, TypeError, OverflowError) as exc:
+            problems.append(f"{prefix}: invalid body or time: {exc}")
+        previous = digest
+    expected_head = [(1, rows[-1][0], rows[-1][5])] if rows else []
+    if heads != expected_head:
+        last = rows[-1][0] if rows else 0
+        problems.append(f"entry {last}: head does not name the last entry and its hash")
+    return ChainReport(len(rows), heads[0][2] if heads else None, tuple(problems))

@@ -23,8 +23,6 @@ from quant.research.ledger import EntryKind, TrialLedger
 from quant.store.sqlite import connect
 from tests.support.ledger import LEDGER_START, records, run_spec
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B10", raises=NotImplementedError)
-
 
 @pytest.fixture
 def clock() -> SimClock:

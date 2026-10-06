@@ -24,8 +24,6 @@ from quant.research.ledger import EntryKind, TrialLedger, TrialTicket
 from tests.support.bars import SYMBOL, Ticket, store_with_days
 from tests.support.ledger import LEDGER_START, run_spec
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B10", raises=NotImplementedError)
-
 DEV_READ = (date(2019, 1, 2), date(2019, 3, 29))
 SCORE_AND_CALIBRATE = [Purpose.SCORE, Purpose.CALIBRATE]
 FIELDS = ("trial_id", "run_id", "first_day", "last_day", "config_hash", "code_hash", "issued_at")

@@ -166,6 +166,31 @@ class DataPolicy:
         nothing, and a ticket shown for a read outside DEV is not checked.
         """
         try:
+            self._check(purpose, first, last, ticket=ticket)
+        except PolicyError as exc:
+            if self.ledger is not None:
+                shown = None
+                if ticket is not None:
+                    shown = type(ticket).__qualname__
+                    trial = getattr(ticket, "trial_id", None)
+                    if isinstance(trial, str):
+                        shown += f" {trial}"
+                self.ledger.record_refusal(
+                    Refusal(
+                        str(purpose),
+                        first,
+                        last,
+                        type(exc).__name__,
+                        str(exc),
+                        shown,
+                    )
+                )
+            raise
+
+    def _check(
+        self, purpose: Purpose, first: date, last: date, *, ticket: ScoringTicket | None
+    ) -> None:
+        try:
             purpose = Purpose(purpose)  # the string "score" names Purpose.SCORE
         except ValueError:
             raise PolicyError(
@@ -200,6 +225,9 @@ class DataPolicy:
                     f"a {purpose} read of {need[0]} to {need[1]} in DEV needs a trial ticket "
                     "from the ledger (C11, A2)"
                 )
+            if self.ledger is None:
+                raise PolicyError("DEV needs a policy bound to the ticket's trial ledger")
+            ticket = self.ledger.verify_ticket(ticket)
             if not ticket.first_day <= need[0] <= need[1] <= ticket.last_day:
                 raise PolicyError(
                     f"trial {ticket.trial_id} may score {ticket.first_day} to "

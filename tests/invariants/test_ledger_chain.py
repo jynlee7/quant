@@ -24,8 +24,6 @@ from quant.core.errors import LedgerError
 from quant.research.ledger import entry_hash, verify_file
 from tests.support.ledger import LEDGER_START, filled_ledger
 
-pytestmark = pytest.mark.xfail(strict=True, reason="red:B10", raises=NotImplementedError)
-
 Tamper = Callable[[sqlite3.Connection], None]
 
 

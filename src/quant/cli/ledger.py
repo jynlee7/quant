@@ -7,6 +7,9 @@ from typing import Annotated
 
 import typer
 
+from quant.core.errors import LedgerError
+from quant.research.ledger import verify_file
+
 DEFAULT_DB = Path("var/research.db")
 
 app = typer.Typer(no_args_is_help=True)
@@ -27,4 +30,13 @@ def verify(
     when it is broken, printing each problem on its own line. Exits 2 when there is no ledger
     at `db` (LedgerError), saying so and creating nothing.
     """
-    raise NotImplementedError
+    try:
+        report = verify_file(db)
+    except LedgerError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(2) from exc
+    if not report.ok:
+        for problem in report.problems:
+            typer.echo(problem)
+        raise typer.Exit(1)
+    typer.echo(f"{report.entries} entries; head {report.head or 'empty'}")
