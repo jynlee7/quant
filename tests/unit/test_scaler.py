@@ -18,7 +18,6 @@ from quant.features.scaler import Scaler
 from quant.features.stream import FeatureMatrix, compute_features
 from tests.support.features import synthetic_bars, with_prices
 
-RED = pytest.mark.xfail(strict=True, reason="red:B3", raises=NotImplementedError)
 NEW_YORK = ZoneInfo("America/New_York")
 END = datetime(2017, 1, 1, tzinfo=NEW_YORK)  # the refit time: the window ends here
 LATER = datetime(2018, 1, 1, tzinfo=NEW_YORK)
@@ -43,7 +42,6 @@ def _same(one: Scaler, two: Scaler) -> bool:
 
 
 @pytest.mark.spec("SPEC§3", "I1")
-@RED
 def test_the_scaler_ignores_data_after_its_window() -> None:
     matrix = _matrix()
     start = from_us(int(matrix.available_at[0]))
@@ -80,7 +78,6 @@ def test_the_scaler_ignores_data_after_its_window() -> None:
 
 
 @pytest.mark.spec("SPEC§3", "ARCH§7.2")
-@RED
 def test_a_fitted_scaler_is_frozen_and_applies_forward() -> None:
     matrix = _matrix()
     start = from_us(int(matrix.available_at[0]))
@@ -115,7 +112,6 @@ def test_a_fitted_scaler_is_frozen_and_applies_forward() -> None:
 
 
 @pytest.mark.spec("SPEC§3")
-@RED
 def test_a_scaler_refuses_a_window_it_cannot_fit() -> None:
     matrix = _matrix()
     start = from_us(int(matrix.available_at[0]))

@@ -10,8 +10,6 @@ from pydantic import ValidationError
 from quant.core.canonical import sha256_hex
 from quant.features.menu import MENU, FeatureConfig, Trend, r1_features
 
-RED = pytest.mark.xfail(strict=True, reason="red:B3", raises=NotImplementedError)
-
 R1: dict[str, Any] = {
     "slot_sessions": 60,
     "ret": {},
@@ -30,7 +28,6 @@ def _with(base: dict[str, Any], path: tuple[str, ...], value: object) -> dict[st
 
 
 @pytest.mark.spec("P8", "D3", "PLAN§5")
-@RED
 def test_r1_turns_on_all_five_transforms_with_the_plan_values() -> None:
     config = r1_features()
     assert config == FeatureConfig.model_validate(R1)
@@ -50,7 +47,6 @@ def test_r1_turns_on_all_five_transforms_with_the_plan_values() -> None:
 
 
 @pytest.mark.spec("P8", "SPEC§3")
-@RED
 def test_the_menu_rejects_unknown_transforms() -> None:
     assert FeatureConfig.model_validate(R1).columns == MENU
     for unknown in ({"macd": {}}, {"F6": {}}, {"ewma_vol": {"bars": 20}}):
@@ -72,7 +68,6 @@ def test_the_menu_rejects_unknown_transforms() -> None:
         (("trend", "slow"), 70, 350),
     ],
 )
-@RED
 def test_the_menu_rejects_out_of_bounds_parameters(
     path: tuple[str, ...], low: int, high: int
 ) -> None:
@@ -87,7 +82,6 @@ def test_the_menu_rejects_out_of_bounds_parameters(
 
 
 @pytest.mark.spec("P8", "D3", "PLAN§5")
-@RED
 def test_the_menu_rejects_a_fast_trend_not_below_the_slow_one() -> None:
     assert Trend(fast=69, slow=70).fast == 69
     assert Trend(fast=70, slow=71).slow == 71
@@ -98,7 +92,6 @@ def test_the_menu_rejects_a_fast_trend_not_below_the_slow_one() -> None:
 
 
 @pytest.mark.spec("P8", "SPEC§3")
-@RED
 def test_the_menu_rejects_configs_without_f1_or_f2() -> None:
     assert FeatureConfig.model_validate({"ret": {}, "rvol": {}}).columns == ("ret", "rvol")
     for always_on in ("ret", "rvol"):
@@ -110,7 +103,6 @@ def test_the_menu_rejects_configs_without_f1_or_f2() -> None:
 
 
 @pytest.mark.spec("P8", "ARCH§7.2")
-@RED
 def test_the_config_hash_is_stable_under_key_order_and_changes_with_any_parameter() -> None:
     config = FeatureConfig.model_validate(R1)
     reordered = FeatureConfig.model_validate(

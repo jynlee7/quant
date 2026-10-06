@@ -36,7 +36,6 @@ from tests.support.features import (
     synthetic_bars,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B3", raises=NotImplementedError)
 NEW_YORK = ZoneInfo("America/New_York")
 HALF_DAY = date(2016, 11, 25)
 HOURLY = (Slot.S1030, Slot.S1130, Slot.S1230, Slot.S1330, Slot.S1430)
@@ -69,7 +68,6 @@ CONFIGS = {"r1": r1_features, "short": _short, "minimal": _minimal}
 
 @pytest.mark.spec("SPEC§3", "D3", "ARCH§4.2", "ARCH§6.1")
 @pytest.mark.parametrize("name", sorted(CONFIGS))
-@RED
 def test_streaming_matches_the_reference(name: str) -> None:
     config = CONFIGS[name]()
     bars = _bars()
@@ -91,7 +89,6 @@ def test_streaming_matches_the_reference(name: str) -> None:
 
 
 @pytest.mark.spec("SPEC§3", "ARCH§14")
-@RED
 def test_two_runs_agree_bit_for_bit() -> None:
     bars = _bars()
     first = compute_features(bars, r1_features())
@@ -105,7 +102,6 @@ def test_two_runs_agree_bit_for_bit() -> None:
 
 
 @pytest.mark.spec("SPEC§3", "ARCH§4.2", "ARCH§4.3")
-@RED
 def test_a_snapshot_is_canonical_json_of_fixed_size_and_restores_bit_for_bit() -> None:
     config = r1_features()
     bars = synthetic_bars(date(2016, 1, 4), date(2016, 12, 30))
@@ -147,7 +143,6 @@ def test_a_snapshot_is_canonical_json_of_fixed_size_and_restores_bit_for_bit() -
 
 
 @pytest.mark.spec("SPEC§3", "ARCH§4.3")
-@RED
 def test_a_snapshot_restores_only_under_its_own_config() -> None:
     config = r1_features()
     stream = FeatureStream(config)
@@ -171,7 +166,6 @@ def test_a_snapshot_restores_only_under_its_own_config() -> None:
 
 
 @pytest.mark.spec("SPEC§3", "ARCH§6.1")
-@RED
 def test_the_close_slot_is_normalized_against_close_history_only() -> None:
     config = r1_features()
     n = config.slot_sessions
@@ -228,7 +222,6 @@ def test_the_close_slot_is_normalized_against_close_history_only() -> None:
 
 @pytest.mark.spec("SPEC§3")
 @pytest.mark.parametrize("slot_sessions", [20, 60, 120])
-@RED
 def test_the_warm_up_drops_60_sessions(slot_sessions: int) -> None:
     # The half day 2016-11-25 falls inside the warm-up and counts as one session.
     bars = synthetic_bars(date(2016, 10, 3), date(2017, 1, 31))
@@ -289,7 +282,6 @@ def _bad(bar: HourlyBar, kind: str) -> HourlyBar:
         "earlier",
     ],
 )
-@RED
 def test_nan_or_missing_input_is_a_model_error(kind: str) -> None:
     assert issubclass(FeatureError, ModelError)
     bars = _bars()
@@ -315,7 +307,6 @@ def test_nan_or_missing_input_is_a_model_error(kind: str) -> None:
 
 
 @pytest.mark.spec("SPEC§3", "I1")
-@RED
 def test_a_batch_skips_a_missing_bar_and_refuses_a_bad_one() -> None:
     bars = list(_bars())
     i = 500  # well after the warm-up
@@ -332,7 +323,6 @@ def test_a_batch_skips_a_missing_bar_and_refuses_a_bad_one() -> None:
 
 
 @pytest.mark.spec("SPEC§3")
-@RED
 def test_a_nan_feature_is_a_model_error() -> None:
     # Flat closes: every return is 0, so F1's RMS and F2's sum are 0 and both are undefined.
     flat = [
@@ -355,7 +345,6 @@ def test_a_nan_feature_is_a_model_error() -> None:
 
 @pytest.mark.full
 @pytest.mark.spec("SPEC§3", "ARCH§4.2")
-@RED
 def test_ten_years_of_features_compute_in_under_five_seconds() -> None:
     bars = synthetic_bars(date(2016, 1, 1), date(2025, 12, 31), seed=7)
     started = time.perf_counter()

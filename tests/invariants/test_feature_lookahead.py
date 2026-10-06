@@ -31,7 +31,6 @@ from quant.features.stream import FeatureRow, FeatureStream, features_for
 from tests.support.bars import SYMBOL, revise_close, store_with_days, synthetic_days
 from tests.support.features import bits, stream_rows, synthetic_bars, with_prices
 
-RED = pytest.mark.xfail(strict=True, reason="red:B3", raises=NotImplementedError)
 FIRST, LAST = date(2016, 9, 1), date(2016, 12, 9)  # 70 sessions: the last day is warm
 AFTER = datetime(2016, 12, 10, tzinfo=UTC)
 CHANGES = ("prices", "volume", "drop", "nan", "huge", "negative", "shuffle", "revise", "append")
@@ -84,7 +83,6 @@ def _change_after(bars: tuple[HourlyBar, ...], cut: int, change: str, seed: int)
     change=st.sampled_from(CHANGES),
     seed=st.integers(min_value=0, max_value=2**16),
 )
-@RED
 def test_changing_bars_after_t_leaves_every_feature_at_t_unchanged(
     position: int, change: str, seed: int
 ) -> None:
@@ -101,7 +99,6 @@ def _decisions(day: date) -> tuple[Decision, ...]:
 
 
 @pytest.mark.spec("I1", "SPEC§3", "ARCH§6.2")
-@RED
 def test_a_decision_reads_its_features_through_the_view() -> None:
     store = store_with_days(FIRST, LAST)
     seen = store.view(AFTER, as_of=AFTER).hourly(SYMBOL, purpose=Purpose.OPERATE)
@@ -119,7 +116,6 @@ def test_a_decision_reads_its_features_through_the_view() -> None:
 
 
 @pytest.mark.spec("I1", "ARCH§6.2")
-@RED
 def test_a_revision_known_after_as_of_leaves_the_features_unchanged() -> None:
     clock = SimClock(datetime(2016, 12, 9, tzinfo=UTC))
     store = store_with_days(FIRST, LAST, clock=clock)
@@ -148,7 +144,6 @@ def test_a_revision_known_after_as_of_leaves_the_features_unchanged() -> None:
 
 
 @pytest.mark.spec("I1", "SPEC§3", "ARCH§6.2")
-@RED
 def test_a_missing_or_incomplete_decision_bar_is_a_model_error() -> None:
     store = store_with_days(FIRST, LAST)
     decisions = _decisions(LAST)

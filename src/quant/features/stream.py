@@ -70,14 +70,21 @@ compare the stream with a slow reference within 1e-12, so the summation order is
 
 from __future__ import annotations
 
+import math
+import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Final
 
+import numpy as np
+
 from quant.core.calendar import BarSpec, Slot
+from quant.core.epoch import from_us, to_us
+from quant.core.errors import ConfigError, FeatureError
 from quant.core.model import StrictModel
 from quant.data.frames import Floats, HourlyBar, Ints
+from quant.data.policy import Purpose
 from quant.data.view import PointInTimeView
 from quant.features.menu import FeatureConfig
 
@@ -106,7 +113,10 @@ class FeatureRow:
         Raises FeatureError when the row is in the warm-up or any value is NaN: a missing or NaN
         feature is a model error, so rule 6 applies (spec §3).
         """
-        raise NotImplementedError("red:B3")
+        values = np.array(self.values, dtype=np.float64)
+        if not self.warm or not np.isfinite(values).all():
+            raise FeatureError(f"features at {self.t_open.isoformat()} are not warm and finite")
+        return values
 
 
 class FeatureState(StrictModel):
@@ -151,21 +161,35 @@ class FeatureStream:
 
     def __init__(self, config: FeatureConfig) -> None:
         """A stream under `config` that has consumed no bar."""
-        raise NotImplementedError("red:B3")
+        self._config = config
+        self._state = FeatureState(
+            config_hash=config.config_hash(),
+            last_t_open=None,
+            last_session=None,
+            sessions=0,
+            prev_close=None,
+            returns=[],
+            slot_returns={slot.value: [] for slot in Slot},
+            slot_ranges={slot.value: [] for slot in Slot},
+            slot_volumes={slot.value: [] for slot in Slot},
+            ema_fast=None,
+            ema_slow=None,
+        )
 
     @property
     def config(self) -> FeatureConfig:
-        raise NotImplementedError("red:B3")
+        return self._config
 
     @property
     def last_t_open(self) -> datetime | None:
         """The t_open (UTC) of the last bar consumed, or None before the first."""
-        raise NotImplementedError("red:B3")
+        value = self._state.last_t_open
+        return None if value is None else from_us(value)
 
     @property
     def sessions(self) -> int:
         """Distinct sessions consumed so far. Rows are warm once this exceeds WARMUP_SESSIONS."""
-        raise NotImplementedError("red:B3")
+        return self._state.sessions
 
     def update(self, bar: HourlyBar) -> FeatureRow:
         """Consume the next bar and return its row, warm or not.
@@ -181,12 +205,78 @@ class FeatureStream:
         Every other bar is consumed, even when some of its values are undefined (NaN in its
         row): it is real data, and later bars need its close and its place in the histories.
         """
-        raise NotImplementedError("red:B3")
+        state, config = self._state, self._config
+        t_open = to_us(bar.t_open)
+        if (
+            not bar.complete
+            or (state.last_t_open is not None and t_open <= state.last_t_open)
+            or any(not math.isfinite(p) or p <= 0 for p in (bar.open, bar.high, bar.low, bar.close))
+            or bar.low > min(bar.open, bar.close)
+            or bar.high < max(bar.open, bar.close)
+            or not math.isfinite(bar.volume)
+            or bar.volume < 0
+        ):
+            raise FeatureError(f"invalid or incomplete feature bar at {bar.t_open.isoformat()}")
+
+        slot = bar.slot.value
+        ret_hist = state.slot_returns[slot]
+        range_hist = state.slot_ranges[slot]
+        vol_hist = state.slot_volumes[slot]
+        ret = math.nan
+        ratio = math.nan
+        returns = state.returns.copy()
+        if state.prev_close is not None:
+            ret = _log(bar.close / state.prev_close)
+            ratio = (bar.high - bar.low) / state.prev_close
+            _append(returns, ret, config.rvol.bars)
+        sigma = math.sqrt(math.fsum(r * r for r in ret_hist) / len(ret_hist)) if ret_hist else 0.0
+        total = math.fsum(r * r for r in returns)
+        values = [ret / sigma if sigma > 0 else math.nan, _log(math.sqrt(total))]
+        if config.range is not None:
+            median_range = statistics.median(range_hist) if range_hist else 0.0
+            values.append(_log(ratio) - _log(median_range))
+        if config.volume is not None:
+            median_volume = statistics.median(vol_hist) if vol_hist else 0.0
+            values.append(_log(bar.volume / median_volume) if median_volume > 0 else math.nan)
+        fast, slow = state.ema_fast, state.ema_slow
+        if config.trend is not None:
+            fast = _ema(bar.close, fast, config.trend.fast)
+            slow = _ema(bar.close, slow, config.trend.slow)
+            values.append(_log(fast / slow))
+
+        # Histories are updated only after the current row has read the prior slot values.
+        if state.prev_close is not None:
+            _append(ret_hist, ret, config.slot_sessions)
+            if config.range is not None:
+                _append(range_hist, ratio, config.slot_sessions)
+        if config.volume is not None:
+            _append(vol_hist, bar.volume, config.slot_sessions)
+        session = bar.session.isoformat()
+        sessions = state.sessions + (session != state.last_session)
+        self._state = state.model_copy(
+            update={
+                "last_t_open": t_open,
+                "last_session": session,
+                "sessions": sessions,
+                "prev_close": bar.close,
+                "returns": returns,
+                "ema_fast": fast,
+                "ema_slow": slow,
+            }
+        )
+        return FeatureRow(
+            bar.session,
+            bar.slot,
+            bar.t_open,
+            bar.available_at,
+            tuple(values),
+            sessions > WARMUP_SESSIONS,
+        )
 
     def snapshot(self) -> FeatureState:
         """The state now. Two streams under one config that consumed the same bars give equal
         snapshots with identical canonical JSON."""
-        raise NotImplementedError("red:B3")
+        return self._state.model_copy(deep=True)
 
     @classmethod
     def restore(cls, config: FeatureConfig, state: FeatureState) -> FeatureStream:
@@ -199,7 +289,54 @@ class FeatureStream:
         history or a non-None EMA for a transform that is off, or some but not all of
         `last_t_open`, `last_session` and `prev_close` set.
         """
-        raise NotImplementedError("red:B3")
+        if state.config_hash != config.config_hash():
+            raise ConfigError("feature state belongs to a different config")
+        slots = {slot.value for slot in Slot}
+        for history, enabled in (
+            (state.slot_returns, True),
+            (state.slot_ranges, config.range is not None),
+            (state.slot_volumes, config.volume is not None),
+        ):
+            if set(history) != slots or any(
+                len(values) > config.slot_sessions
+                or (not enabled and values)
+                or any(not math.isfinite(value) for value in values)
+                for values in history.values()
+            ):
+                raise ConfigError("slot histories do not fit the feature config")
+        if len(state.returns) > config.rvol.bars or any(
+            not math.isfinite(value) for value in state.returns
+        ):
+            raise ConfigError("return history does not fit the feature config")
+        present = [
+            value is not None for value in (state.last_t_open, state.last_session, state.prev_close)
+        ]
+        if any(present) and not all(present):
+            raise ConfigError("last bar time, session and close must be set together")
+        emas = (state.ema_fast, state.ema_slow)
+        if config.trend is None and any(value is not None for value in emas):
+            raise ConfigError("a disabled trend must have no EMAs")
+        if config.trend is not None and any((value is not None) != all(present) for value in emas):
+            raise ConfigError("trend EMAs must be set exactly when a bar has been consumed")
+        if any(
+            value is not None and (not math.isfinite(value) or value <= 0)
+            for value in (state.prev_close, *emas)
+        ):
+            raise ConfigError("previous close and EMAs must be finite and positive")
+        if state.sessions < 0 or (state.sessions > 0) != all(present):
+            raise ConfigError("session count does not match the last bar")
+        if not any(present) and (
+            state.returns
+            or any(
+                values
+                for history in (state.slot_returns, state.slot_ranges, state.slot_volumes)
+                for values in history.values()
+            )
+        ):
+            raise ConfigError("an empty stream must have empty histories")
+        stream = cls(config)
+        stream._state = state.model_copy(deep=True)
+        return stream
 
 
 @dataclass(frozen=True)
@@ -222,16 +359,46 @@ class FeatureMatrix:
         and `values` is a float64 array of shape (n, len(columns)) whose every value is finite.
         Zero rows is valid. Then replace the three arrays with read-only copies
         (`object.__setattr__`), so a matrix can't change after it is built."""
-        raise NotImplementedError("red:B3")
+        if (
+            not isinstance(self.columns, tuple)
+            or not self.columns
+            or any(not isinstance(name, str) or not name for name in self.columns)
+            or len(set(self.columns)) != len(self.columns)
+        ):
+            raise FeatureError("feature columns must be a non-empty tuple of distinct names")
+        for name in ("t_open", "available_at"):
+            times = getattr(self, name)
+            if not isinstance(times, np.ndarray) or times.dtype != np.int64 or times.ndim != 1:
+                raise FeatureError(f"feature {name} must be a 1-D int64 array")
+        n = len(self.t_open)
+        if len(self.available_at) != n or (self.t_open[1:] <= self.t_open[:-1]).any():
+            raise FeatureError("feature times must align and bar opens must strictly increase")
+        if (
+            not isinstance(self.values, np.ndarray)
+            or self.values.dtype != np.float64
+            or self.values.shape != (n, len(self.columns))
+            or not np.isfinite(self.values).all()
+        ):
+            raise FeatureError(
+                "feature values must be a finite float64 matrix with matching columns"
+            )
+        for name in ("t_open", "available_at", "values"):
+            frozen = getattr(self, name).copy()
+            frozen.flags.writeable = False
+            object.__setattr__(self, name, frozen)
 
     def __len__(self) -> int:
         """The number of rows."""
-        raise NotImplementedError("red:B3")
+        return len(self.t_open)
 
     def window(self, start: datetime, end: datetime) -> FeatureMatrix:
         """A new matrix of the rows whose bars became available in [start, end):
         start <= available_at < end. Naive datetimes raise ClockError."""
-        raise NotImplementedError("red:B3")
+        start_us, end_us = to_us(start), to_us(end)
+        mask = (self.available_at >= start_us) & (self.available_at < end_us)
+        return FeatureMatrix(
+            self.columns, self.t_open[mask], self.available_at[mask], self.values[mask]
+        )
 
 
 def compute_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> FeatureMatrix:
@@ -244,7 +411,22 @@ def compute_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Featur
     its bar's t_open, because a model can't be fit on it. No bars, or none warm, gives a matrix
     with zero rows and the config's columns.
     """
-    raise NotImplementedError("red:B3")
+    stream = FeatureStream(config)
+    opens, available, values = [], [], []
+    for bar in bars:
+        if not bar.complete:
+            continue
+        row = stream.update(bar)
+        if row.warm:
+            values.append(row.vector())
+            opens.append(to_us(row.t_open))
+            available.append(to_us(row.available_at))
+    return FeatureMatrix(
+        config.columns,
+        np.array(opens, dtype=np.int64),
+        np.array(available, dtype=np.int64),
+        np.array(values, dtype=np.float64).reshape(len(values), len(config.columns)),
+    )
 
 
 def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar: BarSpec) -> Floats:
@@ -263,4 +445,32 @@ def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar:
     propagates, and feeding stops there). Bars consumed before an error stay consumed, so a
     caller that keeps the stream's snapshot keeps them.
     """
-    raise NotImplementedError("red:B3")
+    last = stream.last_t_open
+    since = None if last is None else last + timedelta(microseconds=1)
+    for candidate in view.hourly(symbol, purpose=Purpose.OPERATE, since=since):
+        if candidate.t_open > bar.t_open:
+            break
+        if not candidate.complete:
+            continue
+        row = stream.update(candidate)
+        if candidate.t_open == bar.t_open:
+            return row.vector()
+    raise FeatureError(f"decision bar at {bar.t_open.isoformat()} is missing or already consumed")
+
+
+def _log(value: float) -> float:
+    """Undefined logarithms become missing features without a warning."""
+    return math.log(value) if value > 0 and math.isfinite(value) else math.nan
+
+
+def _ema(close: float, previous: float | None, span: int) -> float:
+    if previous is None:
+        return close
+    alpha = 2.0 / (span + 1)
+    return alpha * close + (1.0 - alpha) * previous
+
+
+def _append(history: list[float], value: float, bound: int) -> None:
+    history.append(value)
+    if len(history) > bound:
+        del history[0]

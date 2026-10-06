@@ -27,6 +27,7 @@ from typing import Final, Self
 
 from pydantic import Field, model_validator
 
+from quant.core.canonical import sha256_hex
 from quant.core.model import StrictModel
 
 # Feature columns always follow this order (F1–F5), skipping the transforms that are off.
@@ -71,7 +72,9 @@ class Trend(StrictModel):
     def _fast_below_slow(self) -> Self:
         """Return self when fast < slow. Otherwise raise ValueError naming both spans, which
         pydantic reports as a ValidationError. Within the bounds that refuses only 70 / 70."""
-        raise NotImplementedError("red:B3")
+        if self.fast >= self.slow:
+            raise ValueError(f"fast span {self.fast} must be below slow span {self.slow}")
+        return self
 
 
 class FeatureConfig(StrictModel):
@@ -94,7 +97,7 @@ class FeatureConfig(StrictModel):
         """The names of the transforms that are on, in MENU order: the columns of every feature
         row and matrix. r1 gives ("ret", "rvol", "range", "volume", "trend"), and a config with
         only F1, F2 and F5 gives ("ret", "rvol", "trend")."""
-        raise NotImplementedError("red:B3")
+        return tuple(name for name in MENU if getattr(self, name) is not None)
 
     def config_hash(self) -> str:
         """SHA-256, in hex, of this config's canonical JSON: exactly
@@ -104,11 +107,11 @@ class FeatureConfig(StrictModel):
         transform hashes like an explicit null, and a default hashes like the same value written
         out. Any change of parameter or of which transforms are on changes it.
         """
-        raise NotImplementedError("red:B3")
+        return sha256_hex(self)
 
 
 def r1_features() -> FeatureConfig:
     """The seed release r1's features (PLAN §5, D3): all five transforms on, rvol over 35 bars,
     trend EMA 35 / 175, and a slot history of 60 sessions. A new, validated config on each
     call."""
-    raise NotImplementedError("red:B3")
+    return FeatureConfig(ret=Ret(), rvol=Rvol(), range=Range(), volume=Volume(), trend=Trend())
