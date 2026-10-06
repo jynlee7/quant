@@ -37,3 +37,14 @@ class PolicyError(QuantError):
 
 class LockboxError(PolicyError):
     """Scoring or reporting on the lockbox before the go-live test (A2, C1)."""
+
+
+class TicketError(PolicyError):
+    """A trial ticket the ledger can't vouch for: not a TrialTicket, built without the ledger's
+    token, never issued by this ledger (copies and other ledgers' tickets), or changed since it
+    was issued (K5, A2)."""
+
+
+class LedgerError(QuantError):
+    """The trial ledger can't do what was asked: a broken chain, a run settled twice, a hash
+    that isn't SHA-256 hex, or no ledger at the path given (A2)."""

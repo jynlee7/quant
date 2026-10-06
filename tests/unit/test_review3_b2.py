@@ -19,7 +19,7 @@ from quant.data.frames import MinuteFrame
 from quant.data.market_db import BarStore
 from quant.data.policy import DataPolicy, Purpose, Segments
 from quant.store.sqlite import connect
-from tests.support.bars import SYMBOL, Ticket, store_with_days, synthetic_days
+from tests.support.bars import SYMBOL, Ticket, store_with_days, synthetic_days, vouched_policy
 
 NEW_YORK = ZoneInfo("America/New_York")
 TRIAL = Ticket("t1", date(2019, 1, 1), date(2024, 12, 31))
@@ -44,7 +44,7 @@ def test_a_view_must_say_what_it_knows() -> None:
 def test_an_hourly_read_at_midnight_is_checked_over_the_days_before_it() -> None:
     store = store_with_days(date(2024, 12, 30), date(2024, 12, 31))
     midnight = datetime(2025, 1, 1, tzinfo=NEW_YORK)  # the lockbox's first instant
-    view = store.view(midnight, as_of=midnight, ticket=TRIAL)
+    view = store.view(midnight, as_of=midnight, policy=vouched_policy(), ticket=TRIAL)
     assert len(view.hourly(SYMBOL, purpose=Purpose.SCORE)) == 7 + 7
 
 

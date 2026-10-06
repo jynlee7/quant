@@ -19,10 +19,10 @@ from quant.core.errors import ClockError, DataError, LockboxError, PolicyError
 from quant.data import market_db
 from quant.data.frames import MinuteFrame
 from quant.data.market_db import BarStore
-from quant.data.policy import DataPolicy, Purpose, Segments
+from quant.data.policy import Purpose, Segments
 from quant.data.synthetic import synthetic_minutes
 from quant.store.sqlite import connect, transaction
-from tests.support.bars import Ticket, store_with_days
+from tests.support.bars import Ticket, store_with_days, vouched_policy
 
 DAY = date(2019, 7, 2)
 DAY_OPEN = datetime(2019, 7, 2, 13, 30, tzinfo=UTC)  # 09:30 in New York
@@ -227,7 +227,7 @@ def test_a_backfilled_corporate_action_is_known_from_the_end_of_its_declaration_
 
 @pytest.mark.spec("C1", "C11", "A2", "ARCH§6.3")
 def test_calibration_and_edge_estimates_read_fit_dev_with_a_ticket_and_forward() -> None:
-    policy = DataPolicy(Segments(lockbox_end=date(2026, 10, 20)))
+    policy = vouched_policy(Segments(lockbox_end=date(2026, 10, 20)))
     calibrate = Purpose.CALIBRATE
     policy.check(calibrate, date(2016, 1, 4), date(2018, 12, 31))  # the fit-window backtest
     with pytest.raises(PolicyError):  # Kelly's shadow returns on DEV are strategy P&L (C11)

@@ -2,6 +2,86 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B10 · The trial ledger and TrialTicket (done 2026-10-06, tag `b10-done`)
+
+**Built**
+
+- `research.ledger` (`research.db`): the append-only trial ledger, on the `store.sqlite` connect and migrate pattern.
+  - Each entry (`run`, `result`, `refusal`, `gate_config`) holds its kind, its time from the ledger's Clock, a canonical JSON body, and the hash of the entry before it. A single `head` row, written in the same transaction as every append, names the last entry, so a row deleted from the end is caught too.
+  - Every read (`entries`, `trial_count`, `gate_config_hash`, `verify_ticket`) takes the rows and the head in one snapshot and raises LedgerError unless the chain verifies.
+  - Appends run under the write lock, so two ledger objects or two processes chain correctly. An append checks only what is new since the chain the ledger object last verified or wrote, and refuses a tail rewritten since then.
+  - A run is placed twice (C11). When it opens, by its configuration hash, code hash and days: a match reuses that run's trial, and anything else opens the next one. When it settles, by the hash of its decision records: records equal to an earlier settled run's join that run's trial, and a code change that moved no decision leaves its own trial empty. A run that never settles counts until a run with the same config, code and days settles, then goes where that run went.
+  - `record_gate_config` appends gates.yaml as loaded whenever its canonical hash changes.
+- `TrialTicket` (K5): built only by `open_run`, with the module's private token, and only after the run's entry is committed. A ticket is good only with the ledger object that issued it. `verify_ticket` refuses lookalikes, subclasses, copies, tickets from another ledger object on the same file, a ticket changed since it was issued (judged by identity), and one whose run entry no longer stands in a chain that verifies. No ticket can reach the lockbox (P9). Yardsticks score under the ticket of the run they measure and never settle, so they add no trial.
+- `data.policy`:
+  - DataPolicy is bound to a ledger through a `LedgerPort` protocol, so research imports data and never the reverse. A score or calibrate read of DEV needs a ticket that ledger verifies; an unbound policy refuses every DEV ticket, which keeps DEV dark by default.
+  - A bound policy records every read it refuses as a `Refusal`. A refusal the ledger can't record still raises its own error, with a note, and logs `refusal_not_recorded`.
+  - The starts of FIT, DEV and the lockbox are constants; only the seal (`lockbox_end`) is configured. A policy refuses a ledger that holds different Segments.
+- `quant ledger verify` (typer, a new `quant` console script) exits 0 with the entry count and head, 1 with each problem, and 2 when there is no ledger. `verify_file` opens a closed ledger as immutable, so it creates no -wal or -shm files and works on a read-only mount.
+- `core.errors`: TicketError (a PolicyError) and LedgerError.
+- `tests/support/ledger.py`. B2's tests that scored DEV with a structural ticket now bind a vouching stand-in (`vouched_policy()`), so they still test the segment rules alone.
+
+**Tests:** 78 new, all fast, for 292 fast and 296 in all. Highlights:
+
+- K5: nine planted forgeries are refused for score and calibrate. Static scans already covered TrialTicket from B0, so the new tests forge at runtime: a stolen token, a copy, a subclass, a ticket from another ledger, and a field swapped for a subclass whose `==` vouches for anything.
+- C11: an identical rerun reuses its trial, different records add one, a code change that moves no decision adds none, a rerun whose decisions changed is a new trial, and a crashed run follows its identical rerun.
+- A2: scoring DEV without a ticket raises and leaves a ledger entry, and so does a refused lockbox read. No ticket reaches the lockbox, and no ledger or policy can be built with a later one.
+- The chain: ten tamperings fail `verify` and the CLI. Two spawned processes settle 10 runs each at once (40 entries, chain valid), two ledger objects take turns, a failed append leaves no trace, and a ticket dies with its run entry.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| Fast gate | about 13 s (292 tests in 12 s) |
+| Full gate | 27 s |
+| Append one entry | 0.1 ms |
+| Open and settle a run | 0.35 ms on a new ledger, 32 ms at 2,000 entries (placing a run reads the whole chain) |
+| `trial_count` at 2,000 entries | 30 ms |
+| `verify_file` over 2,001 entries | 26 ms |
+
+**Review, round 1** (code-review skill and a Codex review in parallel, after the green). Each candidate was probed against the code before a test was written. Six were fixed as red tests (626db35) and a green commit (05a10c5):
+
+- **R1.** A caller could move where DEV and the lockbox start, so a ledger with a later lockbox issued a ticket for 2025. The starts are now class constants that no caller or subclass can move. DEV's start is fixed too, since a later one would make DEV days FIT, scored without a ticket.
+- **C6.** The ledger and its policy kept separate Segments. `TrialLedger.segments` is public, and a policy refuses a ledger with different ones, or with anything but Segments itself.
+- **R2.** `verify_ticket` trusted a field's own `==`, so a ticket recorded as January could score all of DEV. It now compares each field with the issued object by identity. Issuance had the same hole (a date subclass in a RunSpec), so `open_run` takes only exact dates and strings.
+- **R3.** A ticket outlived its run entry. `verify_ticket` now requires the entry to stand, as issued, in a chain that verifies, and rechecks the chain only when SQLite's `data_version` or `total_changes` has moved. Settling after a wipe raises TicketError, not KeyError.
+- **C1.** The counts read the chain without checking it. `entries()`, `trial_count()` and `gate_config_hash()` read one snapshot and raise LedgerError unless it verifies; an unknown kind does too.
+- **R4.** A crashed run stayed a trial of its own after its identical rerun joined an earlier trial. It now goes where the latest settled run with the same config, code and days went, so the crash case counts 1 (C11: a rerun reuses its trial).
+
+Not fixed, with reasons:
+
+- **C3. The chain has no anchor outside research.db**, so a rewrite of the whole file passes `verify`, and a full wipe makes `trial_count()` 0. Only the quant user writes research.db (ARCHITECTURE §2, §9.1), and an anchor kept on the same box could be rewritten by the same user. A2 guards against an honest but tempted loop, and L1 runs as quant-llm with no access to `var/`. The backups keep earlier copies, which v1 doesn't compare. The docstring, which claimed a deletion from the end is always caught, is corrected, and ARCHITECTURE v1.5 says so.
+- **C2. The policy can't see which configuration is scored**, so a ticket for one config could score another. Only the walk-forward knows what it runs, so B11 enforces it (open items).
+- **C4. An unbound DataPolicy refuses but can't record.** It already refuses DEV score and calibrate, and lockbox reads other than operate. A mandatory ledger would make the engine and evening jobs write research.db, which ARCHITECTURE §2 and §9.1 reserve for the harness and the research CLI. Narrowing §6.3's "a refused read leaves a ledger entry" needs the user (open items).
+
+**Review, round 2** (the rest of round 1's findings, each confirmed by a probe). Fixed as red tests (4578e66) and a green commit (2064a6a):
+
+- **C5.** When the ledger couldn't record a refusal, its LedgerError replaced the refusal, so a refused lockbox read escaped `except PolicyError`. A refusal now always raises its own error, with a note when it went unrecorded. Round 1's R3 test now asks for exactly TicketError.
+- **C7, in part.** `verify_file` left -shm and -wal files beside a closed ledger and failed in a directory it couldn't write. It now opens a closed ledger as immutable, and one in use read-only through its WAL. A known gap, in the docstring: a checkpoint during an immutable check can report a problem that a rerun doesn't.
+- **C8.** Every append rehashed the whole chain. Each ledger object now keeps the chain it last verified or wrote and checks only from that entry on. The trade-off: an append doesn't notice an edit before that entry, but `verify()` and every read still check all rows, and `verify_ticket` rechecks the whole chain after any write.
+- **C9.** An append went on over a tail rewritten since it last saw the head, which `verify` can't catch. It now refuses. New tests cover concurrent processes, two ledger objects, a failed append and tail tampers, and the CLI test checks the entry count it prints.
+- **C10.** A ticket's `issued_at` came from a second reading of the clock. It is now its run entry's `at`.
+
+Not fixed, with reasons:
+
+- **C7, the rest.** `quant ledger verify` defaults to `var/research.db`, relative to the working directory, and nothing resolves `var/` yet (ARCHITECTURE §2: the repo's `var/` on the Mac, `/var/lib/quant` on the VPS). That is one rule for every database, not the ledger's, so it is left to the step that first runs a service (open items).
+
+Round 2's fixes weren't reviewed again. Each has its test, and the full gate passes.
+
+**Deviations** (documents updated in this merge)
+
+- ARCHITECTURE v1.5:
+  - §4.4: the walk-forward refuses a TrialTicket whose `config_hash` or `code_hash` differs from the release and code it runs, and runs yardsticks only inside the measured run's own walk-forward (C2, built in B11).
+  - §6.3: the starts of FIT, DEV and the lockbox are constants in code, and the seal is the only configured boundary (R1). The docs never said otherwise; C1 already puts only the closing date in config.
+  - §10: the chain has no anchor outside research.db, so a full rewrite passes `ledger verify`, which v1 accepts because only the quant user writes the file (C3).
+
+**Open items**
+
+- **B11:** binds tickets to config and code (C2). The walk-forward refuses a ticket whose `config_hash` or `code_hash` differs from the release and code it runs, and runs yardsticks only inside the measured run's walk-forward, under its ticket. B11 also builds the `config_hash` that RunSpec names.
+- **B14 or B18:** one rule that resolves `var/` for every database, such as a `QUANT_VAR` setting, so `quant ledger verify` and the services find research.db wherever they run (C7).
+- **For the user (C4):** ARCHITECTURE §6.3 says a refused read leaves a ledger entry. Processes that don't write research.db (the engine, the evening jobs) refuse without a record. Proposed wording: "A refused read is recorded in the ledger when its DataPolicy is bound to research.db (harness, research CLI); processes that don't write research.db refuse it without a record." This narrows an approved decision, so §6.3 is unchanged until you approve it.
+- **B2's finding 6 is closed:** the policy no longer trusts anything shaped like a ticket. Only its bound ledger can vouch for one, by the private token and by identity.
+
 ## B2 · Bars and the point-in-time store (done 2026-10-05, tag `b02-done`)
 
 **Built**
