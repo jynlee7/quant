@@ -1,6 +1,6 @@
 # SPEC — SPY Regime Trader
 
-**Status:** APPROVED v1.2 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. Each one is tagged where it lands.
+**Status:** APPROVED v1.3 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). Each one is tagged where it lands.
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The spec, the architecture and the [plan](PLAN.md) are approved, and the build started 2026-10-05. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -95,8 +95,11 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
 | F4 | volume | `ln(V_t / median volume in the same slot over the prior 60 sessions)` | Volume ratio relative to what is normal for that slot |
 | F5 | trend | `ln(EMA35(C) / EMA175(C))` | D3 |
 
-- **Standardization:** the z-score parameters are fit on each model's training window at refit time, frozen, and applied forward until the next refit. They are never recomputed with data from after the refit date.
-- **Warm-up:** the first 60 sessions are dropped. A missing or NaN feature at τ counts as a model error, so rule 6 applies.
+- **One stream (B3):** one stream computes the features over every hourly bar from 2016-01, and fits and live trading share it. A fit cuts its window from those rows, so both start from the same EMA seed.
+- **Slot histories (B3):** sessions are numbered in the order the stream reads them, and a half day counts as one. "The same slot over the prior 60 sessions" means that slot's bars in sessions k−60 to k−1, for a bar in session k, or k−N to k−1 when the menu sets N sessions (PLAN §5). A half day has no 12:30, 13:30 or 14:30 bar, so for the N sessions after one, those slots hold N−1 values.
+- **Statistics (B3):** σ_slot is the RMS, `sqrt(mean r²)`, with no mean removed. The median of an even count is the mean of the two middle values, and F3 takes the log of the median, not the median of the logs. Each EMA uses `α = 2/(n+1)` for its span n and starts at the first close.
+- **Standardization:** the z-score parameters are fit on each model's training window at refit time, frozen, and applied forward until the next refit. They are never recomputed with data from after the refit date. They are the mean and the population standard deviation (ddof 0) of the warm rows whose `available_at` lies in [start, end) (B3).
+- **Warm-up:** the first 60 sessions are dropped, whatever N is (B3). A missing or NaN feature at τ counts as a model error, so rule 6 applies.
 - **Determinism:** features are pure float64 functions, so identical inputs give bit-identical outputs.
 - **Feature changes:** Opus can only choose from a menu of pre-built, tested transforms with bounded parameters. A brand-new feature is a code change and goes through the normal build process: failing test first, then review, then your approval.
 
