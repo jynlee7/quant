@@ -27,7 +27,6 @@ from tests.support.hmm import (
     two_diag,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B4", raises=NotImplementedError)
 TOLERANCE = 1e-10  # PLAN B4: the filter matches the naive reference within 1e-10
 
 
@@ -98,7 +97,6 @@ def test_the_decision_path_never_loads_hmmlearn_or_eval() -> None:
 
 @pytest.mark.spec("SPEC§6")
 @pytest.mark.parametrize("name", sorted(TRUTHS))
-@RED
 def test_the_filter_matches_the_naive_reference(name: str) -> None:
     from quant.hmm.filter import ForwardFilter
 
@@ -124,7 +122,6 @@ def test_the_filter_matches_the_naive_reference(name: str) -> None:
 
 
 @pytest.mark.spec("SPEC§6")
-@RED
 def test_run_step_and_forward_pass_agree_bit_for_bit() -> None:
     from quant.hmm.filter import ForwardFilter, emission_logpdf, forward_pass
 
@@ -155,7 +152,6 @@ def test_run_step_and_forward_pass_agree_bit_for_bit() -> None:
 
 
 @pytest.mark.spec("SPEC§6")
-@RED
 def test_the_filter_stays_finite_on_outliers() -> None:
     """Rows far from every state underflow a probability-space filter; ours stays finite."""
     from quant.hmm.filter import ForwardFilter
@@ -178,7 +174,6 @@ def test_the_filter_stays_finite_on_outliers() -> None:
 
 @pytest.mark.full
 @pytest.mark.spec("SPEC§6")
-@RED
 def test_the_filter_stays_finite_over_100000_bars() -> None:
     from quant.hmm.filter import ForwardFilter
 
@@ -196,7 +191,6 @@ def test_the_filter_stays_finite_over_100000_bars() -> None:
 
 @pytest.mark.spec("SPEC§6")
 @pytest.mark.parametrize("name", ["four_sparse", "two_diag"])
-@RED
 def test_next_bar_probabilities_are_p_times_a_and_entropy_is_in_0_1(name: str) -> None:
     from quant.hmm.filter import ForwardFilter
     from quant.hmm.labels import label_probs
@@ -223,7 +217,6 @@ def test_next_bar_probabilities_are_p_times_a_and_entropy_is_in_0_1(name: str) -
 
 
 @pytest.mark.spec("SPEC§4", "SPEC§6")
-@RED
 def test_states_that_share_a_label_add_up() -> None:
     from quant.hmm.filter import ForwardFilter
 
@@ -242,7 +235,6 @@ def test_states_that_share_a_label_add_up() -> None:
 
 
 @pytest.mark.spec("SPEC§6")
-@RED
 def test_the_active_label_and_its_expected_remaining_duration() -> None:
     from quant.hmm.filter import ForwardFilter
 
@@ -279,7 +271,6 @@ def test_the_active_label_and_its_expected_remaining_duration() -> None:
 
 @pytest.mark.spec("SPEC§6")
 @pytest.mark.parametrize("make", [three_full, two_diag], ids=["three_full", "two_diag"])
-@RED
 def test_the_predictive_log_likelihoods_add_up_to_the_total(make: Callable[[], Truth]) -> None:
     from quant.hmm.filter import ForwardFilter
 
@@ -291,7 +282,6 @@ def test_the_predictive_log_likelihoods_add_up_to_the_total(make: Callable[[], T
 
 
 @pytest.mark.spec("SPEC§3", "SPEC§6")
-@RED
 def test_the_filter_standardizes_with_the_models_frozen_scaler() -> None:
     from quant.hmm.filter import ForwardFilter
     from quant.hmm.model import ScalerParams
@@ -313,7 +303,6 @@ def test_the_filter_standardizes_with_the_models_frozen_scaler() -> None:
 
 
 @pytest.mark.spec("SPEC§6", "ARCH§4.3")
-@RED
 def test_the_filter_state_survives_a_snapshot_and_restore() -> None:
     from quant.hmm.filter import FilterState, ForwardFilter
 
@@ -356,7 +345,6 @@ def test_the_filter_state_survives_a_snapshot_and_restore() -> None:
 
 
 @pytest.mark.spec("SPEC§6", "ARCH§4.3")
-@RED
 def test_restore_refuses_a_state_that_doesnt_fit() -> None:
     from quant.hmm.filter import FilterState, ForwardFilter
 
@@ -386,7 +374,6 @@ def test_restore_refuses_a_state_that_doesnt_fit() -> None:
 
 
 @pytest.mark.spec("SPEC§3", "SPEC§6")
-@RED
 def test_a_bad_row_is_a_model_error_and_changes_nothing() -> None:
     from quant.hmm.filter import ForwardFilter
 
@@ -410,7 +397,6 @@ def test_a_bad_row_is_a_model_error_and_changes_nothing() -> None:
 
 
 @pytest.mark.spec("SPEC§6", "D4")
-@RED
 def test_a_swapped_in_model_warms_up_over_its_own_fit_window() -> None:
     """Spec §6: a new model's filter starts from π on its fit window's first row and runs
     forward to the swap, seeing only the past."""

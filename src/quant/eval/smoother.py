@@ -12,6 +12,10 @@ imported here (only hmm.train may, I2).
 
 from __future__ import annotations
 
+import numpy as np
+from scipy.special import logsumexp
+
+from quant.hmm.filter import emission_logpdf, forward_pass
 from quant.hmm.model import Floats, GaussianParams, ScalerParams
 
 
@@ -24,4 +28,16 @@ def smooth(params: GaussianParams, scaler: ScalerParams, rows: Floats) -> Floats
     forward pass's predictive log-likelihoods. The posterior is exp(log p_t + log β_t),
     renormalized to sum to 1. Raises as `forward_pass` does.
     """
-    raise NotImplementedError("red:B4")
+    trace = forward_pass(params, scaler, rows)
+    emissions = emission_logpdf(params, scaler.standardize(rows))
+    with np.errstate(divide="ignore"):
+        log_a = np.log(params.transmat)
+    beta = np.zeros(params.n_states, dtype=np.float64)
+    result = np.empty_like(trace.state_probs)
+    for t in range(len(rows) - 1, -1, -1):
+        joint = trace.log_probs[t] + beta
+        joint -= np.max(joint)
+        result[t] = np.exp(joint - logsumexp(joint))
+        if t:
+            beta = logsumexp(log_a + emissions[t] + beta, axis=1) - trace.loglik[t]
+    return result

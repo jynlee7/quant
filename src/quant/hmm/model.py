@@ -36,6 +36,10 @@ hmm.filter).
 
 from __future__ import annotations
 
+import hashlib
+import re
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +49,9 @@ import numpy as np
 import numpy.typing as npt
 from pydantic import AwareDatetime
 
+from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
+from quant.core.clock import ensure_utc
+from quant.core.errors import ClockError, ModelError
 from quant.core.model import StrictModel
 from quant.hmm.labels import LabelTable
 
@@ -57,6 +64,23 @@ PARAM_NAMES: Final = ("startprob", "transmat", "means", "covars", "scaler_mean",
 ARTIFACT_FORMAT: Final = 1
 # Probability vectors must sum to 1 within this.
 SUM_TOLERANCE: Final = 1e-10
+
+
+def _check_array(values: Floats, shape: tuple[int, ...], name: str) -> None:
+    if (
+        not isinstance(values, np.ndarray)
+        or values.dtype != np.float64
+        or values.shape != shape
+        or not np.isfinite(values).all()
+    ):
+        raise ModelError(f"{name} must be a finite float64 array of shape {shape}")
+
+
+def _freeze_arrays(owner: object, *names: str) -> None:
+    for name in names:
+        values = getattr(owner, name).copy()
+        values.flags.writeable = False
+        object.__setattr__(owner, name, values)
 
 
 @dataclass(frozen=True, eq=False)
@@ -90,17 +114,47 @@ class GaussianParams:
         Replace each array with a read-only copy (`object.__setattr__`), so the caller's array
         can't change the model and writing to the model's raises ValueError.
         """
-        raise NotImplementedError("red:B4")
+        if self.covariance_type not in ("diag", "full"):
+            raise ModelError("covariance type must be diag or full")
+        if not isinstance(self.means, np.ndarray) or self.means.ndim != 2:
+            raise ModelError("means must have shape (K, d)")
+        k, d = self.means.shape
+        if k < 1 or d < 1:
+            raise ModelError("a model needs at least one state and feature")
+        for name, shape in (
+            ("startprob", (k,)),
+            ("transmat", (k, k)),
+            ("means", (k, d)),
+            ("covars", (k, d, d)),
+        ):
+            _check_array(getattr(self, name), shape, name)
+        for probs in (self.startprob, self.transmat):
+            if (probs < 0).any() or not np.allclose(
+                probs.sum(axis=-1), 1.0, rtol=0, atol=SUM_TOLERANCE
+            ):
+                raise ModelError("probabilities must be nonnegative and sum to one")
+        for covariance in self.covars:
+            if not np.array_equal(covariance, covariance.T):
+                raise ModelError("covariances must be exactly symmetric")
+            if self.covariance_type == "diag" and np.any(
+                covariance != np.diag(np.diag(covariance))
+            ):
+                raise ModelError("a diag covariance must have zero off-diagonal entries")
+            try:
+                np.linalg.cholesky(covariance)
+            except np.linalg.LinAlgError as exc:
+                raise ModelError("covariances must be positive definite") from exc
+        _freeze_arrays(self, "startprob", "transmat", "means", "covars")
 
     @property
     def n_states(self) -> int:
         """K."""
-        raise NotImplementedError("red:B4")
+        return int(self.startprob.shape[0])
 
     @property
     def n_features(self) -> int:
         """d."""
-        raise NotImplementedError("red:B4")
+        return int(self.means.shape[1])
 
 
 @dataclass(frozen=True, eq=False)
@@ -119,13 +173,35 @@ class ScalerParams:
         """Raise ModelError unless `columns` is a non-empty tuple of distinct strings, and
         `mean` and `std` are 1-D float64 arrays with one finite value per column, every std
         > 0. Replace the arrays with read-only copies."""
-        raise NotImplementedError("red:B4")
+        if (
+            not isinstance(self.columns, tuple)
+            or not self.columns
+            or any(not isinstance(name, str) for name in self.columns)
+            or len(set(self.columns)) != len(self.columns)
+        ):
+            raise ModelError("scaler columns must be a nonempty tuple of distinct strings")
+        for name in ("mean", "std"):
+            _check_array(getattr(self, name), (len(self.columns),), name)
+        if (self.std <= 0).any():
+            raise ModelError("scaler standard deviations must be positive")
+        _freeze_arrays(self, "mean", "std")
 
     def standardize(self, rows: Floats) -> Floats:
         """`(rows - mean) / std`, exactly that expression, as a new float64 array. `rows` is one
         row (d,) or a matrix (n, d). Raises ModelError on any other shape or dtype, or a value
         that isn't finite."""
-        raise NotImplementedError("red:B4")
+        if (
+            not isinstance(rows, np.ndarray)
+            or rows.ndim not in (1, 2)
+            or rows.shape[-1] != len(self.columns)
+        ):
+            raise ModelError("scaler input must be a row or matrix with its column count")
+        _check_array(rows, rows.shape, "scaler input")
+        with np.errstate(over="ignore", invalid="ignore"):
+            scaled = (rows - self.mean) / self.std
+        if not np.isfinite(scaled).all():
+            raise ModelError("standardized features overflow float64")
+        return scaled
 
 
 class TrainingRecord(StrictModel):
@@ -189,21 +265,73 @@ class HmmModel:
         0 ≤ best < len(seeds) and an `info` with a canonical JSON form, and
         fit_start < fit_end. A naive fit_start or fit_end raises ClockError. Both are stored in
         UTC (`object.__setattr__`)."""
-        raise NotImplementedError("red:B4")
+        start, end = ensure_utc(self.fit_start), ensure_utc(self.fit_end)
+        if (
+            len(self.scaler.columns) != self.params.n_features
+            or len(self.labels.states) != self.params.n_states
+            or re.fullmatch(r"[0-9a-f]{64}", self.feature_config_hash) is None
+            or start >= end
+        ):
+            raise ModelError("model parts, feature hash or fit window do not agree")
+        training = self.training
+        if (
+            not training.seeds
+            or len(training.seeds) != len(training.restart_logliks)
+            or not 0 <= training.best < len(training.seeds)
+        ):
+            raise ModelError("training record needs matching restarts and a valid best index")
+        try:
+            canonical_dumps(training)
+        except ValueError as exc:
+            raise ModelError("training record has no canonical JSON form") from exc
+        object.__setattr__(self, "fit_start", start)
+        object.__setattr__(self, "fit_end", end)
 
     def meta(self) -> ModelMeta:
         """The model's ModelMeta, with `format` = ARTIFACT_FORMAT."""
-        raise NotImplementedError("red:B4")
+        return ModelMeta(
+            format=ARTIFACT_FORMAT,
+            covariance_type=self.params.covariance_type,
+            n_states=self.params.n_states,
+            n_features=self.params.n_features,
+            feature_columns=self.scaler.columns,
+            feature_config_hash=self.feature_config_hash,
+            fit_start=self.fit_start,
+            fit_end=self.fit_end,
+            labels=self.labels,
+            training=self.training,
+        )
 
     def arrays(self) -> dict[str, Floats]:
         """The arrays of params.npz, keyed in PARAM_NAMES order: the four of `params`, then the
         scaler's `mean` as "scaler_mean" and `std` as "scaler_std"."""
-        raise NotImplementedError("red:B4")
+        return {
+            "startprob": self.params.startprob,
+            "transmat": self.params.transmat,
+            "means": self.params.means,
+            "covars": self.params.covars,
+            "scaler_mean": self.scaler.mean,
+            "scaler_std": self.scaler.std,
+        }
 
     def artifact_hash(self) -> str:
         """The artifact hash defined in the module docstring, as 64 lowercase hex characters.
         Deterministic: it depends only on `meta()` and `arrays()`."""
-        raise NotImplementedError("red:B4")
+        return sha256_hex(
+            {
+                "meta": self.meta(),
+                "params": {
+                    name: {
+                        "dtype": "float64",
+                        "shape": list(array.shape),
+                        "sha256": hashlib.sha256(
+                            np.ascontiguousarray(array, dtype="<f8").tobytes()
+                        ).hexdigest(),
+                    }
+                    for name, array in self.arrays().items()
+                },
+            }
+        )
 
 
 def save_model(model: HmmModel, root: Path) -> Path:
@@ -215,7 +343,36 @@ def save_model(model: HmmModel, root: Path) -> Path:
     idempotent; an existing directory that doesn't load as this model raises ModelError and is
     left alone.
     """
-    raise NotImplementedError("red:B4")
+    digest = model.artifact_hash()
+    directory = root / digest
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if directory.exists():
+            load_model(directory)
+            return directory
+        with tempfile.TemporaryDirectory(prefix=".model-", dir=root) as temporary:
+            staged = Path(temporary) / digest
+            staged.mkdir()
+            with zipfile.ZipFile(
+                staged / "params.npz", "w", compression=zipfile.ZIP_STORED
+            ) as archive:
+                for name, array in model.arrays().items():
+                    info = zipfile.ZipInfo(f"{name}.npy", date_time=(1980, 1, 1, 0, 0, 0))
+                    with archive.open(info, "w") as member:
+                        np.lib.format.write_array(member, array, allow_pickle=False)
+            (staged / "meta.json").write_bytes(
+                canonical_dumps({"artifact_hash": digest, "meta": model.meta()})
+            )
+            try:
+                staged.rename(directory)
+            except OSError:
+                # Another writer may have published the same artifact while we wrote it.
+                if not directory.exists():
+                    raise
+                load_model(directory)
+        return directory
+    except (OSError, ValueError) as exc:
+        raise ModelError(f"cannot save model artifact at {directory}") from exc
 
 
 def load_model(directory: Path) -> HmmModel:
@@ -228,4 +385,39 @@ def load_model(directory: Path) -> HmmModel:
     parse or contradicts the arrays, the model fails its own checks, or the hash recomputed from
     what was read differs from meta.json's `artifact_hash` or from the directory's name.
     """
-    raise NotImplementedError("red:B4")
+    try:
+        raw = (directory / "meta.json").read_bytes()
+        document = canonical_loads(raw)
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"artifact_hash", "meta"}
+            or canonical_dumps(document) != raw
+        ):
+            raise ModelError("meta.json must be the canonical artifact document")
+        meta = ModelMeta.model_validate_json(canonical_dumps(document["meta"]))
+        with zipfile.ZipFile(directory / "params.npz") as archive:
+            if sorted(archive.namelist()) != sorted(f"{name}.npy" for name in PARAM_NAMES):
+                raise ModelError("params.npz must hold exactly the six parameter arrays")
+        with np.load(directory / "params.npz", allow_pickle=False) as archive:
+            arrays = {name: archive[name] for name in PARAM_NAMES}
+        model = HmmModel(
+            params=GaussianParams(
+                meta.covariance_type, *(arrays[name] for name in PARAM_NAMES[:4])
+            ),
+            scaler=ScalerParams(meta.feature_columns, arrays["scaler_mean"], arrays["scaler_std"]),
+            fit_start=meta.fit_start,
+            fit_end=meta.fit_end,
+            feature_config_hash=meta.feature_config_hash,
+            labels=meta.labels,
+            training=meta.training,
+        )
+        if meta != model.meta():
+            raise ModelError("model metadata contradicts its parameters or format")
+        if (
+            model.artifact_hash() != document["artifact_hash"]
+            or directory.name != document["artifact_hash"]
+        ):
+            raise ModelError("model artifact hash does not match its contents or directory")
+        return model
+    except (OSError, ValueError, TypeError, KeyError, zipfile.BadZipFile, ClockError) as exc:
+        raise ModelError(f"cannot load model artifact at {directory}") from exc

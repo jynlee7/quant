@@ -12,7 +12,6 @@ from quant.core.errors import ModelError
 from quant.core.regime import Label
 from tests.support.hmm import label_table
 
-RED = pytest.mark.xfail(strict=True, reason="red:B4", raises=NotImplementedError)
 N = 252 * 7  # bars a year: the annualization the labels use
 
 
@@ -52,7 +51,6 @@ BOUNDARIES = [
 
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize(("v", "d", "label"), BOUNDARIES)
-@RED
 def test_the_label_rules_hold_at_their_exact_boundaries(v: float, d: float, label: Label) -> None:
     from quant.hmm.labels import classify, r1_thresholds
 
@@ -60,7 +58,6 @@ def test_the_label_rules_hold_at_their_exact_boundaries(v: float, d: float, labe
 
 
 @pytest.mark.spec("SPEC§4")
-@RED
 def test_the_thresholds_come_from_config() -> None:
     from quant.hmm.labels import LabelThresholds, classify, r1_thresholds
 
@@ -88,7 +85,6 @@ def test_the_thresholds_come_from_config() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@RED
 def test_v_and_d_come_from_returns_weighted_by_filtered_probability() -> None:
     from quant.hmm.labels import state_stats
 
@@ -110,7 +106,6 @@ def test_v_and_d_come_from_returns_weighted_by_filtered_probability() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@RED
 def test_a_fit_window_labels_its_states() -> None:
     """Four states with known returns, one-hot probabilities: each gets its rule's label."""
     from quant.hmm.labels import label_states, r1_thresholds, state_stats
@@ -145,7 +140,6 @@ def test_a_fit_window_labels_its_states() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@RED
 def test_state_stats_refuses_what_it_cant_measure() -> None:
     from quant.hmm.labels import state_stats
 
@@ -165,7 +159,6 @@ def test_state_stats_refuses_what_it_cant_measure() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@RED
 def test_the_probabilities_of_states_that_share_a_label_add_up() -> None:
     from quant.hmm.labels import label_probs
 
@@ -188,7 +181,6 @@ def test_the_probabilities_of_states_that_share_a_label_add_up() -> None:
 
 
 @pytest.mark.spec("SPEC§4", "SPEC§6")
-@RED
 def test_entropy_is_normalized_by_the_models_labels() -> None:
     from quant.hmm.labels import label_entropy, label_probs, top_label
 
@@ -213,7 +205,6 @@ def test_entropy_is_normalized_by_the_models_labels() -> None:
 
 
 @pytest.mark.spec("SPEC§4", "SPEC§6")
-@RED
 def test_the_expected_remaining_duration() -> None:
     from quant.hmm.labels import remaining_duration
 

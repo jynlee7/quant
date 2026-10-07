@@ -32,7 +32,6 @@ from tests.support.hmm import (
     two_diag,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B4", raises=NotImplementedError)
 PARAM_NAMES = ("startprob", "transmat", "means", "covars", "scaler_mean", "scaler_std")
 
 
@@ -63,7 +62,6 @@ def _expected_hash(model: Any) -> str:
 
 @pytest.mark.spec("ARCH§7.2", "SPEC§4", "D4")
 @pytest.mark.parametrize("make", [three_full, two_diag, four_sparse])
-@RED
 def test_an_artifact_round_trips_bit_for_bit(tmp_path: Path, make: Any) -> None:
     from quant.hmm.model import ARTIFACT_FORMAT, load_model, save_model
 
@@ -103,7 +101,6 @@ def test_an_artifact_round_trips_bit_for_bit(tmp_path: Path, make: Any) -> None:
 
 
 @pytest.mark.spec("ARCH§7.2", "ARCH§14")
-@RED
 def test_the_files_and_the_hash_are_deterministic(tmp_path: Path) -> None:
     from quant.hmm.model import save_model
 
@@ -129,7 +126,6 @@ def test_the_files_and_the_hash_are_deterministic(tmp_path: Path) -> None:
 
 
 @pytest.mark.spec("ARCH§7.2", "SPEC§4")
-@RED
 def test_the_artifact_hash_follows_its_definition_and_every_value() -> None:
     model = _model()
     digest = model.artifact_hash()
@@ -163,7 +159,6 @@ def _scaler(std: list[float]) -> Any:
 
 
 @pytest.mark.spec("ARCH§7.2")
-@RED
 def test_loading_never_unpickles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from quant.hmm.model import load_model, save_model
 
@@ -201,7 +196,6 @@ def _copy(directory: Path, where: Path) -> Path:
 
 
 @pytest.mark.spec("ARCH§7.2")
-@RED
 def test_a_tampered_or_incomplete_artifact_is_refused(tmp_path: Path) -> None:
     from quant.hmm.model import load_model, save_model
 
@@ -245,7 +239,6 @@ def test_a_tampered_or_incomplete_artifact_is_refused(tmp_path: Path) -> None:
 
 
 @pytest.mark.spec("ARCH§7.2")
-@RED
 def test_saving_is_idempotent_and_never_overwrites(tmp_path: Path) -> None:
     from quant.hmm.model import load_model, save_model
 
@@ -301,7 +294,6 @@ def _bad_params() -> list[tuple[str, dict[str, Any]]]:
 
 @pytest.mark.spec("SPEC§4", "ARCH§7.2")
 @pytest.mark.parametrize(("why", "fields"), _bad_params(), ids=[w for w, _ in _bad_params()])
-@RED
 def test_bad_parameters_are_refused(why: str, fields: dict[str, Any]) -> None:
     from quant.hmm.model import GaussianParams
 
@@ -310,7 +302,6 @@ def test_bad_parameters_are_refused(why: str, fields: dict[str, Any]) -> None:
 
 
 @pytest.mark.spec("SPEC§4", "ARCH§7.2")
-@RED
 def test_the_model_checks_its_parts_and_freezes_its_arrays() -> None:
     from quant.hmm.model import HmmModel, ScalerParams
 

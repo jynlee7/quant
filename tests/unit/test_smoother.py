@@ -14,12 +14,9 @@ from tests.support.hmm import (
     sample,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B4", raises=NotImplementedError)
-
 
 @pytest.mark.spec("A4", "I2")
 @pytest.mark.parametrize("name", sorted(TRUTHS))
-@RED
 def test_the_smoother_matches_the_naive_reference(name: str) -> None:
     from quant.eval.smoother import smooth
     from quant.hmm.filter import forward_pass
@@ -43,7 +40,6 @@ def test_the_smoother_matches_the_naive_reference(name: str) -> None:
 
 
 @pytest.mark.spec("A4")
-@RED
 def test_the_smoother_stays_finite_on_outliers() -> None:
     from quant.eval.smoother import smooth
 

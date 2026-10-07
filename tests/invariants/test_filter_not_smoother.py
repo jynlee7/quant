@@ -22,7 +22,6 @@ from tests.support.hmm import (
     sample,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B4", raises=NotImplementedError)
 Floats = npt.NDArray[np.float64]
 
 
@@ -36,7 +35,6 @@ def looks_filtered(probs: Floats, smoothed: Floats) -> bool:
 
 @pytest.mark.spec("T-NL3", "I2", "SPEC§6")
 @pytest.mark.parametrize("name", sorted(TRUTHS))
-@RED
 def test_the_filter_differs_from_the_smoother_inside_and_matches_at_the_end(name: str) -> None:
     from quant.eval.smoother import smooth
     from quant.hmm.filter import ForwardFilter
