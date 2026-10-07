@@ -36,7 +36,6 @@ def _unit(means: list[float], startprob: list[float], transmat: list[list[float]
     )
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 @pytest.mark.spec("SPEC§6")
 def test_identical_emissions_keep_the_prior_on_an_outlier() -> None:
     """Codex R1: when every state gives a row the same density, the posterior is the prior, however
@@ -54,7 +53,6 @@ def test_identical_emissions_keep_the_prior_on_an_outlier() -> None:
     assert np.array([o.state_probs for o in outputs]).tobytes() == trace.state_probs.tobytes()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 @pytest.mark.spec("A4")
 def test_the_smoother_keeps_the_transitions_on_an_outlier() -> None:
     """Codex R3: an outlier's emissions (about -5e17) must not swamp log a_jk + log β. With two
@@ -69,7 +67,6 @@ def test_the_smoother_keeps_the_transitions_on_an_outlier() -> None:
     np.testing.assert_allclose(posteriors[1], [0.0, 1.0], rtol=0, atol=1e-12)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=ModelError)
 @pytest.mark.spec("SPEC§4", "SPEC§6")
 def test_a_closed_state_the_chain_cant_reach_doesnt_block_the_duration() -> None:
     """Codex R2, Claude C1: CHOP is states 0 and 1, and state 1 is absorbing but unreachable (π
@@ -93,7 +90,6 @@ def test_a_closed_state_the_chain_cant_reach_doesnt_block_the_duration() -> None
         assert out.remaining_duration == pytest.approx(10.0, rel=1e-12)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§4", "SPEC§6")
 def test_a_label_the_chain_can_never_leave_is_refused_when_the_filter_is_built() -> None:
     """Claude C1: a label short of every state, holding a closed class the chain can reach, has
@@ -123,7 +119,6 @@ def test_a_label_the_chain_can_never_leave_is_refused_when_the_filter_is_built()
     ForwardFilter(model_of(absorbing, [Label.CHOP] * 3))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=np.linalg.LinAlgError)
 @pytest.mark.spec("SPEC§6")
 def test_an_ill_conditioned_covariance_the_model_accepts_is_one_the_filter_evaluates() -> None:
     """Claude C2: diag(1, 1e-11) is positive definite, so GaussianParams accepts it; scipy's
@@ -143,13 +138,19 @@ def test_an_ill_conditioned_covariance_the_model_accepts_is_one_the_filter_evalu
     probs = np.array([o.state_probs for o in outputs])
     np.testing.assert_allclose(probs, reference.probs, rtol=0, atol=1e-10)
     np.testing.assert_allclose([o.loglik for o in outputs], reference.loglik, rtol=1e-12)
-    textbook = np.log([density(truth, row) for row in x[:20]])
+    textbook = [
+        [
+            -0.5 * (row - truth.means[k]) @ np.linalg.inv(truth.covars[k]) @ (row - truth.means[k])
+            - 0.5 * math.log((2 * math.pi) ** truth.d * np.linalg.det(truth.covars[k]))
+            for k in range(truth.k)
+        ]
+        for row in x[:20]
+    ]
     np.testing.assert_allclose(emission_logpdf(model.params, x[:20]), textbook, rtol=1e-12)
     assert forward_pass(model.params, model.scaler, x).state_probs.tobytes() == probs.tobytes()
     assert np.isfinite(smooth(model.params, model.scaler, x)).all()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=TypeError)
 @pytest.mark.spec("SPEC§6")
 def test_a_forward_pass_continues_from_the_rows_before_it() -> None:
     """Claude C3: B4b scores a validation block by continuing the filter from the training rows,
@@ -184,7 +185,6 @@ def test_a_forward_pass_continues_from_the_rows_before_it() -> None:
             forward_pass(params, scaler, x[300:], previous=bad)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 @pytest.mark.spec("SPEC§3", "SPEC§6")
 def test_the_predictive_log_likelihood_is_the_density_of_the_raw_features() -> None:
     """Claude C4: spec §6's l_t is log p(x_t | x_<t) for the raw row x_t, so it carries the
@@ -218,7 +218,6 @@ def test_the_predictive_log_likelihood_is_the_density_of_the_raw_features() -> N
         assert math.isclose(loglik.sum(), reference.loglik.sum(), rel_tol=1e-12)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§4")
 def test_a_volatility_that_is_only_rounding_is_undefined() -> None:
     """Codex R5: 3,000 returns all equal to 0.001 have no volatility, but summation leaves a

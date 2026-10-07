@@ -29,7 +29,9 @@ with P_l = 0 count 0), so H is 1 when the model's labels are equally likely what
 0 for a model with one label. The active label is the most probable one. Its expected remaining
 duration is the expected number of bars, the current one included, before the chain first
 leaves the label's states, starting from the filtered distribution within them. For a label of
-one state k that is 1 / (1 - a_kk), spec §4's expected duration.
+one state k that is 1 / (1 - a_kk), spec §4's expected duration. It is infinite from a state
+that can reach a closed class inside the label, so a filter refuses a model whose chain can
+reach such a state from π (`Durations`); states it can't reach never hold probability.
 
 Everything here is pure float64 numpy. Nothing imports hmmlearn or eval (K3).
 """
@@ -138,8 +140,9 @@ def state_stats(returns: Floats, state_probs: Floats) -> tuple[Floats, Floats]:
 
     `returns` has shape (n,) and `state_probs` shape (n, K), row t being bar t's filtered
     probabilities. Raises ModelError when the shapes don't agree, n < 2, any value isn't finite,
-    a probability is negative, sigma_all is 0, or a state has w_k = 0 or sigma_k = 0 (its d is
-    undefined).
+    a probability is negative, a state has w_k = 0, or sigma_all or a sigma_k is 0: v and d are
+    then undefined. A volatility no larger than n·eps·max|r_t| (eps the float64 machine epsilon)
+    counts as 0, since that is the residue rounding leaves in the mean of n equal returns.
     """
     if (
         not isinstance(returns, np.ndarray)
@@ -163,7 +166,8 @@ def state_stats(returns: Floats, state_probs: Floats) -> tuple[Floats, Floats]:
         sigma_all = returns.std()
         v = sigma / sigma_all
         d = np.sqrt(BARS_PER_YEAR) * mu / sigma
-    if (weights <= 0).any() or (sigma <= 0).any() or sigma_all <= 0:
+    residue = len(returns) * np.finfo(np.float64).eps * float(np.abs(returns).max())
+    if (weights <= 0).any() or (sigma <= residue).any() or sigma_all <= residue:
         raise ModelError("state statistics need positive weight and volatility")
     if not np.isfinite(v).all() or not np.isfinite(d).all():
         raise ModelError("state statistics overflow float64")
@@ -212,33 +216,115 @@ def top_label(probs: Mapping[Label, float]) -> Label:
     return max((label for label in Label if label in probs), key=probs.__getitem__)
 
 
+def _closure(seed: npt.NDArray[np.bool_], edges: npt.NDArray[np.bool_]) -> npt.NDArray[np.bool_]:
+    """Every node that reaches `seed` along `edges` (edges[j, k]: j steps to k), seed included."""
+    reached = seed.copy()
+    while True:
+        grown = reached | (edges & reached[None, :]).any(axis=1)
+        if (grown == reached).all():
+            return reached
+        reached = grown
+
+
+def _exit_times(transmat: Floats, states: tuple[int, ...]) -> Floats:
+    """For each state of S = `states`, the expected number of bars, the current one included,
+    before the chain first leaves S: x over the states that leave S with probability 1, where
+    (I - A_FF) x = 1 for that set F, and +inf for the rest (a state that can reach a closed class
+    inside S). F is closed under A's moves inside S, so x is exact for any mix over F. Needs S
+    short of every state. Raises ModelError when the solve fails or overflows."""
+    index = np.array(states, dtype=np.int64)
+    inside = np.zeros(len(transmat), dtype=bool)
+    inside[index] = True
+    sub = transmat[np.ix_(index, index)]
+    moves = np.greater(sub, 0.0)
+    outside = transmat[np.ix_(index, np.flatnonzero(~inside))]
+    leaks = np.asarray(np.greater(outside, 0.0).any(axis=1), dtype=np.bool_)
+    closed = ~_closure(leaks, moves)
+    finite = ~_closure(closed, moves)
+    times = np.full(len(states), np.inf, dtype=np.float64)
+    if finite.any():
+        try:
+            times[finite] = np.linalg.solve(
+                np.eye(int(finite.sum())) - sub[np.ix_(finite, finite)], np.ones(int(finite.sum()))
+            )
+        except np.linalg.LinAlgError as exc:
+            raise ModelError("a label's expected duration is singular") from exc
+        if not np.isfinite(times[finite]).all():
+            raise ModelError("a label's expected duration is not finite")
+    return times
+
+
+def _expected(state_probs: Floats, states: tuple[int, ...], times: Floats, label: Label) -> float:
+    mass = state_probs[list(states)]
+    total = mass.sum()
+    if np.isinf(times[mass > 0]).any():
+        raise ModelError(f"{label} has probability on states it can never leave")
+    duration = float((mass / total) @ np.where(np.isinf(times), 0.0, times))
+    if not np.isfinite(duration):
+        raise ModelError(f"{label} duration is not finite")
+    return duration
+
+
+def _label_states(state_probs: Floats, table: LabelTable, label: Label) -> tuple[int, ...] | None:
+    """S for `label`, or None when S is every state. Raises as `remaining_duration` does."""
+    states = table.states_of(label)
+    if not states:
+        raise ModelError(f"model has no {label} states")
+    if state_probs.shape != (len(table.states),):
+        raise ModelError("state probabilities must have one entry per state")
+    if state_probs[list(states)].sum() <= 0:
+        raise ModelError(f"{label} has no probability mass")
+    return None if len(states) == len(table.states) else states
+
+
 def remaining_duration(
     state_probs: Floats, transmat: Floats, table: LabelTable, label: Label
 ) -> float | None:
     """The expected remaining duration of `label`, in bars, the current bar included (module
-    docstring): with S = table.states_of(label), w = state_probs[S] / Σ state_probs[S] and A_SS
-    the transition matrix restricted to S, it is w · x where (I - A_SS) x = 1 (numpy.linalg.solve).
-    A label of one state k gives 1 / (1 - a_kk).
+    docstring): with S = table.states_of(label) and w = state_probs[S] / Σ state_probs[S], it is
+    w · x, x being each state's expected bars before the chain first leaves S.
+
+    x solves (I - A_FF) x = 1 (numpy.linalg.solve) over F, the states of S from which the chain
+    leaves S with probability 1, so only states the current mix can reach count: an absorbing
+    state the mix gives no probability doesn't make the duration undefined. A label of one state
+    k gives 1 / (1 - a_kk).
 
     None when S is every state: the chain can never leave the label. Raises ModelError when
-    `label` isn't in the table, Σ state_probs[S] is 0, the system is singular (a closed subset
-    of S), or the result isn't finite.
+    `label` isn't in the table, `state_probs` isn't shape (K,), Σ state_probs[S] is 0, the mix
+    puts probability on a state that may never leave S (the duration is infinite), or the result
+    isn't finite. `Durations` gives the same values, bit for bit, from a table built once.
     """
-    states = table.states_of(label)
-    if not states:
-        raise ModelError(f"model has no {label} states")
-    mass = state_probs[list(states)]
-    if mass.sum() <= 0:
-        raise ModelError(f"{label} has no probability mass")
-    if len(states) == len(table.states):
+    states = _label_states(state_probs, table, label)
+    if states is None:
         return None
-    sub = transmat[np.ix_(states, states)]
-    try:
-        duration = float(
-            (mass / mass.sum()) @ np.linalg.solve(np.eye(len(states)) - sub, np.ones(len(states)))
-        )
-    except np.linalg.LinAlgError as exc:
-        raise ModelError(f"{label} contains a closed subset") from exc
-    if not np.isfinite(duration):
-        raise ModelError(f"{label} duration is not finite")
-    return duration
+    return _expected(state_probs, states, _exit_times(transmat, states), label)
+
+
+class Durations:
+    """`remaining_duration` for one model, with each label's exit times solved once.
+
+    Built from the model's π, A and label table, it refuses (ModelError) a model in which the
+    chain can reach, from π, a state of some label (short of every state) that may never leave
+    that label: such a label's expected duration would be infinite once it holds probability.
+    States the chain can't reach never hold any, so they don't count.
+    """
+
+    def __init__(self, startprob: Floats, transmat: Floats, table: LabelTable) -> None:
+        reachable = _closure(startprob > 0, (transmat > 0).T)
+        self._table = table
+        self._times: dict[Label, Floats] = {}
+        for label in table.labels:
+            states = table.states_of(label)
+            if len(states) == len(table.states):
+                continue
+            times = _exit_times(transmat, states)
+            if np.isinf(times[reachable[list(states)]]).any():
+                raise ModelError(f"{label} holds states the chain can reach but never leave")
+            self._times[label] = times
+
+    def remaining(self, state_probs: Floats, label: Label) -> float | None:
+        """`remaining_duration(state_probs, A, table, label)` for this model, bit for bit."""
+        states = _label_states(state_probs, self._table, label)
+        if states is None:
+            return None
+        return _expected(state_probs, states, self._times[label], label)

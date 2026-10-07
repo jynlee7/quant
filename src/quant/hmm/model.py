@@ -47,6 +47,7 @@ from typing import Any, Final, Literal
 
 import numpy as np
 import numpy.typing as npt
+import scipy.linalg
 from pydantic import AwareDatetime
 
 from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
@@ -107,8 +108,9 @@ class GaussianParams:
         - every array is float64 with the shapes above, K ≥ 1 and d ≥ 1, and every value is
           finite;
         - `startprob` and every row of `transmat` are ≥ 0 and sum to 1 within SUM_TOLERANCE;
-        - every covariance is exactly symmetric (Σ == Σᵀ, elementwise) and positive definite
-          (its Cholesky factorization succeeds);
+        - every covariance is exactly symmetric (Σ == Σᵀ, elementwise) and positive definite,
+          with a finite `whitening()`: its Cholesky factorization succeeds, and the inverse
+          factor and log-determinant are finite;
         - for "diag", every off-diagonal entry is exactly 0.
 
         Replace each array with a read-only copy (`object.__setattr__`), so the caller's array
@@ -140,11 +142,31 @@ class GaussianParams:
                 covariance != np.diag(np.diag(covariance))
             ):
                 raise ModelError("a diag covariance must have zero off-diagonal entries")
-            try:
-                np.linalg.cholesky(covariance)
-            except np.linalg.LinAlgError as exc:
-                raise ModelError("covariances must be positive definite") from exc
         _freeze_arrays(self, "startprob", "transmat", "means", "covars")
+        self.whitening()
+
+    def whitening(self) -> tuple[Floats, Floats]:
+        """(W, h): for each state k, W[k] = L_k⁻¹, the inverse of the lower Cholesky factor of
+        Σ_k (`scipy.linalg.cholesky`, then `scipy.linalg.solve_triangular` against I), shape
+        (K, d, d), and h[k] = Σ_i log L_k[i, i] = ½ log det Σ_k, shape (K,). The emission
+        density is then log b_k(z) = -½ d log 2π - h[k] - ½ |W[k] (z - μ_k)|². Deterministic,
+        and raises ModelError when a factorization fails or a value isn't finite, so a model
+        that constructs can always be evaluated."""
+        k, d = self.means.shape
+        inverse = np.empty((k, d, d), dtype=np.float64)
+        half_logdet = np.empty(k, dtype=np.float64)
+        identity = np.eye(d, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            for state, covariance in enumerate(self.covars):
+                try:
+                    factor = scipy.linalg.cholesky(covariance, lower=True)
+                    inverse[state] = scipy.linalg.solve_triangular(factor, identity, lower=True)
+                except (np.linalg.LinAlgError, ValueError) as exc:
+                    raise ModelError("covariances must be positive definite") from exc
+                half_logdet[state] = np.log(np.diag(factor)).sum()
+        if not np.isfinite(inverse).all() or not np.isfinite(half_logdet).all():
+            raise ModelError("covariances must have a finite inverse and log-determinant")
+        return inverse, half_logdet
 
     @property
     def n_states(self) -> int:
