@@ -176,17 +176,37 @@ def test_loading_never_unpickles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert all(call.get("allow_pickle") is False for call in calls)
     monkeypatch.undo()
 
-    # An object array in params.npz is refused, not unpickled.
+    # An object array in params.npz is refused, not unpickled: its payload's __reduce__ would
+    # run code on unpickling, and must not. (Claude C9: a plain object array failed the shape
+    # check even when unpickled, so it couldn't tell.)
     planted = tmp_path / "planted" / directory.name
     shutil.copytree(directory, planted)
     with np.load(directory / "params.npz", allow_pickle=False) as npz:
         arrays = {name: npz[name] for name in npz.files}
-    arrays["means"] = np.array([{"payload": 1}], dtype=object)
+    payload = np.empty(1, dtype=object)
+    payload[0] = _Payload()
+    arrays["means"] = payload
     buffer = io.BytesIO()
     np.savez(buffer, **arrays)  # type: ignore[arg-type]
     (planted / "params.npz").write_bytes(buffer.getvalue())
+    _UNPICKLED.clear()
     with pytest.raises(ModelError):
         load_model(planted)
+    assert not _UNPICKLED
+
+
+_UNPICKLED: list[str] = []
+
+
+def _unpickled(note: str) -> None:
+    _UNPICKLED.append(note)
+
+
+class _Payload:
+    """Unpickling this calls `_unpickled`: the side effect a pickle exploit would have."""
+
+    def __reduce__(self) -> tuple[Any, tuple[str]]:
+        return (_unpickled, ("ran",))
 
 
 def _copy(directory: Path, where: Path) -> Path:

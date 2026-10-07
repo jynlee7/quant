@@ -16,14 +16,17 @@ import numpy as np
 from scipy.special import logsumexp
 
 from quant.core.errors import ModelError
+from quant.data.frames import Floats
 from quant.hmm.filter import forward_pass
-from quant.hmm.model import Floats, GaussianParams, ScalerParams
+from quant.hmm.model import GaussianParams, ScalerParams
 
 
-def smooth(params: GaussianParams, scaler: ScalerParams, rows: Floats) -> Floats:
+def smooth(
+    params: GaussianParams, scaler: ScalerParams, rows: Floats, *, columns: tuple[str, ...]
+) -> Floats:
     """Smoothed state posteriors, shape (n, K): row t is P(s_t | x_1..x_n), summing to 1.
 
-    Run `forward_pass` over `rows` (n, d) for log alpha and the emissions log b(z_t), then the
+    Run `forward_pass` over `rows` (n, d), whose columns `columns` names, for log alpha and the emissions log b(z_t), then the
     backward recursion in log space: log β_{n-1} = 0 and
 
         log β_t,j = logsumexp_k(log a_jk + e_{t+1},k + log β_{t+1},k) - c_t,
@@ -34,7 +37,7 @@ def smooth(params: GaussianParams, scaler: ScalerParams, rows: Floats) -> Floats
     constant per bar cancels: the posterior is exp(log p_t + log β_t), renormalized to sum to
     1. Raises as `forward_pass` does.
     """
-    trace = forward_pass(params, scaler, rows)
+    trace = forward_pass(params, scaler, rows, columns=columns)
     with np.errstate(divide="ignore"):
         log_a = np.log(params.transmat)
     beta = np.zeros(params.n_states, dtype=np.float64)

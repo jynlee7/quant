@@ -15,6 +15,7 @@ import pytest
 from tests.support.hmm import (
     DEFAULT_LABELS,
     TRUTHS,
+    columns_of,
     hmmlearn_posteriors,
     identity_scaler,
     model_of,
@@ -44,11 +45,16 @@ def test_the_filter_differs_from_the_smoother_inside_and_matches_at_the_end(name
     theirs = hmmlearn_posteriors(truth, x)
 
     ours = np.array(
-        [o.state_probs for o in ForwardFilter(model_of(truth, DEFAULT_LABELS[name])).run(x)]
+        [
+            o.state_probs
+            for o in ForwardFilter(model_of(truth, DEFAULT_LABELS[name])).run(
+                x, columns=columns_of(x)
+            )
+        ]
     )
     assert looks_filtered(ours, theirs)
 
     # The check bites: smoothed posteriors fail it, because they match at every bar.
-    smoothed = smooth(params_of(truth), identity_scaler(truth.d), x)
+    smoothed = smooth(params_of(truth), identity_scaler(truth.d), x, columns=columns_of(x))
     np.testing.assert_allclose(smoothed, theirs, rtol=0, atol=1e-9)
     assert not looks_filtered(smoothed, theirs)

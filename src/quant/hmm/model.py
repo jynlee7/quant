@@ -36,27 +36,33 @@ hmm.filter).
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import os
 import re
+import shutil
 import tempfile
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final, Literal
+from types import MappingProxyType
+from typing import Annotated, Any, Final, Literal
 
 import numpy as np
-import numpy.typing as npt
 import scipy.linalg
-from pydantic import AwareDatetime
+from pydantic import AfterValidator, AwareDatetime, PlainSerializer
 
 from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
 from quant.core.clock import ensure_utc
 from quant.core.errors import ClockError, ModelError
 from quant.core.model import StrictModel
+from quant.data.frames import Floats
+from quant.features.scaler import STD_RTOL, Scaler
+from quant.features.stream import freeze_arrays
 from quant.hmm.labels import LabelTable
 
-Floats = npt.NDArray[np.float64]
 CovarianceType = Literal["diag", "full"]
 
 # The arrays in params.npz, in the order they are written. No other member is allowed.
@@ -77,11 +83,27 @@ def _check_array(values: Floats, shape: tuple[int, ...], name: str) -> None:
         raise ModelError(f"{name} must be a finite float64 array of shape {shape}")
 
 
-def _freeze_arrays(owner: object, *names: str) -> None:
-    for name in names:
-        values = getattr(owner, name).copy()
-        values.flags.writeable = False
-        object.__setattr__(owner, name, values)
+def _freeze_json(value: Any) -> Any:
+    """`value` with every mapping made a read-only MappingProxyType and every list a tuple, all
+    the way down, so nothing reachable from it can change."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    """The plain dicts and lists `_freeze_json` came from, for serialization."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+# A JSON object that is deeply immutable once validated, and serializes as a plain one.
+FrozenJson = Annotated[Mapping[str, Any], AfterValidator(_freeze_json), PlainSerializer(_thaw_json)]
 
 
 @dataclass(frozen=True, eq=False)
@@ -142,7 +164,7 @@ class GaussianParams:
                 covariance != np.diag(np.diag(covariance))
             ):
                 raise ModelError("a diag covariance must have zero off-diagonal entries")
-        _freeze_arrays(self, "startprob", "transmat", "means", "covars")
+        freeze_arrays(self, "startprob", "transmat", "means", "covars")
         self.whitening()
 
     def whitening(self) -> tuple[Floats, Floats]:
@@ -183,8 +205,9 @@ class GaussianParams:
 class ScalerParams:
     """The frozen z-score parameters the model's features are standardized with (spec §3).
 
-    `columns` names the d feature columns in order; `mean` and `std` are (d,). B3's
-    `quant.features.scaler.Scaler` carries the same three values; the trainer copies them in.
+    `columns` names the d feature columns in order; `mean` and `std` are (d,). They are B3's
+    `quant.features.scaler.Scaler` without its window, which the model's fit window replaces:
+    the trainer converts one with `from_scaler`, and the checks are B3's, STD_RTOL included.
     """
 
     columns: tuple[str, ...]
@@ -194,7 +217,8 @@ class ScalerParams:
     def __post_init__(self) -> None:
         """Raise ModelError unless `columns` is a non-empty tuple of distinct strings, and
         `mean` and `std` are 1-D float64 arrays with one finite value per column, every std
-        > 0. Replace the arrays with read-only copies."""
+        > 0 and more than STD_RTOL times its column's |mean| (B3's constant-column check).
+        Replace the arrays with read-only copies (`freeze_arrays`)."""
         if (
             not isinstance(self.columns, tuple)
             or not self.columns
@@ -204,20 +228,29 @@ class ScalerParams:
             raise ModelError("scaler columns must be a nonempty tuple of distinct strings")
         for name in ("mean", "std"):
             _check_array(getattr(self, name), (len(self.columns),), name)
-        if (self.std <= 0).any():
-            raise ModelError("scaler standard deviations must be positive")
-        _freeze_arrays(self, "mean", "std")
+        if (self.std <= 0).any() or (self.std <= STD_RTOL * np.abs(self.mean)).any():
+            raise ModelError("scaler deviations must be positive and more than rounding")
+        freeze_arrays(self, "mean", "std")
 
-    def standardize(self, rows: Floats) -> Floats:
+    @classmethod
+    def from_scaler(cls, scaler: Scaler) -> ScalerParams:
+        """B3's fitted scaler as the model stores it: its columns, mean and std, checked again
+        here (ModelError). `standardize` then gives `scaler.transform`'s values bit for bit."""
+        return cls(scaler.columns, scaler.mean, scaler.std)
+
+    def standardize(self, rows: Floats, *, columns: tuple[str, ...]) -> Floats:
         """`(rows - mean) / std`, exactly that expression, as a new float64 array. `rows` is one
-        row (d,) or a matrix (n, d). Raises ModelError on any other shape or dtype, or a value
-        that isn't finite."""
+        row (d,) or a matrix (n, d), and `columns` names its columns, which must be exactly
+        `self.columns`: a row of the same width from another feature config is refused, as
+        B3's `Scaler.transform` refuses it. Raises ModelError for other names, any other shape
+        or dtype, or a value that isn't finite."""
         if (
-            not isinstance(rows, np.ndarray)
+            columns != self.columns
+            or not isinstance(rows, np.ndarray)
             or rows.ndim not in (1, 2)
             or rows.shape[-1] != len(self.columns)
         ):
-            raise ModelError("scaler input must be a row or matrix with its column count")
+            raise ModelError("scaler input must be a row or matrix of the scaler's columns")
         _check_array(rows, rows.shape, "scaler input")
         with np.errstate(over="ignore", invalid="ignore"):
             scaled = (rows - self.mean) / self.std
@@ -232,18 +265,20 @@ class TrainingRecord(StrictModel):
     - `base_seed`: the configured base seed.
     - `seeds` and `restart_logliks`: one entry per restart, in restart order: its seed and its
       final training log-likelihood. At least one restart.
-    - `best`: the index of the winning restart.
+    - `best`: the index of the winning restart: the highest log-likelihood, a tie going to the
+      lowest index (`numpy.argmax`, spec §4). HmmModel checks it.
     - `info`: everything else the trainer records (data hash, the BIC and validation table,
       the validation block's predictive log-likelihood distribution, sanity checks, the code
       commit, library and BLAS versions). Any value with a canonical JSON form. It is part of
-      the artifact hash.
+      the artifact hash, so it is deeply immutable once validated: its objects become
+      read-only mappings and its arrays tuples, and it serializes back to plain JSON.
     """
 
     base_seed: int
     seeds: tuple[int, ...]
     restart_logliks: tuple[float, ...]
     best: int
-    info: dict[str, Any]
+    info: FrozenJson
 
 
 class ModelMeta(StrictModel):
@@ -283,10 +318,14 @@ class HmmModel:
     def __post_init__(self) -> None:
         """Raise ModelError unless the parts agree: `scaler` has `params.n_features` columns,
         `labels.states` has `params.n_states` rows, `feature_config_hash` is 64 lowercase hex
-        characters, `training` has as many seeds as log-likelihoods (≥ 1) with
-        0 ≤ best < len(seeds) and an `info` with a canonical JSON form, and
-        fit_start < fit_end. A naive fit_start or fit_end raises ClockError. Both are stored in
-        UTC (`object.__setattr__`)."""
+        characters, `training` has as many seeds as log-likelihoods (≥ 1) with best the
+        argmax of the log-likelihoods (the lowest index on a tie) and an `info` with a
+        canonical JSON form, and fit_start < fit_end. A naive fit_start or fit_end raises
+        ClockError. Both are stored in UTC (`object.__setattr__`).
+
+        `training` is stored as a fresh record parsed from its canonical JSON, so the model
+        never shares the caller's objects (a `model_copy(update=...)` skips validation) and
+        its `info` is frozen all the way down: nothing can change the artifact hash."""
         start, end = ensure_utc(self.fit_start), ensure_utc(self.fit_end)
         if (
             len(self.scaler.columns) != self.params.n_features
@@ -295,17 +334,17 @@ class HmmModel:
             or start >= end
         ):
             raise ModelError("model parts, feature hash or fit window do not agree")
-        training = self.training
+        try:
+            training = TrainingRecord.model_validate_json(canonical_dumps(self.training))
+        except ValueError as exc:
+            raise ModelError("training record has no canonical JSON form") from exc
         if (
             not training.seeds
             or len(training.seeds) != len(training.restart_logliks)
-            or not 0 <= training.best < len(training.seeds)
+            or training.best != int(np.argmax(training.restart_logliks))
         ):
-            raise ModelError("training record needs matching restarts and a valid best index")
-        try:
-            canonical_dumps(training)
-        except ValueError as exc:
-            raise ModelError("training record has no canonical JSON form") from exc
+            raise ModelError("training record needs matching restarts and the best one's index")
+        object.__setattr__(self, "training", training)
         object.__setattr__(self, "fit_start", start)
         object.__setattr__(self, "fit_end", end)
 
@@ -356,42 +395,62 @@ class HmmModel:
         )
 
 
+def _fsync(path: Path) -> None:
+    """Flush a file's or a directory's contents and entries to the device."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def save_model(model: HmmModel, root: Path) -> Path:
     """Write the model's artifact to `root/<artifact_hash>/` and return that directory.
 
-    The files are written into a temporary directory inside `root` and renamed into place, so
-    a reader never sees half an artifact. `root` is created if missing. Saving a model whose
-    directory already exists checks it with `load_model` and returns it unchanged, so saving is
-    idempotent; an existing directory that doesn't load as this model raises ModelError and is
-    left alone.
+    The files are written into a temporary directory `root/.model-*/` and renamed into place,
+    so a reader never sees half an artifact. Each file and the staged directory are fsynced
+    before the rename and `root` after it, so a power loss can't publish a directory whose
+    files' bytes never reached the disk. Writers hold an exclusive lock on `root` itself
+    (fcntl.flock on the directory) for the whole save, so a `.model-*` entry found while
+    holding it was left by a crash, and is removed. `root` is created if missing. Saving a
+    model whose directory already exists checks it with `load_model` and returns it unchanged,
+    so saving is idempotent; an existing directory that doesn't load as this model raises
+    ModelError and is left alone.
     """
     digest = model.artifact_hash()
     directory = root / digest
     try:
         root.mkdir(parents=True, exist_ok=True)
-        if directory.exists():
-            load_model(directory)
-            return directory
-        with tempfile.TemporaryDirectory(prefix=".model-", dir=root) as temporary:
-            staged = Path(temporary) / digest
-            staged.mkdir()
-            with zipfile.ZipFile(
-                staged / "params.npz", "w", compression=zipfile.ZIP_STORED
-            ) as archive:
-                for name, array in model.arrays().items():
-                    info = zipfile.ZipInfo(f"{name}.npy", date_time=(1980, 1, 1, 0, 0, 0))
-                    with archive.open(info, "w") as member:
-                        np.lib.format.write_array(member, array, allow_pickle=False)
-            (staged / "meta.json").write_bytes(
-                canonical_dumps({"artifact_hash": digest, "meta": model.meta()})
-            )
-            try:
-                staged.rename(directory)
-            except OSError:
-                # Another writer may have published the same artifact while we wrote it.
-                if not directory.exists():
-                    raise
+        lock = os.open(root, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if directory.exists():
                 load_model(directory)
+                return directory
+            for stale in root.glob(".model-*"):
+                if stale.is_dir() and not stale.is_symlink():
+                    shutil.rmtree(stale)
+                else:
+                    stale.unlink()
+            with tempfile.TemporaryDirectory(prefix=".model-", dir=root) as temporary:
+                staged = Path(temporary) / digest
+                staged.mkdir()
+                with zipfile.ZipFile(
+                    staged / "params.npz", "w", compression=zipfile.ZIP_STORED
+                ) as archive:
+                    for name, array in model.arrays().items():
+                        info = zipfile.ZipInfo(f"{name}.npy", date_time=(1980, 1, 1, 0, 0, 0))
+                        with archive.open(info, "w") as member:
+                            np.lib.format.write_array(member, array, allow_pickle=False)
+                (staged / "meta.json").write_bytes(
+                    canonical_dumps({"artifact_hash": digest, "meta": model.meta()})
+                )
+                for path in (staged / "params.npz", staged / "meta.json", staged):
+                    _fsync(path)
+                staged.rename(directory)
+                _fsync(root)
+        finally:
+            os.close(lock)
         return directory
     except (OSError, ValueError) as exc:
         raise ModelError(f"cannot save model artifact at {directory}") from exc

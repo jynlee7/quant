@@ -239,7 +239,17 @@ def params_of(truth: Truth) -> Any:
 def identity_scaler(d: int) -> Any:
     from quant.hmm.model import ScalerParams
 
-    return ScalerParams(tuple(f"f{i}" for i in range(d)), np.zeros(d, dtype=np.float64), np.ones(d))
+    return ScalerParams(identity_columns(d), np.zeros(d, dtype=np.float64), np.ones(d))
+
+
+def identity_columns(d: int) -> tuple[str, ...]:
+    """The column names of `identity_scaler(d)`: f0, f1, ..."""
+    return tuple(f"f{i}" for i in range(d))
+
+
+def columns_of(rows: Floats) -> tuple[str, ...]:
+    """The column names `identity_scaler` gives rows (n, d) or a row (d,) of this width."""
+    return identity_columns(rows.shape[-1])
 
 
 def training_record(base_seed: int = 20160104) -> Any:

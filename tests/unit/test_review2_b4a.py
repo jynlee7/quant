@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from quant.core.errors import ModelError
+from quant.core.regime import Label
 from tests.support.hmm import (
     DEFAULT_LABELS,
     identity_scaler,
@@ -26,7 +27,6 @@ def _model(training: Any = None, scaler: Any = None) -> Any:
     return model_of(three_full(), DEFAULT_LABELS["three_full"], scaler, training=training)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
 @pytest.mark.spec("ARCH§7.2")
 def test_the_training_record_of_a_model_cannot_change() -> None:
     """Codex R4: `training.info` was a plain dict, so assigning to it changed the artifact hash
@@ -49,7 +49,6 @@ def test_the_training_record_of_a_model_cannot_change() -> None:
     ForwardFilter.restore(model, snapshot)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 @pytest.mark.spec("ARCH§7.2")
 def test_the_callers_training_info_cannot_change_a_built_model() -> None:
     """Codex R4: the model kept the caller's dict, so the caller could change the model."""
@@ -61,7 +60,6 @@ def test_the_callers_training_info_cannot_change_a_built_model() -> None:
     assert model.artifact_hash() == digest
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
 @pytest.mark.spec("ARCH§7.2")
 def test_a_models_arrays_cannot_be_made_writable_again() -> None:
     """Codex R4: a read-only copy that owns its memory can be flipped back to writable."""
@@ -71,7 +69,6 @@ def test_a_models_arrays_cannot_be_made_writable_again() -> None:
             array.flags.writeable = True
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§3")
 def test_the_models_scaler_refuses_a_constant_column() -> None:
     """Claude C5: B3's scaler refuses a std that is only rounding (≤ STD_RTOL × |mean|), and the
@@ -82,7 +79,6 @@ def test_the_models_scaler_refuses_a_constant_column() -> None:
         ScalerParams(("a", "b"), np.array([0.1, 0.0]), np.array([1e-17, 1.0]))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AttributeError)
 @pytest.mark.spec("SPEC§3")
 def test_the_models_scaler_is_b3s_scaler() -> None:
     """Claude C5: the trainer converts B3's Scaler with a check, and both standardize alike."""
@@ -102,7 +98,6 @@ def test_the_models_scaler_is_b3s_scaler() -> None:
     assert ours.tobytes() == scaler.transform(rows, columns=("ret", "rvol")).tobytes()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=TypeError)
 @pytest.mark.spec("SPEC§3", "SPEC§6")
 def test_the_filter_refuses_rows_of_other_columns() -> None:
     """Claude C5: a row of the right width from another feature config was filtered silently.
@@ -131,26 +126,35 @@ def test_the_filter_refuses_rows_of_other_columns() -> None:
     assert fresh.bars == 1
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 @pytest.mark.spec("SPEC§6")
 def test_the_filter_names_its_most_probable_label_the_top_label() -> None:
     """Claude C7: `active_label` read like the switching engine's active label (SPEC §8), which
     has hysteresis. The filter's is the most probable label, so it is `top_label`, with
     `top_label_remaining` its expected remaining duration."""
     from quant.hmm.filter import FilterOutput, ForwardFilter
-    from quant.hmm.labels import top_label
+    from quant.hmm.labels import remaining_duration, top_label
 
     fields = FilterOutput.__dataclass_fields__
     assert "active_label" not in fields
     assert {"top_label", "top_label_remaining"} <= set(fields)
     model = _model()
     _, x = sample(three_full(), 30, seed=23)
-    for out in ForwardFilter(model).run(x, columns=model.scaler.columns):
+    f = ForwardFilter(model)
+    with pytest.raises(ModelError):
+        f.remaining(Label.CHOP)
+    for row in x:
+        out = f.step(row, columns=model.scaler.columns)
         assert out.top_label is top_label(out.label_probs)
         assert out.top_label_remaining is None or out.top_label_remaining >= 1.0
+        # The engine's active label may be another one; the filter gives its duration too.
+        assert f.remaining(out.top_label) == out.top_label_remaining
+        for label in model.labels.labels:
+            if out.label_probs[label] > 0:
+                assert f.remaining(label) == remaining_duration(
+                    out.state_probs, model.params.transmat, model.labels, label
+                )
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 @pytest.mark.spec("ARCH§7.2")
 def test_saving_a_model_is_durable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Claude C10: without fsync, a power loss can publish the renamed directory before its
@@ -174,7 +178,6 @@ def test_saving_a_model_is_durable(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         assert (stat.st_dev, stat.st_ino) in synced, path
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 @pytest.mark.spec("ARCH§7.2")
 def test_saving_clears_the_temporary_directories_a_crash_left(tmp_path: Path) -> None:
     """Claude C10: a crash mid-save leaves a `.model-*` directory behind. The next save, which
@@ -190,7 +193,6 @@ def test_saving_clears_the_temporary_directories_a_crash_left(tmp_path: Path) ->
     assert not [p for p in root.iterdir() if p.name.startswith(".model-")]
 
 
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§4", "ARCH§7.2")
 def test_the_best_restart_is_the_highest_log_likelihood() -> None:
     """Claude C11: the restart with the highest training log-likelihood wins (SPEC §4), a tie

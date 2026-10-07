@@ -48,8 +48,7 @@ from pydantic import model_validator
 from quant.core.errors import ModelError
 from quant.core.model import StrictModel
 from quant.core.regime import Label
-
-Floats = npt.NDArray[np.float64]
+from quant.data.frames import Floats
 
 # Annualization: 252 sessions a year of 7 bars each (six hourly bars and the closing half
 # hour). Half days are ignored. Only d depends on it, since it cancels from v.

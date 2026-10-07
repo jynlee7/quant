@@ -15,6 +15,7 @@ from quant.core.regime import Label
 from tests.support.hmm import (
     DEFAULT_LABELS,
     Truth,
+    columns_of,
     density,
     identity_scaler,
     model_of,
@@ -44,12 +45,12 @@ def test_identical_emissions_keep_the_prior_on_an_outlier() -> None:
 
     truth = _unit([0.0, 0.0], [0.9, 0.1], [[0.8, 0.2], [0.3, 0.7]])
     rows = _f([[1e9], [-1e9], [0.5]])
-    trace = forward_pass(params_of(truth), identity_scaler(1), rows)
+    trace = forward_pass(params_of(truth), identity_scaler(1), rows, columns=columns_of(rows))
     prior = truth.startprob
     for t in range(len(rows)):
         np.testing.assert_allclose(trace.state_probs[t], prior, rtol=0, atol=1e-12)
         prior = prior @ truth.transmat
-    outputs = ForwardFilter(model_of(truth)).run(rows)
+    outputs = ForwardFilter(model_of(truth)).run(rows, columns=columns_of(rows))
     assert np.array([o.state_probs for o in outputs]).tobytes() == trace.state_probs.tobytes()
 
 
@@ -61,7 +62,12 @@ def test_the_smoother_keeps_the_transitions_on_an_outlier() -> None:
     from quant.eval.smoother import smooth
 
     truth = _unit([0.0, 2.0], [0.5, 0.5], [[0.99, 0.01], [0.1, 0.9]])
-    posteriors = smooth(params_of(truth), identity_scaler(1), _f([[0.0], [1e9]]))
+    posteriors = smooth(
+        params_of(truth),
+        identity_scaler(1),
+        _f([[0.0], [1e9]]),
+        columns=columns_of(_f([[0.0], [1e9]])),
+    )
     first = truth.startprob * density(truth, _f([0.0])) * truth.transmat[:, 1]
     np.testing.assert_allclose(posteriors[0], first / first.sum(), rtol=0, atol=1e-12)
     np.testing.assert_allclose(posteriors[1], [0.0, 1.0], rtol=0, atol=1e-12)
@@ -83,11 +89,11 @@ def test_a_closed_state_the_chain_cant_reach_doesnt_block_the_duration() -> None
     assert remaining_duration(_f([1.0, 0.0, 0.0]), a, table, Label.CHOP) == pytest.approx(10.0)
     assert remaining_duration(_f([0.3, 0.0, 0.7]), a, table, Label.CHOP) == pytest.approx(10.0)
     rows = _f([[0.0], [0.1], [3.0], [3.1], [-0.2]])
-    outputs = ForwardFilter(model).run(rows)
-    assert [o.active_label for o in outputs] == [Label.CHOP] * 2 + [Label.STRESS] * 2 + [Label.CHOP]
+    outputs = ForwardFilter(model).run(rows, columns=columns_of(rows))
+    assert [o.top_label for o in outputs] == [Label.CHOP] * 2 + [Label.STRESS] * 2 + [Label.CHOP]
     for out in outputs:
         assert out.state_probs[1] == 0.0
-        assert out.remaining_duration == pytest.approx(10.0, rel=1e-12)
+        assert out.top_label_remaining == pytest.approx(10.0, rel=1e-12)
 
 
 @pytest.mark.spec("SPEC§4", "SPEC§6")
@@ -133,7 +139,7 @@ def test_an_ill_conditioned_covariance_the_model_accepts_is_one_the_filter_evalu
     truth = Truth("full", base.startprob, base.transmat, base.means, covars)
     model = model_of(truth, DEFAULT_LABELS["three_full"])
     _, x = sample(truth, 200, seed=301)
-    outputs = ForwardFilter(model).run(x)
+    outputs = ForwardFilter(model).run(x, columns=columns_of(x))
     reference = naive_filter(truth, x)
     probs = np.array([o.state_probs for o in outputs])
     np.testing.assert_allclose(probs, reference.probs, rtol=0, atol=1e-10)
@@ -147,8 +153,11 @@ def test_an_ill_conditioned_covariance_the_model_accepts_is_one_the_filter_evalu
         for row in x[:20]
     ]
     np.testing.assert_allclose(emission_logpdf(model.params, x[:20]), textbook, rtol=1e-12)
-    assert forward_pass(model.params, model.scaler, x).state_probs.tobytes() == probs.tobytes()
-    assert np.isfinite(smooth(model.params, model.scaler, x)).all()
+    assert (
+        forward_pass(model.params, model.scaler, x, columns=columns_of(x)).state_probs.tobytes()
+        == probs.tobytes()
+    )
+    assert np.isfinite(smooth(model.params, model.scaler, x, columns=columns_of(x))).all()
 
 
 @pytest.mark.spec("SPEC§6")
@@ -162,27 +171,31 @@ def test_a_forward_pass_continues_from_the_rows_before_it() -> None:
     model = model_of(truth, DEFAULT_LABELS["three_full"])
     params, scaler = model.params, model.scaler
     _, x = sample(truth, 500, seed=311)
-    whole = forward_pass(params, scaler, x)
-    train = forward_pass(params, scaler, x[:300])
-    later = forward_pass(params, scaler, x[300:], previous=train.log_probs[-1])
+    whole = forward_pass(params, scaler, x, columns=columns_of(x))
+    train = forward_pass(params, scaler, x[:300], columns=columns_of(x))
+    later = forward_pass(
+        params, scaler, x[300:], previous=train.log_probs[-1], columns=columns_of(x)
+    )
     assert later.log_probs.tobytes() == whole.log_probs[300:].tobytes()
     assert later.loglik.tobytes() == whole.loglik[300:].tobytes()
-    warmed = ForwardFilter.warmed(model, x[:300]).run(x[300:])
+    warmed = ForwardFilter.warmed(model, x[:300], columns=columns_of(x)).run(
+        x[300:], columns=columns_of(x)
+    )
     assert np.array([o.loglik for o in warmed]).tobytes() == later.loglik.tobytes()
 
     # Restarting from π instead gets the first validation bar's l_t wrong.
-    fresh = forward_pass(params, scaler, x[300:])
+    fresh = forward_pass(params, scaler, x[300:], columns=columns_of(x))
     assert fresh.loglik[0] != later.loglik[0]
     # None is the same as starting from π.
     assert (
-        forward_pass(params, scaler, x[300:], previous=None).loglik.tobytes()
+        forward_pass(params, scaler, x[300:], previous=None, columns=columns_of(x)).loglik.tobytes()
         == fresh.loglik.tobytes()
     )
 
     lp = train.log_probs[-1]
     for bad in (lp[:2], lp + 0.1, np.where(lp == lp.max(), np.nan, lp), lp.astype(np.float32)):
         with pytest.raises(ModelError):
-            forward_pass(params, scaler, x[300:], previous=bad)
+            forward_pass(params, scaler, x[300:], previous=bad, columns=columns_of(x))
 
 
 @pytest.mark.spec("SPEC§3", "SPEC§6")
@@ -211,9 +224,9 @@ def test_the_predictive_log_likelihood_is_the_density_of_the_raw_features() -> N
         )
         reference = naive_filter(in_x, raw)
         model = model_of(truth, DEFAULT_LABELS["three_full"], ScalerParams(("a", "b"), m, s))
-        loglik = np.array([o.loglik for o in ForwardFilter(model).run(raw)])
+        loglik = np.array([o.loglik for o in ForwardFilter(model).run(raw, columns=("a", "b"))])
         np.testing.assert_allclose(loglik, reference.loglik, rtol=0, atol=1e-10)
-        trace = forward_pass(model.params, model.scaler, raw)
+        trace = forward_pass(model.params, model.scaler, raw, columns=("a", "b"))
         assert trace.loglik.tobytes() == loglik.tobytes()
         assert math.isclose(loglik.sum(), reference.loglik.sum(), rel_tol=1e-12)
 

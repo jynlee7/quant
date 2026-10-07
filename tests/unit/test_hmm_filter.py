@@ -19,6 +19,7 @@ from tests.support.hmm import (
     TRUTHS,
     Truth,
     brute_force,
+    columns_of,
     four_sparse,
     hmmlearn_score,
     model_of,
@@ -104,7 +105,7 @@ def test_the_filter_matches_the_naive_reference(name: str) -> None:
     truth = TRUTHS[name]()
     _, x = sample(truth, 1500, seed=11)
     reference = naive_filter(truth, x)
-    outputs = ForwardFilter(_model(name)).run(x)
+    outputs = ForwardFilter(_model(name)).run(x, columns=columns_of(x))
 
     assert len(outputs) == len(x)
     probs = np.array([o.state_probs for o in outputs])
@@ -118,7 +119,9 @@ def test_the_filter_matches_the_naive_reference(name: str) -> None:
     # On a few bars, the filter equals P(s_t | x_0..x_t) by enumerating every path.
     _, few = sample(truth, 6, seed=12)
     filtered, _ = brute_force(truth, few)
-    few_probs = np.array([o.state_probs for o in ForwardFilter(_model(name)).run(few)])
+    few_probs = np.array(
+        [o.state_probs for o in ForwardFilter(_model(name)).run(few, columns=columns_of(few))]
+    )
     np.testing.assert_allclose(few_probs, filtered, rtol=0, atol=1e-12)
 
 
@@ -130,13 +133,13 @@ def test_run_step_and_forward_pass_agree_bit_for_bit() -> None:
     model = _model("four_sparse")
     _, x = sample(truth, 400, seed=21)
 
-    ran = ForwardFilter(model).run(x)
+    ran = ForwardFilter(model).run(x, columns=columns_of(x))
     stepper = ForwardFilter(model)
-    stepped = [stepper.step(row) for row in x]
+    stepped = [stepper.step(row, columns=columns_of(row)) for row in x]
     assert stepper.bars == len(x)
     assert all(_same(a, b) for a, b in zip(ran, stepped, strict=True))
 
-    trace = forward_pass(model.params, model.scaler, x)
+    trace = forward_pass(model.params, model.scaler, x, columns=columns_of(x))
     assert trace.state_probs.shape == trace.log_probs.shape == (len(x), truth.k)
     assert trace.loglik.shape == (len(x),)
     assert trace.state_probs.tobytes() == np.array([o.state_probs for o in ran]).tobytes()
@@ -163,7 +166,7 @@ def test_the_filter_stays_finite_on_outliers() -> None:
     x[1000] = [1e9, -1e9]
     x[1001] = [-1e9, 1e9]
     x[2500:2510] = 1e6
-    outputs = ForwardFilter(_model("three_full")).run(x)
+    outputs = ForwardFilter(_model("three_full")).run(x, columns=columns_of(x))
     for out in outputs:
         assert np.isfinite(out.state_probs).all()
         assert np.isfinite(out.next_state_probs).all()
@@ -180,7 +183,7 @@ def test_the_filter_stays_finite_over_100000_bars() -> None:
 
     truth = three_full()
     _, x = sample(truth, 100_000, seed=32)
-    outputs = ForwardFilter(_model("three_full")).run(x)
+    outputs = ForwardFilter(_model("three_full")).run(x, columns=columns_of(x))
     assert len(outputs) == 100_000
     probs = np.array([o.state_probs for o in outputs])
     loglik = np.array([o.loglik for o in outputs])
@@ -202,7 +205,7 @@ def test_next_bar_probabilities_are_p_times_a_and_entropy_is_in_0_1(name: str) -
 
     table = model.labels
     n_labels = len(table.labels)
-    for out in ForwardFilter(model).run(x):
+    for out in ForwardFilter(model).run(x, columns=columns_of(x)):
         np.testing.assert_allclose(
             out.next_state_probs, out.state_probs @ truth.transmat, rtol=0, atol=1e-12
         )
@@ -223,7 +226,7 @@ def test_states_that_share_a_label_add_up() -> None:
 
     truth = four_sparse()  # labels CHOP, CALM_UP, CHOP, CRASH
     _, x = sample(truth, 300, seed=51)
-    for out in ForwardFilter(_model("four_sparse")).run(x):
+    for out in ForwardFilter(_model("four_sparse")).run(x, columns=columns_of(x)):
         p = out.state_probs
         assert list(out.label_probs) == [Label.CRASH, Label.CALM_UP, Label.CHOP]
         assert Label.STRESS not in out.label_probs  # no stress-like state, no STRESS label
@@ -236,36 +239,36 @@ def test_states_that_share_a_label_add_up() -> None:
 
 
 @pytest.mark.spec("SPEC§6")
-def test_the_active_label_and_its_expected_remaining_duration() -> None:
+def test_the_top_label_and_its_expected_remaining_duration() -> None:
     from quant.hmm.filter import ForwardFilter
 
     truth = four_sparse()
     a = truth.transmat
     _, x = sample(truth, 300, seed=61)
     seen = set()
-    for out in ForwardFilter(_model("four_sparse")).run(x):
+    for out in ForwardFilter(_model("four_sparse")).run(x, columns=columns_of(x)):
         best = max(out.label_probs.values())
-        assert out.label_probs[out.active_label] == best
-        seen.add(out.active_label)
+        assert out.label_probs[out.top_label] == best
+        seen.add(out.top_label)
         p = out.state_probs
-        if out.active_label is Label.CHOP:  # states 0 and 2
+        if out.top_label is Label.CHOP:  # states 0 and 2
             states = [0, 2]
             w = p[states] / p[states].sum()
             sub = a[np.ix_(states, states)]
             expected = float(w @ np.linalg.inv(np.eye(2) - sub) @ np.ones(2))
-        elif out.active_label is Label.CALM_UP:
+        elif out.top_label is Label.CALM_UP:
             expected = 1.0 / (1.0 - a[1, 1])
         else:
             expected = 1.0 / (1.0 - a[3, 3])
-        assert out.remaining_duration == pytest.approx(expected, rel=1e-12)
-        assert out.remaining_duration >= 1.0
+        assert out.top_label_remaining == pytest.approx(expected, rel=1e-12)
+        assert out.top_label_remaining >= 1.0
     assert {Label.CHOP, Label.CALM_UP} <= seen
 
     # A model whose states all share one label can never leave it: no finite duration, and
     # no uncertainty between labels.
     one = model_of(truth, [Label.CHOP] * 4)
-    for out in ForwardFilter(one).run(x[:50]):
-        assert out.remaining_duration is None
+    for out in ForwardFilter(one).run(x[:50], columns=columns_of(x)):
+        assert out.top_label_remaining is None
         assert out.entropy == 0.0
         assert out.label_probs == {Label.CHOP: pytest.approx(1.0, abs=1e-12)}
 
@@ -278,7 +281,7 @@ def test_the_predictive_log_likelihoods_add_up_to_the_total(make: Callable[[], T
     truth = make()
     _, x = sample(truth, 2000, seed=71)
     model = model_of(truth, [Label.CHOP] * truth.k)
-    total = sum(out.loglik for out in ForwardFilter(model).run(x))
+    total = sum(out.loglik for out in ForwardFilter(model).run(x, columns=columns_of(x)))
     assert total == pytest.approx(hmmlearn_score(truth, x), rel=1e-12, abs=1e-8)
 
 
@@ -297,9 +300,9 @@ def test_the_filter_standardizes_with_the_models_frozen_scaler() -> None:
     plain = model_of(truth, DEFAULT_LABELS["three_full"])
 
     standardized = (raw - mean) / std
-    assert scaler.standardize(raw).tobytes() == standardized.tobytes()
-    ours = ForwardFilter(scaled).run(raw)
-    theirs = ForwardFilter(plain).run(standardized)
+    assert scaler.standardize(raw, columns=("ret", "rvol")).tobytes() == standardized.tobytes()
+    ours = ForwardFilter(scaled).run(raw, columns=("ret", "rvol"))
+    theirs = ForwardFilter(plain).run(standardized, columns=columns_of(standardized))
     # Every output but l_t, which is the density of the raw row and so carries the scaler's
     # Jacobian (tests/unit/test_review_b4a.py).
     assert all(
@@ -323,23 +326,23 @@ def test_the_filter_state_survives_a_snapshot_and_restore() -> None:
 
     # After one bar, states 2 and 3 are impossible (π is 0 there): log 0 is stored as None.
     one = ForwardFilter(model)
-    one.step(x[0])
+    one.step(x[0], columns=columns_of(x))
     first = one.snapshot()
     assert first.log_probs is not None
     assert first.log_probs[2] is None
     assert first.log_probs[3] is None
 
     whole = ForwardFilter(model)
-    outputs = whole.run(x)
+    outputs = whole.run(x, columns=columns_of(x))
     half = ForwardFilter(model)
-    half.run(x[:400])
+    half.run(x[:400], columns=columns_of(x))
     state = half.snapshot()
     text = canonical_dumps(state)
     restored_state = FilterState.model_validate(canonical_loads(text))
     assert canonical_dumps(restored_state) == text
     restored = ForwardFilter.restore(model, restored_state)
     assert restored.bars == 400
-    later = restored.run(x[400:])
+    later = restored.run(x[400:], columns=columns_of(x))
     assert all(_same(a, b) for a, b in zip(outputs[400:], later, strict=True))
     assert canonical_dumps(restored.snapshot()) == canonical_dumps(whole.snapshot())
 
@@ -347,7 +350,7 @@ def test_the_filter_state_survives_a_snapshot_and_restore() -> None:
     again = ForwardFilter.restore(
         model, FilterState.model_validate(canonical_loads(canonical_dumps(first)))
     )
-    assert _same(again.step(x[1]), outputs[1])
+    assert _same(again.step(x[1], columns=columns_of(x)), outputs[1])
 
 
 @pytest.mark.spec("SPEC§6", "ARCH§4.3")
@@ -358,7 +361,7 @@ def test_restore_refuses_a_state_that_doesnt_fit() -> None:
     model = _model("three_full")
     _, x = sample(truth, 50, seed=101)
     f = ForwardFilter(model)
-    f.run(x)
+    f.run(x, columns=columns_of(x))
     good = f.snapshot()
     other = model_of(truth, [Label.CHOP, Label.CHOP, Label.STRESS])  # a different model
     assert other.artifact_hash() != model.artifact_hash()
@@ -386,7 +389,7 @@ def test_a_bad_row_is_a_model_error_and_changes_nothing() -> None:
     truth = three_full()
     _, x = sample(truth, 20, seed=111)
     f = ForwardFilter(_model("three_full"))
-    f.run(x[:10])
+    f.run(x[:10], columns=columns_of(x))
     before = canonical_dumps(f.snapshot())
     for row in (
         np.array([np.nan, 0.0]),
@@ -397,7 +400,7 @@ def test_a_bad_row_is_a_model_error_and_changes_nothing() -> None:
         np.array([0.0, 0.0], dtype=np.float32),
     ):
         with pytest.raises(ModelError):
-            f.step(row)  # type: ignore[arg-type]
+            f.step(row, columns=f.model.scaler.columns)  # type: ignore[arg-type]
         assert canonical_dumps(f.snapshot()) == before
     assert f.bars == 10
 
@@ -413,15 +416,18 @@ def test_a_swapped_in_model_warms_up_over_its_own_fit_window() -> None:
     _, x = sample(truth, 600, seed=121)
     window, after = x[:450], x[450:]
 
-    warmed = ForwardFilter.warmed(model, window)
+    warmed = ForwardFilter.warmed(model, window, columns=columns_of(window))
     stepped = ForwardFilter(model)
     for row in window:
-        stepped.step(row)
+        stepped.step(row, columns=columns_of(row))
     assert warmed.bars == 450
     assert canonical_dumps(warmed.snapshot()) == canonical_dumps(stepped.snapshot())
 
-    continuous = ForwardFilter(model).run(x)
-    assert all(_same(a, b) for a, b in zip(continuous[450:], warmed.run(after), strict=True))
+    continuous = ForwardFilter(model).run(x, columns=columns_of(x))
+    assert all(
+        _same(a, b)
+        for a, b in zip(continuous[450:], warmed.run(after, columns=columns_of(after)), strict=True)
+    )
 
-    empty = ForwardFilter.warmed(model, np.empty((0, truth.d)))
+    empty = ForwardFilter.warmed(model, np.empty((0, truth.d)), columns=columns_of(window))
     assert canonical_dumps(empty.snapshot()) == canonical_dumps(ForwardFilter(model).snapshot())

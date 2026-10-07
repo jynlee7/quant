@@ -21,8 +21,14 @@ can't look ahead.
 
 **Per bar**, `ForwardFilter.step` returns every output of spec §6 (`FilterOutput`): the filtered
 state and label probabilities, the next-bar probabilities q_t = p_t A and their label sums, the
-normalized label entropy H_t, the predictive log-likelihood l_t, the active (most probable)
-label and its expected remaining duration. The label view comes from quant.hmm.labels.
+normalized label entropy H_t, the predictive log-likelihood l_t, the top (most probable) label
+and its expected remaining duration. The top label is not the switching engine's active label
+(spec §8), which has hysteresis; `ForwardFilter.remaining` gives any label's duration. The label
+view comes from quant.hmm.labels.
+
+**Columns.** Every entry point takes the rows' column names with them, and refuses names that
+aren't exactly the model scaler's (`ScalerParams.standardize`), so a row of the same width from
+another feature config can't be filtered.
 
 **State** is the last log p_t and a bar count. It snapshots to canonical JSON for EngineState
 (`FilterState`, ARCHITECTURE §4.3), and a restored filter continues bit for bit.
@@ -46,8 +52,9 @@ import numpy as np
 from quant.core.errors import ModelError
 from quant.core.model import StrictModel
 from quant.core.regime import Label
+from quant.data.frames import Floats
 from quant.hmm.labels import Durations, label_entropy, label_probs, top_label
-from quant.hmm.model import Floats, GaussianParams, HmmModel, ScalerParams
+from quant.hmm.model import GaussianParams, HmmModel, ScalerParams
 
 
 def _check_rows(rows: Floats, width: int) -> None:
@@ -175,11 +182,12 @@ def forward_pass(
     scaler: ScalerParams,
     rows: Floats,
     *,
+    columns: tuple[str, ...],
     previous: Floats | None = None,
 ) -> ForwardTrace:
-    """Run the recursion of the module docstring over `rows` (n, d), raw feature rows in
-    `scaler.columns` order. Used to label a model on its fit window and to score a validation
-    block (B4b) before any HmmModel exists.
+    """Run the recursion of the module docstring over `rows` (n, d), raw feature rows whose
+    columns `columns` names, which must be exactly `scaler.columns`. Used to label a model on
+    its fit window and to score a validation block (B4b) before any HmmModel exists.
 
     `previous` is log p of the bar just before rows[0] (`ForwardTrace.log_probs[-1]` of the pass
     over the rows before), so the first prior is log(p A) and the pass continues that one; None
@@ -189,14 +197,14 @@ def forward_pass(
     Bar t's values are bit-identical to what `ForwardFilter.step` gives on the same rows from a
     fresh filter (with `previous`, from a filter that consumed the rows before), and a pass over
     rows[:m] continued over rows[m:] equals one pass over all of them. Raises ModelError for
-    n = 0, a shape or dtype that doesn't fit, a value that isn't finite, a bar whose l_t isn't
-    finite, or a `previous` that isn't a float64 (K,) vector of log-probabilities (no NaN or
+    n = 0, `columns` other than the scaler's, a shape or dtype that doesn't fit, a value that
+    isn't finite, a bar whose l_t isn't finite, or a `previous` that isn't a float64 (K,) vector of log-probabilities (no NaN or
     +inf, exp summing to 1 within 1e-9).
     """
     _check_rows(rows, params.n_features)
     if not len(rows) or len(scaler.columns) != params.n_features:
         raise ModelError("forward pass needs rows and a scaler matching the model")
-    z = scaler.standardize(rows)
+    z = scaler.standardize(rows, columns=columns)
     emissions = _Emissions(params)
     prior, log_a = _logs(params)
     if previous is not None:
@@ -222,8 +230,9 @@ class FilterOutput:
       the model's labels in rule order; a label the model lacks is absent (probability 0).
     - `entropy`: `hmm.labels.label_entropy` of `label_probs`, in [0, 1].
     - `loglik`: l_t = log p(x_t | x_<t), the density of the raw row (Jacobian included).
-    - `active_label`: `hmm.labels.top_label(label_probs)`.
-    - `remaining_duration`: `hmm.labels.remaining_duration(p_t, A, labels, active_label)`, in
+    - `top_label`: `hmm.labels.top_label(label_probs)`, the most probable label. Not the
+      switching engine's active label (spec §8), which has hysteresis.
+    - `top_label_remaining`: `hmm.labels.remaining_duration(p_t, A, labels, top_label)`, in
       bars, the current one included; None when the label covers every state.
     """
 
@@ -233,8 +242,8 @@ class FilterOutput:
     next_label_probs: dict[Label, float]
     entropy: float
     loglik: float
-    active_label: Label
-    remaining_duration: float | None
+    top_label: Label
+    top_label_remaining: float | None
 
 
 class FilterState(StrictModel):
@@ -273,15 +282,19 @@ class ForwardFilter:
         self._model_hash = model.artifact_hash()
 
     @classmethod
-    def warmed(cls, model: HmmModel, rows: Floats) -> ForwardFilter:
+    def warmed(cls, model: HmmModel, rows: Floats, *, columns: tuple[str, ...]) -> ForwardFilter:
         """The filter a model swap starts from (spec §6): a new filter stepped over `rows`, the
         model's own feature rows from its fit window's first row up to (not including) the swap
-        time, in order. Its state is exactly that of `ForwardFilter(model)` after `step` on each
-        row. Rows of shape (0, d) give a fresh filter. Raises as `step` does."""
+        time, in order, with `columns` naming their columns. Its state is exactly that of
+        `ForwardFilter(model)` after `step` on each row. Rows of shape (0, d) give a fresh
+        filter. Raises as `step` does, and for `columns` other than the scaler's even with no
+        rows."""
         result = cls(model)
         _check_rows(rows, model.params.n_features)
+        if columns != model.scaler.columns:
+            raise ModelError("rows must have the model scaler's columns")
         for row in rows:
-            result.step(row)
+            result.step(row, columns=columns)
         return result
 
     @property
@@ -293,17 +306,17 @@ class ForwardFilter:
         """Rows consumed so far."""
         return self._bars
 
-    def step(self, row: Floats) -> FilterOutput:
-        """Consume the next feature row (d,), raw and in the scaler's column order, and return
-        its outputs.
+    def step(self, row: Floats, *, columns: tuple[str, ...]) -> FilterOutput:
+        """Consume the next feature row (d,), raw, with `columns` naming its columns, and
+        return its outputs.
 
-        Raises ModelError, leaving the state exactly as it was, when the row isn't a float64
-        array of shape (d,), a value isn't finite, or l_t isn't finite. A NaN feature is a model
-        error, so rule 6 applies (spec §3).
+        Raises ModelError, leaving the state exactly as it was, when `columns` isn't exactly
+        the model scaler's, the row isn't a float64 array of shape (d,), a value isn't finite,
+        or l_t isn't finite. A NaN feature is a model error, so rule 6 applies (spec §3).
         """
         if not isinstance(row, np.ndarray) or row.shape != (self.model.params.n_features,):
             raise ModelError("a filter step needs one feature row")
-        z = self.model.scaler.standardize(row)
+        z = self.model.scaler.standardize(row, columns=columns)
         prior = (
             self._log_start if self._log_probs is None else _predict(self._log_probs, self._log_a)
         )
@@ -312,7 +325,7 @@ class ForwardFilter:
         next_probs = probs @ self.model.params.transmat
         table = self.model.labels
         labels = label_probs(probs, table)
-        active = top_label(labels)
+        top = top_label(labels)
         output = FilterOutput(
             state_probs=probs,
             next_state_probs=next_probs,
@@ -320,18 +333,30 @@ class ForwardFilter:
             next_label_probs=label_probs(next_probs, table),
             entropy=label_entropy(labels, table),
             loglik=loglik,
-            active_label=active,
-            remaining_duration=self._durations.remaining(probs, active),
+            top_label=top,
+            top_label_remaining=self._durations.remaining(probs, top),
         )
         self._log_probs = logs
         self._bars += 1
         return output
 
-    def run(self, rows: Floats) -> list[FilterOutput]:
-        """`step` on each row of `rows` (n, d) in order, returning the outputs. Equal, bit for
-        bit, to calling `step` n times. On an error, the rows before the bad one stay consumed."""
+    def run(self, rows: Floats, *, columns: tuple[str, ...]) -> list[FilterOutput]:
+        """`step` on each row of `rows` (n, d) in order, `columns` naming their columns,
+        returning the outputs. Equal, bit for bit, to calling `step` n times. On an error, the
+        rows before the bad one stay consumed; `columns` other than the scaler's consume none."""
         _check_rows(rows, self.model.params.n_features)
-        return [self.step(row) for row in rows]
+        if columns != self.model.scaler.columns:
+            raise ModelError("rows must have the model scaler's columns")
+        return [self.step(row, columns=columns) for row in rows]
+
+    def remaining(self, label: Label) -> float | None:
+        """The expected remaining duration of `label` from the current p_t, in bars, the current
+        one included (`hmm.labels.remaining_duration`): what the switching engine reads for its
+        active label, which need not be the top one. Raises ModelError before the first row, or
+        as `remaining_duration` does (a label the model lacks, or one with no probability)."""
+        if self._log_probs is None:
+            raise ModelError("the filter has consumed no row")
+        return self._durations.remaining(np.exp(self._log_probs), label)
 
     def snapshot(self) -> FilterState:
         """The state now. Two filters under one model that consumed the same rows give equal
