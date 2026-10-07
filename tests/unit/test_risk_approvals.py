@@ -177,7 +177,9 @@ def test_each_approval_is_spendable_once(issue: Issue) -> None:
 def test_an_order_approval_expires_at_the_end_of_its_bar() -> None:
     # The 10:46 ET decision executes in the 10:30-11:30 bar, so its approval expires at 11:30.
     d = desk()
-    early, late = _order(d), _order(d)
+    early = _order(d)
+    late = d.check(intent(Side.BUY, 100, leg=2))  # another leg: a re-check would replace early
+    assert type(late) is RiskApprovedOrder
     assert early.expires_at == late.expires_at
     d.clock.advance_to(early.expires_at - timedelta(microseconds=1))
     assert d.engine.spend(early) is early

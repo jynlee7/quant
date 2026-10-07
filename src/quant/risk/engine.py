@@ -600,6 +600,16 @@ class RiskEngine:
         self._issued[approval] = _approval_fields(approval)
         return approval
 
+    def release(self, approval: RiskApprovedOrder) -> None:
+        """Give up `approval` unsent: execution calls this when it drops an approved order
+        without sending it. The approval stops holding exposure or shares, and `spend` refuses
+        it from then on. Releasing one already spent, released, revoked or expired changes
+        nothing.
+
+        ApprovalError, as in `spend` cases 1–3, when `approval` is not exactly a
+        RiskApprovedOrder this engine object issued."""
+        raise NotImplementedError
+
     def spend(self, approval: object) -> Approval:
         """Spend `approval` once; the broker adapter calls this right before it sends anything,
         and sends nothing unless it returns.

@@ -177,11 +177,12 @@ def test_3_gross_exposure_may_reach_one_times_equity_and_no_more() -> None:
     d = desk()
     approved(d.check(intent(Side.BUY, 400), position=600))  # exactly 1.0x
     vetoed(d.check(intent(Side.BUY, 401, leg=2), position=600), RiskCheck.LIMITS)
-    # Working buy orders count as held.
+    # Working buy orders count as held (a fresh desk: the approval above still holds 400).
+    w = desk()
     working = (order("buy-1", Side.BUY, OrderKind.LIMIT, 100, PRICE),)
-    approved(d.check(intent(Side.BUY, 400, leg=3), position=500, open_orders=working))
+    approved(w.check(intent(Side.BUY, 400), position=500, open_orders=working))
     vetoed(
-        d.check(intent(Side.BUY, 401, leg=4), position=500, open_orders=working), RiskCheck.LIMITS
+        w.check(intent(Side.BUY, 401, leg=2), position=500, open_orders=working), RiskCheck.LIMITS
     )
 
 
@@ -227,22 +228,22 @@ def test_3_the_overnight_cap_binds_on_the_last_fillable_decision_only(day: objec
 
 @pytest.mark.spec("D9", "ARCH§8.1", "SPEC§10")
 def test_3_sells_are_clamped_so_they_never_go_short() -> None:
-    d = desk()
-    vetoed(d.check(intent(Side.SELL, 100)), RiskCheck.LIMITS)  # flat: nothing to sell
-    assert approved(d.check(intent(Side.SELL, 500, leg=2), position=300)).quantity == 300
+    # A fresh desk for each case: an outstanding SELL approval reserves its shares.
+    vetoed(desk().check(intent(Side.SELL, 100)), RiskCheck.LIMITS)  # flat: nothing to sell
+    assert approved(desk().check(intent(Side.SELL, 500), position=300)).quantity == 300
     working = (order("sell-1", Side.SELL, OrderKind.LIMIT, 100, PRICE),)
     assert (
-        approved(d.check(intent(Side.SELL, 500, leg=3), position=300, open_orders=working)).quantity
+        approved(desk().check(intent(Side.SELL, 500), position=300, open_orders=working)).quantity
         == 200
     )
     stop = (order("stop-1", Side.SELL, OrderKind.STOP, 300),)  # cancelled before any sale
     assert (
-        approved(d.check(intent(Side.SELL, 500, leg=4), position=300, open_orders=stop)).quantity
+        approved(desk().check(intent(Side.SELL, 500), position=300, open_orders=stop)).quantity
         == 300
     )
     working_all = (order("sell-2", Side.SELL, OrderKind.LIMIT, 300, PRICE),)
     vetoed(
-        d.check(intent(Side.SELL, 1, leg=5), position=300, open_orders=working_all),
+        desk().check(intent(Side.SELL, 1), position=300, open_orders=working_all),
         RiskCheck.LIMITS,
     )
 
@@ -383,19 +384,21 @@ def test_5_a_risk_reducing_twenty_first_intent_halts_and_still_passes() -> None:
 def test_the_sixtieth_raw_submission_halts_trading(side: Side) -> None:
     d = desk()
     order_intent = intent(side, 1)
-    approvals = [approved(d.check(order_intent, position=100)) for _ in range(60)]
     for _ in range(100):  # cancels and flattens are not submissions
         d.engine.spend(d.engine.approve_cancel("eng1-x", reason="re-quote"))
-    for approval in approvals[:59]:
-        d.engine.spend(approval)
+    # One intent re-quoted 60 times: each re-check replaces the approval before it, so each
+    # attempt is spent before the next is checked.
+    for _ in range(59):
+        d.engine.spend(approved(d.check(order_intent, position=100)))
     assert d.engine.state.submissions == 59
     assert not d.engine.state.halted
+    last = approved(d.check(order_intent, position=100))
     if side is Side.BUY:
         with pytest.raises(ApprovalError):
-            d.engine.spend(approvals[59])
+            d.engine.spend(last)
         assert d.engine.state.submissions == 59
     else:
-        assert d.engine.spend(approvals[59]) is approvals[59]
+        assert d.engine.spend(last) is last
         assert d.engine.state.submissions == 60
     assert d.engine.state.halted
 
