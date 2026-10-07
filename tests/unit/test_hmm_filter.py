@@ -6,6 +6,7 @@ import math
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -299,7 +300,12 @@ def test_the_filter_standardizes_with_the_models_frozen_scaler() -> None:
     assert scaler.standardize(raw).tobytes() == standardized.tobytes()
     ours = ForwardFilter(scaled).run(raw)
     theirs = ForwardFilter(plain).run(standardized)
-    assert all(_same(a, b) for a, b in zip(ours, theirs, strict=True))
+    # Every output but l_t, which is the density of the raw row and so carries the scaler's
+    # Jacobian (tests/unit/test_review_b4a.py).
+    assert all(
+        _same(replace(a, loglik=0.0), replace(b, loglik=0.0))
+        for a, b in zip(ours, theirs, strict=True)
+    )
 
 
 @pytest.mark.spec("SPEC§6", "ARCH§4.3")
