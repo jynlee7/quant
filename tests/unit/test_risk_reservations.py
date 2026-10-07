@@ -40,7 +40,6 @@ def vetoed(verdict: RiskVerdict, check: RiskCheck) -> Veto:
 # --- R1/C1: outstanding BUY approvals hold their exposure -----------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "D13", "I4")
 def test_outstanding_buys_count_toward_gross_exposure() -> None:
     d = desk()
@@ -52,7 +51,6 @@ def test_outstanding_buys_count_toward_gross_exposure() -> None:
     vetoed(d.check(intent(Side.BUY, 1, leg=4), position=500), RiskCheck.LIMITS)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "D13")
 def test_outstanding_buys_count_toward_the_label_cap() -> None:
     d = desk()
@@ -61,7 +59,6 @@ def test_outstanding_buys_count_toward_the_label_cap() -> None:
     approved(d.check(intent(Side.BUY, 200, label=Label.CHOP, leg=3)))  # exactly 0.5x
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("A3", "SPEC§10", "ARCH§8.1")
 def test_outstanding_buys_count_toward_the_overnight_cap() -> None:
     last = last_fillable(HALF_DAY)
@@ -70,7 +67,6 @@ def test_outstanding_buys_count_toward_the_overnight_cap() -> None:
     vetoed(d.check(intent(Side.BUY, 201, tau=last.tau, leg=2)), RiskCheck.LIMITS)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("D7", "SPEC§10", "ARCH§8.1", "ARCH§8.4")
 def test_approving_pending_orders_counts_the_ones_already_approved() -> None:
     # Two $30,000 CHOP entries wait for you; approving both would make 0.6x against a 0.5x cap.
@@ -83,7 +79,6 @@ def test_approving_pending_orders_counts_the_ones_already_approved() -> None:
     vetoed(d.engine.approve_pending(second, d.ctx()), RiskCheck.LIMITS)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "ARCH§8.2", "I4")
 def test_a_recheck_of_the_same_leg_replaces_its_earlier_approval() -> None:
     # A re-quote is checked again and gets a new approval; the old one can no longer be sent.
@@ -95,7 +90,6 @@ def test_a_recheck_of_the_same_leg_replaces_its_earlier_approval() -> None:
     assert d.engine.spend(new) is new
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "I4")
 def test_a_released_approval_frees_its_exposure_and_cannot_be_spent() -> None:
     d = desk()
@@ -118,7 +112,6 @@ def test_an_expired_approval_holds_no_exposure() -> None:
     approved(d.check(intent(Side.BUY, 500, label=Label.CHOP, tau=second.tau)))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "I4")
 def test_a_spent_buy_counts_until_a_snapshot_taken_after_the_spend() -> None:
     d = desk()
@@ -134,7 +127,6 @@ def test_a_spent_buy_counts_until_a_snapshot_taken_after_the_spend() -> None:
 # --- C3: outstanding SELL approvals reserve shares -------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("D9", "SPEC§10", "ARCH§8.1")
 def test_outstanding_sells_reserve_their_shares() -> None:
     d = desk()
@@ -143,7 +135,6 @@ def test_outstanding_sells_reserve_their_shares() -> None:
     vetoed(d.check(intent(Side.SELL, 1, leg=3), position=100), RiskCheck.LIMITS)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("D9", "SPEC§10", "ARCH§8.1", "I4")
 def test_two_sell_approvals_never_sell_more_than_is_held() -> None:
     d = desk()
@@ -156,7 +147,6 @@ def test_two_sell_approvals_never_sell_more_than_is_held() -> None:
     assert sent <= 100
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("D9", "SPEC§10", "ARCH§8.1", "I4")
 def test_a_sell_is_revoked_when_a_snapshot_shows_fewer_shares_than_it_reserves() -> None:
     # The broker-side stop fired after the SELL was approved: nothing is left to sell.
@@ -167,7 +157,6 @@ def test_a_sell_is_revoked_when_a_snapshot_shows_fewer_shares_than_it_reserves()
         d.engine.spend(sell)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("D9", "ARCH§8.3", "I4")
 def test_a_spent_flatten_revokes_every_outstanding_order() -> None:
     d = desk()
@@ -182,7 +171,6 @@ def test_a_spent_flatten_revokes_every_outstanding_order() -> None:
 # --- R3/C2: spend re-checks what can change after issue --------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§10", "C8", "ARCH§8.1", "I4")
 def test_spend_refuses_a_buy_once_the_daily_loss_lock_sets() -> None:
     d = desk()
@@ -194,7 +182,6 @@ def test_spend_refuses_a_buy_once_the_daily_loss_lock_sets() -> None:
     assert d.engine.spend(sell) is sell  # reductions still go
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§10", "SPEC§8", "C5", "ARCH§8.1", "I4")
 @pytest.mark.parametrize(
     "block",
@@ -205,7 +192,7 @@ def test_spend_refuses_a_buy_once_a_check_learns_of_a_block(block: dict[str, boo
     d = desk()
     buy = approved(d.check(intent(Side.BUY, 100)))
     sell = approved(d.check(intent(Side.SELL, 100, leg=2), position=100))
-    assert isinstance(d.check(intent(Side.BUY, 100, leg=3), **block), Veto)  # type: ignore[arg-type]
+    assert isinstance(d.check(intent(Side.BUY, 100, leg=3), position=100, **block), Veto)  # type: ignore[arg-type]
     with pytest.raises(ApprovalError):
         d.engine.spend(buy)
     assert d.engine.spend(sell) is sell
@@ -214,7 +201,6 @@ def test_spend_refuses_a_buy_once_a_check_learns_of_a_block(block: dict[str, boo
 # --- R2: an approval's intent cannot change after issue --------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("I4", "K5", "ARCH§4.4")
 @pytest.mark.parametrize(
     ("name", "value"), [("side", Side.BUY), ("quantity", 1_000_000)], ids=["side", "quantity"]
@@ -230,7 +216,6 @@ def test_spend_refuses_an_approval_whose_intent_changed(name: str, value: object
 # --- R4, R5/C4: monetary boundaries at their exact decimal values -----------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "C8", "D13")
 def test_the_daily_loss_lock_sets_at_exactly_two_percent_of_any_equity() -> None:
     inside = desk(equity=100_000.50)
@@ -241,7 +226,6 @@ def test_the_daily_loss_lock_sets_at_exactly_two_percent_of_any_equity() -> None
     assert outcome.flatten
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "C8", "D13")
 def test_the_drawdown_trigger_fires_at_exactly_ten_percent_of_any_peak() -> None:
     inside = desk(equity=100_000.30)
@@ -250,7 +234,6 @@ def test_the_drawdown_trigger_fires_at_exactly_ten_percent_of_any_peak() -> None
     assert d.engine.mark(90_000.27).kill  # 100,000.30 - 10,000.03: exactly 10%
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "D13")
 @pytest.mark.parametrize("label", [Label.CALM_UP, Label.CHOP], ids=["single order", "CHOP"])
 def test_the_caps_hold_at_exactly_their_dollar_value(label: Label) -> None:
@@ -263,7 +246,6 @@ def test_the_caps_hold_at_exactly_their_dollar_value(label: Label) -> None:
     vetoed(d.check(intent(Side.BUY, 101, label=label, stop=500.0, leg=2), **ctx), RiskCheck.LIMITS)  # type: ignore[arg-type]
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.2", "SPEC§10")
 def test_the_collar_passes_exactly_ten_basis_points_from_the_quote() -> None:
     # ARCHITECTURE §8.2 buys at the ask + 10 bp and sells at the bid - 10 bp. For quotes on a

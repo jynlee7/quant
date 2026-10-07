@@ -76,7 +76,6 @@ def exact(value: float) -> Decimal:
     return Decimal(repr(value))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "D9", "A3", "C3", "D7", "ARCH§8.1", "I4")
 @given(st.integers(0, 400), steps)
 def test_no_sequence_of_intents_and_fills_goes_short_or_breaches_a_cap(
