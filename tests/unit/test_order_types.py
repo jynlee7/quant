@@ -23,7 +23,6 @@ from quant.core.orders import (
     Side,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 TAU = datetime(2018, 3, 6, 15, 46, tzinfo=UTC)  # 10:46 ET
 
 
@@ -40,7 +39,6 @@ def fields(**changes: Any) -> dict[str, Any]:
     return base | changes
 
 
-@RED
 @pytest.mark.spec("ARCH§4.1", "ARCH§4.2", "D9")
 def test_an_intent_names_its_decision_side_shares_and_target() -> None:
     order = OrderIntent(**fields())
@@ -57,7 +55,6 @@ def test_an_intent_names_its_decision_side_shares_and_target() -> None:
         order.quantity = 600  # type: ignore[misc]
 
 
-@RED
 @pytest.mark.spec("ARCH§4.1", "ARCH§4.2", "D9", "ARCH§14")
 @pytest.mark.parametrize(
     "changes",
@@ -98,7 +95,6 @@ def test_an_inconsistent_intent_is_refused(changes: dict[str, Any]) -> None:
         OrderIntent(**fields(**changes))
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "ARCH§8.1")
 def test_snapshots_and_quotes_refuse_naive_times() -> None:
     naive = TAU.replace(tzinfo=None)

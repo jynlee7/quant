@@ -30,19 +30,35 @@ B9b's. "Now" comes from the engine's Clock. Every veto and halt is logged with s
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any, Final, Protocol, final
+from math import isfinite
+from typing import Any, Final, Protocol, cast, final
 
+import structlog
 from pydantic import Field
 
-from quant.core.calendar import TradingCalendar
+from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.clock import Clock
+from quant.core.epoch import to_us
+from quant.core.errors import ApprovalError, CalendarError, QuantError, RiskError
 from quant.core.model import StrictModel
-from quant.core.orders import BrokerSnapshot, InternalBook, OrderIntent, Quote, TradingMode
-from quant.core.schedule import Timing
+from quant.core.orders import (
+    SYMBOL,
+    BrokerSnapshot,
+    InternalBook,
+    OrderIntent,
+    OrderKind,
+    Quote,
+    Side,
+    TradingMode,
+)
+from quant.core.schedule import Timing, decision_schedule
 from quant.risk.limits import RiskConfig
+
+log = structlog.get_logger()
 
 _TOKEN: Final = object()
 """The private token every approved type's constructor demands. It never leaves this module."""
@@ -84,19 +100,19 @@ class _Approved:
     _token: object
 
     def __setattr__(self, name: str, value: object) -> None:
-        raise NotImplementedError
+        raise AttributeError("approvals are immutable")
 
     def __delattr__(self, name: str) -> None:
-        raise NotImplementedError
+        raise AttributeError("approvals are immutable")
 
     def __copy__(self) -> _Approved:
-        raise NotImplementedError
+        raise TypeError("approvals cannot be copied")
 
     def __deepcopy__(self, memo: dict[int, object]) -> _Approved:
-        raise NotImplementedError
+        raise TypeError("approvals cannot be copied")
 
     def __reduce_ex__(self, protocol: object) -> tuple[object, ...]:
-        raise NotImplementedError
+        raise TypeError("approvals cannot be pickled")
 
 
 @final
@@ -137,11 +153,27 @@ class RiskApprovedOrder(_Approved):
         expires_at: datetime,
         flagged: bool,
     ) -> None:
-        raise NotImplementedError
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "intent": intent,
+                "quantity": quantity,
+                "limit_price": limit_price,
+                "notional": notional,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+                "flagged": flagged,
+            },
+        )
 
     def __repr__(self) -> str:
         """`RiskApprovedOrder(<approval_id>, <side> <quantity> @ <limit_price>, until <expires_at>)`."""
-        raise NotImplementedError
+        return (
+            f"RiskApprovedOrder({self.approval_id}, {self.intent.side} {self.quantity} "
+            f"@ {self.limit_price}, until {self.expires_at})"
+        )
 
 
 @final
@@ -166,11 +198,20 @@ class RiskApprovedCancel(_Approved):
         reason: str,
         issued_at: datetime,
     ) -> None:
-        raise NotImplementedError
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "client_order_id": client_order_id,
+                "reason": reason,
+                "issued_at": issued_at,
+            },
+        )
 
     def __repr__(self) -> str:
         """`RiskApprovedCancel(<approval_id>, <client_order_id>)`."""
-        raise NotImplementedError
+        return f"RiskApprovedCancel({self.approval_id}, {self.client_order_id})"
 
 
 @final
@@ -196,11 +237,20 @@ class RiskApprovedFlatten(_Approved):
         reason: str,
         issued_at: datetime,
     ) -> None:
-        raise NotImplementedError
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "symbol": symbol,
+                "reason": reason,
+                "issued_at": issued_at,
+            },
+        )
 
     def __repr__(self) -> str:
         """`RiskApprovedFlatten(<approval_id>, <symbol>)`."""
-        raise NotImplementedError
+        return f"RiskApprovedFlatten({self.approval_id}, {self.symbol})"
 
 
 Approval = RiskApprovedOrder | RiskApprovedCancel | RiskApprovedFlatten
@@ -335,13 +385,16 @@ class MemorySpentApprovals:
     """SpentApprovals in memory, for the backtest and tests."""
 
     def __init__(self) -> None:
-        raise NotImplementedError
+        self._spent: dict[str, datetime] = {}
 
     def is_spent(self, approval_id: str) -> bool:
-        raise NotImplementedError
+        return approval_id in self._spent
 
     def spend(self, approval_id: str, at: datetime) -> bool:
-        raise NotImplementedError
+        if self.is_spent(approval_id):
+            return False
+        self._spent[approval_id] = at
+        return True
 
 
 # --- the engine -----------------------------------------------------------------------------------
@@ -373,12 +426,20 @@ class RiskEngine:
         MemorySpentApprovals, and `state` to `RiskState()`. The engine starts with no approvals
         issued: approvals from an earlier engine object are never honoured, even with the same
         `spent` store and state."""
-        raise NotImplementedError
+        self._config = config
+        self._clock = clock
+        self._mode = mode
+        self._calendar = TradingCalendar.xnys() if calendar is None else calendar
+        self._timing = Timing() if timing is None else timing
+        self._spent = MemorySpentApprovals() if spent is None else spent
+        self._state = RiskState() if state is None else state
+        self._issued: dict[Approval, tuple[object, ...]] = {}
+        self._pending: dict[PendingApproval, tuple[object, ...]] = {}
 
     @property
     def state(self) -> RiskState:
         """The current state, as an immutable snapshot."""
-        raise NotImplementedError
+        return self._state
 
     def start_session(self, day: date, *, equity: float) -> None:
         """Begin session `day` with start-of-day equity `equity`: the peak becomes the larger of
@@ -387,7 +448,21 @@ class RiskEngine:
 
         RiskError unless `day` is a session of the calendar later than `state.session`, and
         `equity` is finite and positive."""
-        raise NotImplementedError
+        _check_equity(equity)
+        try:
+            self._calendar.session(day)
+        except CalendarError as exc:
+            raise RiskError(str(exc)) from exc
+        if self.state.session is not None and day <= self.state.session:
+            raise RiskError("a new session must be later than the current session")
+        self._update(
+            session=day,
+            start_equity=float(equity),
+            peak_equity=max(self.state.peak_equity or equity, equity),
+            intents=(),
+            submissions=0,
+            daily_loss_locked=False,
+        )
 
     def mark(self, equity: float) -> MarkOutcome:
         """One equity mark from the minute monitor, on the freshest price (C8), or from a broker
@@ -400,7 +475,32 @@ class RiskEngine:
           fires).
 
         RiskError when no session has started, or `equity` isn't finite and positive."""
-        raise NotImplementedError
+        _check_equity(equity)
+        start = self.state.start_equity
+        if self.state.session is None or start is None:
+            raise RiskError("an equity mark needs a started session")
+        peak = max(self.state.peak_equity or equity, equity)
+        daily_breach = start - equity >= self._config.daily_loss_fraction * start
+        drawdown_breach = peak - equity >= self._config.max_drawdown_fraction * peak
+        flatten = daily_breach and not self.state.daily_loss_locked
+        kill = drawdown_breach and not self.state.killed
+        self._update(
+            peak_equity=float(peak),
+            daily_loss_locked=self.state.daily_loss_locked or daily_breach,
+            killed=self.state.killed or kill,
+        )
+        if flatten:
+            log.warning("risk_daily_loss_lock", equity=equity, start_equity=start)
+        if kill:
+            self._halt("maximum drawdown reached")
+        return MarkOutcome(
+            float(equity),
+            (start - equity) / start,
+            (peak - equity) / peak,
+            self.state.daily_loss_locked,
+            flatten,
+            kill,
+        )
 
     def check(self, intent: OrderIntent, context: RiskContext) -> RiskVerdict:
         """The verdict on `intent`: RiskApprovedOrder, Veto or PendingApproval. The first check
@@ -452,7 +552,7 @@ class RiskEngine:
         A pass returns a registered RiskApprovedOrder, expiring at the window's end. Checking
         never raises for a bad intent or context: every refusal is a Veto.
         """
-        raise NotImplementedError
+        return self._check(intent, context, manual_approval=False)
 
     def approve_pending(self, pending: PendingApproval, context: RiskContext) -> RiskVerdict:
         """Your approval of `pending` (D7, ARCHITECTURE §8.4): checks 1–6 run again on its intent
@@ -461,16 +561,44 @@ class RiskEngine:
 
         ApprovalError when this engine object didn't issue `pending` (judged by identity), it
         was already approved, or `now >= pending.expires_at`."""
-        raise NotImplementedError
+        if type(pending) is not PendingApproval:
+            raise ApprovalError("pending must be exactly a PendingApproval")
+        issued = self._pending.get(pending)
+        if issued is None or not _unchanged(_pending_fields(pending), issued):
+            raise ApprovalError("pending approval was not issued here or has changed")
+        if self._clock.now() >= pending.expires_at:
+            raise ApprovalError("pending approval has expired")
+        verdict = self._check(pending.intent, context, manual_approval=True)
+        if isinstance(verdict, RiskApprovedOrder):
+            del self._pending[pending]
+        return verdict
 
     def approve_cancel(self, client_order_id: str, *, reason: str) -> RiskApprovedCancel:
         """A registered approval to cancel `client_order_id`, issued whatever the state."""
-        raise NotImplementedError
+        now = self._clock.now()
+        approval = RiskApprovedCancel(
+            token=_TOKEN,
+            approval_id=self._next_id("C", now),
+            client_order_id=client_order_id,
+            reason=reason,
+            issued_at=now,
+        )
+        self._issued[approval] = _approval_fields(approval)
+        return approval
 
     def approve_flatten(self, *, reason: str) -> RiskApprovedFlatten:
         """A registered approval for the kill switch to close the whole SPY position, issued
         whatever the state."""
-        raise NotImplementedError
+        now = self._clock.now()
+        approval = RiskApprovedFlatten(
+            token=_TOKEN,
+            approval_id=self._next_id("F", now),
+            symbol=SYMBOL,
+            reason=reason,
+            issued_at=now,
+        )
+        self._issued[approval] = _approval_fields(approval)
+        return approval
 
     def spend(self, approval: object) -> Approval:
         """Spend `approval` once; the broker adapter calls this right before it sends anything,
@@ -492,7 +620,220 @@ class RiskEngine:
         Then the id is recorded in the store (`spend` returning False is case 5) and a
         RiskApprovedOrder counts as one raw submission (C3). Cancels and flattens never count.
         """
-        raise NotImplementedError
+        if type(approval) not in (RiskApprovedOrder, RiskApprovedCancel, RiskApprovedFlatten):
+            raise ApprovalError("expected exactly an approved order, cancel or flatten")
+        approved = cast(Approval, approval)
+        if getattr(approved, "_token", None) is not _TOKEN:
+            raise ApprovalError("approval is missing the risk engine's private token")
+        issued = self._issued.get(approved)
+        if issued is None or not _unchanged(_approval_fields(approved), issued):
+            raise ApprovalError("approval was not issued here or has changed")
+        now = self._clock.now()
+        if isinstance(approved, RiskApprovedOrder) and now >= approved.expires_at:
+            raise ApprovalError("order approval has expired")
+        if self._spent.is_spent(approved.approval_id):
+            raise ApprovalError("approval has already been spent")
+        if isinstance(approved, RiskApprovedOrder):
+            buy = approved.intent.side is Side.BUY
+            if buy and self.state.halted:
+                raise ApprovalError("trading is halted")
+            if self.state.submissions + 1 >= self._config.submission_halt_at:
+                self._halt("raw submission limit reached")
+                if buy:
+                    raise ApprovalError("raw submission limit reached")
+        if not self._spent.spend(approved.approval_id, now):
+            raise ApprovalError("approval has already been spent")
+        if isinstance(approved, RiskApprovedOrder):
+            self._update(submissions=self.state.submissions + 1)
+        return approved
+
+    def _update(self, **changes: Any) -> None:
+        self._state = self.state.model_copy(update=changes)
+
+    def _halt(self, reason: str) -> None:
+        self._update(halted=True, halt_reason=reason)
+        log.error("risk_halted", reason=reason)
+
+    def _veto(
+        self, intent: OrderIntent, check: RiskCheck, reason: str, *, halts: bool = False
+    ) -> Veto:
+        if halts:
+            self._halt(reason)
+        log.warning("risk_veto", check=check.value, reason=reason, halts=halts)
+        return Veto(intent, check, reason, halts)
+
+    def _next_id(self, prefix: str, now: datetime) -> str:
+        self._update(issued=self.state.issued + 1)
+        return f"{prefix}{self.state.issued}-{to_us(now)}"
+
+    def _check(
+        self, intent: OrderIntent, context: RiskContext, *, manual_approval: bool
+    ) -> RiskVerdict:
+        now = self._clock.now()
+        config = self._config
+        stage = RiskCheck.INTENT
+        try:
+            # Revalidate even a model constructed or copied without pydantic validation.
+            OrderIntent.model_validate(intent.model_dump())
+            day = intent.tau.astimezone(NEW_YORK).date()
+            decision = next(
+                (
+                    d
+                    for d in decision_schedule(self._calendar, day, self._timing)
+                    if d.tau == intent.tau
+                ),
+                None,
+            )
+            if decision is None:
+                return self._veto(intent, stage, "intent is not a scheduled decision")
+            execution_day = decision.executes_at.astimezone(NEW_YORK).date()
+            session = self._calendar.session(execution_day)
+            expires = next(
+                bar.t_close
+                for bar in session.bars
+                if bar.t_open <= decision.executes_at < bar.t_close
+            )
+            if self.state.session != execution_day:
+                return self._veto(intent, stage, "intent needs its execution session started")
+            if not decision.executes_at <= now < expires:
+                return self._veto(intent, stage, "intent is outside its execution window")
+            buy = intent.side is Side.BUY
+
+            stage = RiskCheck.HALTED
+            if buy and (self.state.halted or context.halted):
+                return self._veto(intent, stage, "trading is halted")
+
+            stage = RiskCheck.RECONCILIATION
+            broker, book = context.broker, context.book
+            BrokerSnapshot.model_validate(broker.model_dump())
+            InternalBook.model_validate(book.model_dump())
+            age = (now - broker.taken_at).total_seconds()
+            if not 0 <= age <= config.snapshot_max_age_s:
+                return self._veto(intent, stage, "broker snapshot is stale or from the future")
+            if (
+                broker.position < 0
+                or broker.position != book.position
+                or Counter(broker.open_orders) != Counter(book.open_orders)
+            ):
+                return self._veto(
+                    intent,
+                    stage,
+                    "broker and internal positions or orders disagree, or the position is short",
+                    halts=True,
+                )
+
+            stage = RiskCheck.LIMITS
+            price = context.limit_price
+            valid_price = isinstance(price, (int, float)) and not isinstance(price, bool)
+            valid_price = valid_price and isfinite(price) and price > 0
+            quantity = intent.quantity
+            if buy:
+                if decision.reduce_only:
+                    return self._veto(intent, stage, "this decision can only reduce exposure")
+                held = (
+                    broker.position
+                    + quantity
+                    + sum(
+                        order.quantity
+                        for order in broker.open_orders
+                        if order.side is Side.BUY and order.kind is OrderKind.LIMIT
+                    )
+                )
+                cap = min(
+                    config.max_gross_exposure,
+                    config.uncertain_cap
+                    if intent.uncertain or intent.label is None
+                    else config.label_caps.cap(intent.label),
+                )
+                if decision.last_fillable:
+                    cap = min(cap, config.overnight_cap)
+                # Invalid prices are refused by PRICE; they cannot earn an approval.
+                if valid_price and held * price > cap * broker.equity:
+                    return self._veto(intent, stage, "resulting position exceeds its exposure cap")
+                if valid_price and quantity * price > config.single_order_cap * broker.equity:
+                    return self._veto(intent, stage, "order exceeds the single-order cap")
+            else:
+                available = broker.position - sum(
+                    order.quantity
+                    for order in broker.open_orders
+                    if order.side is Side.SELL and order.kind is OrderKind.LIMIT
+                )
+                quantity = min(quantity, available)
+                if quantity <= 0:
+                    return self._veto(intent, stage, "no unreserved shares remain to sell")
+
+            stage = RiskCheck.LOCKS
+            if buy:
+                if self.state.daily_loss_locked:
+                    return self._veto(intent, stage, "daily-loss lock blocks entries")
+                if context.drift_frozen:
+                    return self._veto(intent, stage, "drift freeze blocks entries")
+                if not context.healthy:
+                    return self._veto(intent, stage, "rule 6 blocks entries")
+
+            stage = RiskCheck.RATE
+            key = f"{intent.decision_id}#{intent.leg}"
+            if key not in self.state.intents:
+                self._update(intents=(*self.state.intents, key))
+            if len(self.state.intents) > config.max_intents_per_day:
+                if buy:
+                    return self._veto(intent, stage, "daily intent limit exceeded", halts=True)
+                self._halt("daily intent limit exceeded")
+
+            stage = RiskCheck.PRICE
+            quote = context.quote
+            Quote.model_validate(quote.model_dump())
+            age = (now - quote.at).total_seconds()
+            if not 0 <= age <= config.quote_max_age_s:
+                return self._veto(intent, stage, "quote is stale or from the future")
+            if quote.bid > quote.ask:
+                return self._veto(intent, stage, "quote is crossed")
+            ref = quote.ask if buy else quote.bid
+            if not valid_price or abs(price - ref) > ref * config.collar_bp / 10_000:
+                return self._veto(intent, stage, "limit price is invalid or outside the collar")
+            if buy and (intent.stop_price is None or intent.stop_price >= price):
+                return self._veto(intent, stage, "entry needs a protective stop below its limit")
+            notional = quantity * price
+            if not isfinite(notional):
+                return self._veto(intent, stage, "order notional must be finite")
+
+            stage = RiskCheck.APPROVAL
+            large = buy and notional > config.manual_approval_notional
+            if large and self._mode is TradingMode.LIVE and not manual_approval:
+                pending = PendingApproval(
+                    self._next_id("P", now),
+                    intent,
+                    quantity,
+                    float(price),
+                    float(notional),
+                    now,
+                    expires,
+                )
+                self._pending[pending] = _pending_fields(pending)
+                log.warning(
+                    "risk_pending_approval", pending_id=pending.pending_id, notional=notional
+                )
+                return pending
+            flagged = large or manual_approval
+            approval = RiskApprovedOrder(
+                token=_TOKEN,
+                approval_id=self._next_id("O", now),
+                intent=intent,
+                quantity=quantity,
+                limit_price=float(price),
+                notional=float(notional),
+                issued_at=now,
+                expires_at=expires,
+                flagged=flagged,
+            )
+            self._issued[approval] = _approval_fields(approval)
+            if flagged:
+                log.warning(
+                    "risk_flagged_order", approval_id=approval.approval_id, notional=notional
+                )
+            return approval
+        except (QuantError, ValueError, TypeError, AttributeError, ArithmeticError) as exc:
+            return self._veto(intent, stage, f"invalid intent or context: {exc}")
 
 
 def verdict_record(verdict: RiskVerdict) -> dict[str, Any]:
@@ -507,4 +848,53 @@ def verdict_record(verdict: RiskVerdict) -> dict[str, Any]:
 
     `intent` is the OrderIntent itself (canonical JSON dumps a model); times stay datetimes.
     """
-    raise NotImplementedError
+    if isinstance(verdict, Veto):
+        return {
+            "verdict": "veto",
+            "intent": verdict.intent,
+            "check": verdict.check.value,
+            "reason": verdict.reason,
+            "halts": verdict.halts,
+        }
+    record: dict[str, Any] = {
+        "intent": verdict.intent,
+        "quantity": verdict.quantity,
+        "limit_price": verdict.limit_price,
+        "notional": verdict.notional,
+        "issued_at": verdict.issued_at,
+        "expires_at": verdict.expires_at,
+    }
+    if isinstance(verdict, PendingApproval):
+        record.update(verdict="pending", pending_id=verdict.pending_id)
+    else:
+        record.update(verdict="approved", approval_id=verdict.approval_id, flagged=verdict.flagged)
+    return record
+
+
+def _initialize(approval: _Approved, token: object, fields: dict[str, object]) -> None:
+    if token is not _TOKEN:
+        raise ApprovalError("an approval requires the risk engine's private token")
+    object.__setattr__(approval, "_token", token)
+    for name, value in fields.items():
+        object.__setattr__(approval, name, value)
+
+
+def _approval_fields(approval: Approval) -> tuple[object, ...]:
+    return tuple(
+        getattr(approval, name, None) for name in (*_Approved.__slots__, *type(approval).__slots__)
+    )
+
+
+def _pending_fields(pending: PendingApproval) -> tuple[object, ...]:
+    return tuple(getattr(pending, name, None) for name in PendingApproval.__dataclass_fields__)
+
+
+def _unchanged(current: tuple[object, ...], issued: tuple[object, ...]) -> bool:
+    return all(now is then for now, then in zip(current, issued, strict=True))
+
+
+def _check_equity(equity: float) -> None:
+    if isinstance(equity, bool) or not isinstance(equity, (int, float)):
+        raise RiskError("equity must be finite and positive")
+    if not isfinite(equity) or equity <= 0:
+        raise RiskError("equity must be finite and positive")

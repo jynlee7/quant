@@ -30,8 +30,6 @@ from quant.risk.engine import (
 )
 from tests.support.risk import Desk, desk, intent
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
-
 Approved = RiskApprovedOrder | RiskApprovedCancel | RiskApprovedFlatten
 Issue = Callable[[Desk], Approved]
 
@@ -120,7 +118,6 @@ FORGERIES: dict[str, Forgery] = {
 }
 
 
-@RED
 @pytest.mark.spec("I4", "K5", "ARCH§4.4")
 @pytest.mark.parametrize("issue", KINDS.values(), ids=KINDS.keys())
 @pytest.mark.parametrize("forge", FORGERIES.values(), ids=FORGERIES.keys())
@@ -134,7 +131,6 @@ def test_i4_approvals_built_outside_the_engine_are_refused(issue: Issue, forge: 
     assert d.engine.spend(genuine) is genuine
 
 
-@RED
 @pytest.mark.spec("I4", "K5", "ARCH§4.4")
 def test_approved_types_demand_the_token_and_are_immutable_and_uncopyable() -> None:
     d = desk()
@@ -167,7 +163,6 @@ def test_approved_types_demand_the_token_and_are_immutable_and_uncopyable() -> N
     assert "_token" not in verdict_record(real)
 
 
-@RED
 @pytest.mark.spec("I4", "ARCH§4.4")
 @pytest.mark.parametrize("issue", KINDS.values(), ids=KINDS.keys())
 def test_each_approval_is_spendable_once(issue: Issue) -> None:
@@ -178,7 +173,6 @@ def test_each_approval_is_spendable_once(issue: Issue) -> None:
         d.engine.spend(approval)
 
 
-@RED
 @pytest.mark.spec("I4", "ARCH§4.4", "D7")
 def test_an_order_approval_expires_at_the_end_of_its_bar() -> None:
     # The 10:46 ET decision executes in the 10:30-11:30 bar, so its approval expires at 11:30.
@@ -192,7 +186,6 @@ def test_an_order_approval_expires_at_the_end_of_its_bar() -> None:
         d.engine.spend(late)
 
 
-@RED
 @pytest.mark.spec("I4", "ARCH§4.4")
 def test_spent_ids_go_to_the_store_and_the_store_refuses_them_again() -> None:
     spent = MemorySpentApprovals()
@@ -209,7 +202,6 @@ def test_spent_ids_go_to_the_store_and_the_store_refuses_them_again() -> None:
         d.engine.spend(second)
 
 
-@RED
 @pytest.mark.spec("I4", "ARCH§4.4", "ARCH§14")
 def test_a_restarted_engine_issues_fresh_ids_that_its_store_accepts() -> None:
     spent = MemorySpentApprovals()

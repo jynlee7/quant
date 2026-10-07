@@ -45,7 +45,6 @@ from tests.support.risk import (
     order,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 US = timedelta(microseconds=1)
 FIVE_S = timedelta(seconds=5)
 
@@ -66,7 +65,6 @@ def vetoed(verdict: RiskVerdict, check: RiskCheck, *, halts: bool = False) -> Ve
 # --- the precondition: a scheduled decision, inside its window, this session -----------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.2", "SPEC§10")
 def test_an_intent_must_be_a_scheduled_decision_inside_its_window() -> None:
     first, second = decisions()[0], decisions()[1]
@@ -84,7 +82,6 @@ def test_an_intent_must_be_a_scheduled_decision_inside_its_window() -> None:
     vetoed(d.check(intent(tau=first.tau, leg=3)), RiskCheck.INTENT)  # never sent late
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10")
 def test_an_intent_needs_its_session_started() -> None:
     d = desk(day=None)
@@ -93,7 +90,6 @@ def test_an_intent_needs_its_session_started() -> None:
     approved(d.check(intent()))
 
 
-@RED
 @pytest.mark.spec("A3", "ARCH§5", "ARCH§8.1", "D9")
 def test_the_closing_decision_executes_at_the_next_open_and_only_reduces() -> None:
     close = closing()
@@ -113,7 +109,6 @@ def test_the_closing_decision_executes_at_the_next_open_and_only_reduces() -> No
 # --- 1. HALTED -------------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "D9")
 def test_1_halted_passes_only_risk_reducing_intents_clamped_to_the_position() -> None:
     d = desk()
@@ -131,7 +126,6 @@ def test_1_halted_passes_only_risk_reducing_intents_clamped_to_the_position() ->
 # --- 2. Reconciliation -----------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10")
 @pytest.mark.parametrize("side", [Side.BUY, Side.SELL], ids=str)
 def test_2_the_snapshot_may_be_five_seconds_old_and_no_older(side: Side) -> None:
@@ -144,7 +138,6 @@ def test_2_the_snapshot_may_be_five_seconds_old_and_no_older(side: Side) -> None
     assert not d.engine.state.halted  # a stale snapshot is retried, not a halt
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "C2")
 @pytest.mark.parametrize(
     "mismatch",
@@ -167,7 +160,6 @@ def test_2_a_mismatch_or_a_short_halts_trading(mismatch: dict[str, object]) -> N
     vetoed(d.check(intent(Side.BUY, 100, leg=2)), RiskCheck.HALTED)
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1")
 def test_2_open_orders_match_in_any_order() -> None:
     orders = (order("stop-1"), order("buy-1", Side.BUY, OrderKind.LIMIT, 50, PRICE))
@@ -180,7 +172,6 @@ def test_2_open_orders_match_in_any_order() -> None:
 # --- 3. Limits -------------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "D9", "D13")
 def test_3_gross_exposure_may_reach_one_times_equity_and_no_more() -> None:
     d = desk()
@@ -194,7 +185,6 @@ def test_3_gross_exposure_may_reach_one_times_equity_and_no_more() -> None:
     )
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "D13")
 @pytest.mark.parametrize("label", [Label.CHOP, Label.STRESS], ids=str)
 def test_3_each_label_cap_holds_at_its_boundary(label: Label) -> None:
@@ -204,7 +194,6 @@ def test_3_each_label_cap_holds_at_its_boundary(label: Label) -> None:
     vetoed(d.check(intent(Side.BUY, cap - 99, label=label, leg=2), position=100), RiskCheck.LIMITS)
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "D13", "SPEC§8")
 @pytest.mark.parametrize(
     "kwargs",
@@ -216,7 +205,6 @@ def test_3_crash_no_label_and_uncertainty_cap_buys_at_zero(kwargs: dict[str, obj
     vetoed(d.check(intent(Side.BUY, 1, **kwargs)), RiskCheck.LIMITS)  # type: ignore[arg-type]
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "D13")
 def test_3_one_order_may_buy_half_of_equity_and_no_more() -> None:
     d = desk()
@@ -224,7 +212,6 @@ def test_3_one_order_may_buy_half_of_equity_and_no_more() -> None:
     vetoed(d.check(intent(Side.BUY, 501, leg=2)), RiskCheck.LIMITS)
 
 
-@RED
 @pytest.mark.spec("A3", "ARCH§8.1", "SPEC§10")
 @pytest.mark.parametrize("day", [DAY, HALF_DAY], ids=["15:46 ET", "12:46 ET on a half day"])
 def test_3_the_overnight_cap_binds_on_the_last_fillable_decision_only(day: object) -> None:
@@ -238,7 +225,6 @@ def test_3_the_overnight_cap_binds_on_the_last_fillable_decision_only(day: objec
     approved(e.check(intent(Side.BUY, 401, tau=earlier.tau), position=100))
 
 
-@RED
 @pytest.mark.spec("D9", "ARCH§8.1", "SPEC§10")
 def test_3_sells_are_clamped_so_they_never_go_short() -> None:
     d = desk()
@@ -261,7 +247,6 @@ def test_3_sells_are_clamped_so_they_never_go_short() -> None:
     )
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "D7")
 def test_risk_reducing_intents_skip_the_caps_locks_and_approval() -> None:
     d = desk(mode=TradingMode.LIVE)
@@ -283,7 +268,6 @@ def test_risk_reducing_intents_skip_the_caps_locks_and_approval() -> None:
 # --- 4. Locks --------------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "C5", "SPEC§8")
 @pytest.mark.parametrize(
     "lock", [{"drift_frozen": True}, {"healthy": False}], ids=["drift freeze", "rule 6"]
@@ -295,7 +279,6 @@ def test_4_a_drift_freeze_and_rule_6_veto_entries_only(lock: dict[str, bool]) ->
     approved(d.check(intent(Side.BUY, 100, leg=3)))
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "C8", "D13")
 def test_4_the_daily_loss_lock_sets_at_exactly_two_percent() -> None:
     inside = desk()
@@ -322,7 +305,6 @@ def test_4_the_daily_loss_lock_sets_at_exactly_two_percent() -> None:
     approved(d.check(intent(Side.BUY, 100, tau=decisions(NEXT_DAY)[0].tau), equity=97_000.0))
 
 
-@RED
 @pytest.mark.spec("ARCH§8.3", "SPEC§10", "C8", "D13")
 def test_the_drawdown_trigger_fires_at_exactly_ten_percent_from_the_peak() -> None:
     d = desk()
@@ -345,7 +327,6 @@ def test_the_drawdown_trigger_fires_at_exactly_ten_percent_from_the_peak() -> No
     vetoed(d.check(intent(Side.BUY, 1, tau=decisions(NEXT_DAY)[0].tau)), RiskCheck.HALTED)
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "C8")
 def test_sessions_and_marks_refuse_misuse() -> None:
     d = desk(day=None)
@@ -366,7 +347,6 @@ def test_sessions_and_marks_refuse_misuse() -> None:
 # --- 5. Rate (C3) ----------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("C3", "ARCH§8.1", "SPEC§10")
 def test_5_the_twenty_first_intent_in_a_session_halts_trading() -> None:
     d = desk()
@@ -389,7 +369,6 @@ def test_5_the_twenty_first_intent_in_a_session_halts_trading() -> None:
     assert d.engine.state.halted
 
 
-@RED
 @pytest.mark.spec("C3", "ARCH§8.1")
 def test_5_a_risk_reducing_twenty_first_intent_halts_and_still_passes() -> None:
     d = desk()
@@ -399,7 +378,6 @@ def test_5_a_risk_reducing_twenty_first_intent_halts_and_still_passes() -> None:
     assert d.engine.state.halted
 
 
-@RED
 @pytest.mark.spec("C3", "ARCH§4.4", "SPEC§10")
 @pytest.mark.parametrize("side", [Side.BUY, Side.SELL], ids=str)
 def test_the_sixtieth_raw_submission_halts_trading(side: Side) -> None:
@@ -422,7 +400,6 @@ def test_the_sixtieth_raw_submission_halts_trading(side: Side) -> None:
     assert d.engine.state.halted
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "I4")
 def test_a_halt_stops_buys_already_approved_but_never_reductions() -> None:
     d = desk()
@@ -445,7 +422,6 @@ def test_a_halt_stops_buys_already_approved_but_never_reductions() -> None:
 # --- 6. Price --------------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "C8")
 def test_6_the_quote_may_be_five_seconds_old_and_no_older() -> None:
     d = desk()
@@ -455,7 +431,6 @@ def test_6_the_quote_may_be_five_seconds_old_and_no_older() -> None:
     vetoed(d.check(intent(Side.BUY, 100), bid=PRICE + 0.01), RiskCheck.PRICE)  # crossed
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10")
 @pytest.mark.parametrize("side", [Side.BUY, Side.SELL], ids=str)
 @pytest.mark.parametrize("direction", [1.0, -1.0], ids=["above", "below"])
@@ -471,7 +446,6 @@ def test_6_the_limit_sits_within_ten_basis_points_of_its_side_of_the_quote(
     vetoed(d.check(intent(side, 100, stop=stop), position=100, limit=outside), RiskCheck.PRICE)
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "SPEC§7")
 @pytest.mark.parametrize(
     "stop", [None, PRICE, PRICE + 1.0], ids=["no stop", "at the limit", "above"]
@@ -485,7 +459,6 @@ def test_6_every_entry_carries_a_stop_below_its_limit(stop: float | None) -> Non
 # --- 7. Approval (D7) ------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("D7", "ARCH§8.1", "ARCH§8.4", "SPEC§10")
 def test_7_live_orders_above_25000_wait_for_approval() -> None:
     d = desk(mode=TradingMode.LIVE)
@@ -508,7 +481,6 @@ def test_7_live_orders_above_25000_wait_for_approval() -> None:
     assert len(d.engine.state.intents) == 2  # approving didn't count the intent again
 
 
-@RED
 @pytest.mark.spec("D7", "ARCH§8.1")
 def test_7_paper_flags_large_orders_and_never_blocks_them() -> None:
     d = desk(mode=TradingMode.PAPER)
@@ -519,7 +491,6 @@ def test_7_paper_flags_large_orders_and_never_blocks_them() -> None:
     assert d.engine.spend(flagged) is flagged
 
 
-@RED
 @pytest.mark.spec("D7", "ARCH§8.4", "I4")
 def test_7_a_pending_approval_expires_rechecks_and_cannot_be_forged() -> None:
     d = desk(mode=TradingMode.LIVE)
@@ -599,7 +570,6 @@ ORDER_CASES: dict[str, Case] = {
 }
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1")
 @pytest.mark.parametrize("case", ORDER_CASES.values(), ids=ORDER_CASES.keys())
 def test_the_first_failing_check_decides(case: Case) -> None:
@@ -611,7 +581,6 @@ def test_the_first_failing_check_decides(case: Case) -> None:
 # --- records ---------------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "ARCH§14", "ARCH§8.1")
 def test_verdict_records_are_canonical_and_identical_across_runs() -> None:
     def run() -> list[str]:
@@ -634,7 +603,6 @@ def test_verdict_records_are_canonical_and_identical_across_runs() -> None:
     assert kinds == ["approved", "pending", "veto"]
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "SPEC§10")
 def test_state_restores_and_continues_the_count() -> None:
     d = desk()

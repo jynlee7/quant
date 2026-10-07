@@ -25,8 +25,6 @@ from quant.risk.limits import (
 from quant_check.repo import scrubbed_env
 from tests.support.risk import RISK_YAML as COMMITTED_FILE
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
-
 
 def git(repo: Path, *args: str) -> None:
     subprocess.run(
@@ -48,7 +46,6 @@ def repo_with_risk_yaml(root: Path) -> Path:
     return root
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "D13", "D7", "C3", "A3")
 def test_the_committed_file_holds_the_spec_section_10_limits() -> None:
     data = COMMITTED_FILE.read_bytes()
@@ -68,7 +65,6 @@ def test_the_committed_file_holds_the_spec_section_10_limits() -> None:
     assert limits.snapshot_max_age_s == 5.0
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "ARCH§9.3", "SPEC§10")
 @pytest.mark.parametrize(
     "edit",
@@ -90,7 +86,6 @@ def test_the_loader_refuses_a_file_that_differs_from_the_committed_one(
         load_risk_config(path, committed=committed)
 
 
-@RED
 @pytest.mark.spec("ARCH§8.1", "ARCH§9.3")
 def test_committed_bytes_reads_head_and_the_loader_refuses_local_edits(tmp_path: Path) -> None:
     repo = repo_with_risk_yaml(tmp_path / "repo")
@@ -110,7 +105,6 @@ def test_committed_bytes_reads_head_and_the_loader_refuses_local_edits(tmp_path:
         load_risk_config(tmp_path / "missing.yaml", committed=b"")
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "D13")
 @pytest.mark.parametrize(
     "edit",
@@ -145,7 +139,6 @@ def test_the_parser_refuses_malformed_or_inconsistent_limits(edit: object) -> No
         parse_risk_config(text.encode())
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "ARCH§8.1")
 def test_the_loaded_config_is_frozen() -> None:
     limits = parse_risk_config(COMMITTED_FILE.read_bytes())

@@ -8,11 +8,15 @@ changes on disk, and alerting, belongs to the live engine (B14).
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 from typing import Final
 
-from pydantic import Field, model_validator
+import yaml
+from pydantic import Field, ValidationError, model_validator
 
+from quant.core.errors import ConfigError
 from quant.core.model import StrictModel
 from quant.core.orders import Label
 
@@ -30,7 +34,7 @@ class LabelCaps(StrictModel):
 
     def cap(self, label: Label) -> float:
         """The cap for `label`."""
-        raise NotImplementedError
+        return float(getattr(self, label.value))
 
 
 class RiskConfig(StrictModel):
@@ -73,7 +77,12 @@ class RiskConfig(StrictModel):
         """ValueError (so a ValidationError) unless the limits hang together: no label cap and
         neither the overnight nor the uncertain cap above `max_gross_exposure`, CRASH's cap is 0
         (spec §7: no playbook can trade it), and `uncertain_cap` is 0 (spec §10)."""
-        raise NotImplementedError
+        caps = [self.label_caps.cap(label) for label in Label]
+        if max(*caps, self.overnight_cap, self.uncertain_cap) > self.max_gross_exposure:
+            raise ValueError("label, overnight and uncertain caps must not exceed gross exposure")
+        if self.label_caps.CRASH != 0.0 or self.uncertain_cap != 0.0:
+            raise ValueError("CRASH and uncertainty must cap exposure at zero")
+        return self
 
 
 def parse_risk_config(data: bytes) -> RiskConfig:
@@ -81,7 +90,13 @@ def parse_risk_config(data: bytes) -> RiskConfig:
     for text that isn't UTF-8 or YAML, a top level that isn't a mapping, an unknown or missing
     key, a value of the wrong type, or limits that fail RiskConfig's checks. YAML integers are
     accepted for float fields; nothing else is coerced."""
-    raise NotImplementedError
+    try:
+        values = yaml.safe_load(data.decode("utf-8"))
+        if not isinstance(values, dict):
+            raise ConfigError("risk.yaml must contain a mapping")
+        return RiskConfig.model_validate(values)
+    except (UnicodeError, yaml.YAMLError, ValidationError) as exc:
+        raise ConfigError(f"invalid risk.yaml: {exc}") from exc
 
 
 def load_risk_config(path: Path, *, committed: bytes) -> RiskConfig:
@@ -91,7 +106,13 @@ def load_risk_config(path: Path, *, committed: bytes) -> RiskConfig:
     (`committed_bytes`): one changed byte, whitespace and comments included, is a difference.
     Also ConfigError when the file can't be read, and whatever `parse_risk_config` refuses.
     """
-    raise NotImplementedError
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"cannot read risk limits at {path}: {exc}") from exc
+    if data != committed:
+        raise ConfigError(f"risk limits at {path} differ from the committed version")
+    return parse_risk_config(data)
 
 
 def committed_bytes(repo: Path, relpath: str = RISK_YAML) -> bytes:
@@ -103,4 +124,13 @@ def committed_bytes(repo: Path, relpath: str = RISK_YAML) -> bytes:
     ConfigError when `repo` isn't a git repository, has no commits, or doesn't track `relpath`
     at HEAD.
     """
-    raise NotImplementedError
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "show", f"HEAD:{relpath}"],
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            check=True,
+            capture_output=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ConfigError(f"cannot read committed {relpath} from {repo}: {exc}") from exc
+    return result.stdout

@@ -29,7 +29,6 @@ from quant.core.orders import Label, Side, TradingMode
 from quant.risk.engine import PendingApproval, RiskApprovedOrder, Veto
 from tests.support.risk import EQUITY, NEXT_DAY, config, decisions, desk, intent
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 LAST = len(decisions()) - 1  # the closing decision
 
 
@@ -61,7 +60,6 @@ steps = st.lists(
 )
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "D9", "A3", "C3", "D7", "ARCH§8.1", "I4")
 @given(steps)
 def test_no_sequence_of_intents_and_fills_goes_short_or_breaches_a_cap(drawn: list[Step]) -> None:

@@ -19,6 +19,9 @@ from typing import Final
 
 from pydantic import Field, field_validator, model_validator
 
+from quant.core.clock import ensure_utc
+from quant.core.errors import ClockError
+from quant.core.ids import decision_id
 from quant.core.model import StrictModel
 
 SYMBOL: Final = "SPY"
@@ -97,14 +100,24 @@ class OrderIntent(StrictModel):
     def _tau_utc(cls, value: datetime) -> datetime:
         """`value` in UTC (quant.core.clock.ensure_utc); a naive datetime raises ValueError, so
         pydantic reports a ValidationError."""
-        raise NotImplementedError
+        return _utc(value)
 
     @model_validator(mode="after")
     def _consistent(self) -> OrderIntent:
         """ValueError (a ValidationError) unless `decision_id == decision_id(tau)`, `symbol ==
         SYMBOL`, and a BUY is not `reduce_only`. A tau off the whole minute, for which
         `decision_id` raises ClockError, is a ValueError too."""
-        raise NotImplementedError
+        try:
+            expected = decision_id(self.tau)
+        except ClockError as exc:
+            raise ValueError(str(exc)) from exc
+        if self.decision_id != expected:
+            raise ValueError("decision_id must name tau")
+        if self.symbol != SYMBOL:
+            raise ValueError(f"only {SYMBOL} may be traded")
+        if self.side is Side.BUY and self.reduce_only:
+            raise ValueError("a BUY cannot be reduce-only")
+        return self
 
 
 class Quote(StrictModel):
@@ -120,7 +133,7 @@ class Quote(StrictModel):
     @classmethod
     def _at_utc(cls, value: datetime) -> datetime:
         """`value` in UTC; a naive datetime raises ValueError (a ValidationError)."""
-        raise NotImplementedError
+        return _utc(value)
 
 
 class OpenOrder(StrictModel):
@@ -155,7 +168,7 @@ class BrokerSnapshot(StrictModel):
     @classmethod
     def _taken_utc(cls, value: datetime) -> datetime:
         """`value` in UTC; a naive datetime raises ValueError (a ValidationError)."""
-        raise NotImplementedError
+        return _utc(value)
 
 
 class InternalBook(StrictModel):
@@ -164,3 +177,10 @@ class InternalBook(StrictModel):
 
     position: int
     open_orders: tuple[OpenOrder, ...] = ()
+
+
+def _utc(value: datetime) -> datetime:
+    try:
+        return ensure_utc(value)
+    except ClockError as exc:
+        raise ValueError(str(exc)) from exc
