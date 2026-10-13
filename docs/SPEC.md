@@ -1,6 +1,6 @@
 # SPEC — SPY Regime Trader
 
-**Status:** APPROVED v1.3 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). Each one is tagged where it lands.
+**Status:** APPROVED v1.4 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). v1.4 adds Jev, TypeSafe AI's typed-decision model, as a shadow advisor that is logged next to the HMM, scored only on forward paper bars and never affects a decision: layer L1s and invariant I7 (§1), §12a, and a known risk (§16). You approved it on 2026-10-13. Each one is tagged where it lands.
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The spec, the architecture and the [plan](PLAN.md) are approved, and the build started 2026-10-05. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -56,6 +56,7 @@ When we reach setup, you will add your keys to `.env` yourself. I'll create `.en
 |---|---|---|---|
 | **L1 Opus 5.5** | Nightly, as a separate process and Unix user, with only `ANTHROPIC_API_KEY` in its environment | Propose features (from a tested menu), playbooks, strategy.md edits and HMM configs; audit fit reports; review sessions | Hold broker keys; place or cancel orders; read or write risk limits; grade or promote its own proposals; run inside the trading loop |
 | **L2 HMM** | Every candle | Emit filtered state probabilities, next-bar state probabilities, entropy and predictive log-likelihood | See a future candle; decide or size anything |
+| **L1s Jev shadow** (v1.4) | Every decision bar, after the decision is recorded, as a separate process under L1's Unix user, with only `TYPESAFE_API_KEY` in its environment | Answer three fixed questions about the next bar (§12a); have its answers logged and scored against the HMM's | Hold broker keys; place or cancel orders; read risk limits or the databases; affect any decision, size or order; be called on a backtest, a replay, DEV or the lockbox |
 | **L3 Code** | Every candle, at all times | Own thresholds, switching, sizing, risk vetoes, every order, the kill switch, and promotions through the gates | Be overridden by L1 or L2 output |
 
 Each invariant is enforced by a test that fails the build:
@@ -68,6 +69,7 @@ Each invariant is enforced by a test that fails the build:
 | I4 | Every order passes the risk engine | The broker adapter accepts only a `RiskApprovedOrder`, and only the risk engine can construct one |
 | I5 | The live endpoint is unreachable unless the go-live gate passes | Adapter constructor test |
 | I6 | Secrets never appear in code, logs, the database or LLM prompts | Secret scan plus a test of the redacting log filter |
+| I7 | No decision-path module, and neither `research` nor `harness`, imports `quant.shadow` or reads `shadow.db` (v1.4) | Import-graph test (ARCHITECTURE K7) plus a scan for the `shadow.db` path |
 
 ---
 
@@ -253,6 +255,36 @@ The winner is written to `strategy.md` along with its config hash, model version
 - **Harness:** each proposal adds an entry to the trial ledger, then runs a full walk-forward on the development period and gates G1–G6. If it passes and beats the current champion, it is queued for your approval (D12). Beating the champion means a higher out-of-sample Sharpe after costs on the development period; a champion that fails any gate is beaten by any candidate that passes all six (C9). Once approved, it is promoted as a new version that can be rolled back.
 - **Model:** `claude-opus-5-5` via the Anthropic API. With the server-side refusal fallback on, another model may answer on a night Opus declines, and each proposal records which model wrote it (AD6).
 
+## 12a. Shadow advisor (Jev) (v1.4)
+
+Jev is TypeSafe AI's typed-decision model. It takes a text state and named, typed questions, and returns typed answers in one pass. Here it runs as a shadow: its answers are logged next to the HMM's and scored, and nothing on the way to a decision, a size or an order reads them (I7). Its vendor claims are unchecked (§16), so B20's spike checks them first.
+
+- **When:** every decision bar of paper trading (the FORWARD segment), after the engine has recorded the decision. Backtests, replays, DEV and the lockbox never call Jev. A cloud model has probably seen that market history in training, so a score there would quietly use the future, and its answers may not repeat run to run.
+- **Questions:** one call per bar, with three questions.
+
+  | Name | Type | Question |
+  |---|---|---|
+  | `next_label` | `Choice` of CALM_UP, CHOP, STRESS, CRASH | The next bar's regime label |
+  | `next_up` | `Noul`, a probability in [0, 1] | The next bar's return (F1) is above 0 |
+  | `next_stress` | `Noul` | The next bar is STRESS or CRASH |
+
+- **The bundle** holds only features F1–F5 at τ, the filtered and next-bar label probabilities, the entropy, the active playbook and the position fraction. It holds no dates or times, no ticker and no secrets, and a secret scan must pass before it is written.
+- **Answers** are checked against a strict schema. Extra keys, a `Noul` outside [0, 1], a label outside the four, or an answer over the size cap make the answer `missing`.
+- **Late and missing:** an answer that arrives at or after the next bar's `available_at` is `late`. It is stored and never scored. An outage, a timeout or a rejected answer is `missing`. Neither is an engine health event; the daily report counts both.
+- **Scoring** runs each evening in `eval/`, the only place smoothing runs:
+  - the Brier score and log-loss of `next_up` and `next_stress` against what happened. Log-loss clips probabilities to [1e-6, 1 − 1e-6];
+  - the HMM's forecasts of the same events, scored the same way on the same bars. P(next F1 > 0) comes from its Gaussian mixture weighted by the next-bar state probabilities, and P(next bar is STRESS or CRASH) from the next-bar label probabilities;
+  - `next_label` accuracy. The outcome of `next_label` and `next_stress` is the A4 smoothed label;
+  - one line in the daily report, with the counts of late and missing answers.
+
+  A bar is scored once, on the evening its outcome is known, and its score is never revised.
+- **Promotion test**, fixed now, before any data exists. Jev may be **proposed** as an input only when all three hold:
+  1. the test runs at one of its two looks, fixed now: at 500 scored forward bars, and once more at 1,000 only if the first look fails. It never runs at any other time, and after a second failure Jev is never proposed;
+  2. a one-sided Diebold–Mariano test on the per-bar `next_stress` Brier differences (Jev minus HMM), over the bars where both are scored, with a Newey–West standard error, finds Jev's Brier score lower at p < 0.025. That is 0.05 split across the two looks (Bonferroni), so repeated looks can't manufacture a pass;
+  3. Jev's late-or-missing rate is under 2% of the bars it was asked about.
+
+  Passing allows only a proposal. Adopting it is a separate approval from you, with a spec change. An adopted input could only cut risk: it could lower the size multiplier, never raise it and never open a position. Its responses would be recorded as decision inputs, so replays stay exact.
+
 ## 13. Dashboard, alerts and reports
 
 - **Dashboard:** a local web app. It is read-only apart from the kill and approve buttons. It shows:
@@ -303,6 +335,7 @@ The checklist ends with a section titled **WHAT COULD BLOW UP THIS ACCOUNT?** An
 | Pattern-day-trader rules on small live accounts | Check before going live |
 | You loosen limits under pressure | Changing `risk.yaml` needs a restart and a commit, and sends an alert |
 | Keys leak | `.env` only, log redaction, and keys are never pasted into chat |
+| Jev's vendor claims (calibration, latency, determinism, data retention) come from secondary blogs and haven't been checked (v1.4) | Shadow only (I7); B20's spike checks the claims first and records them in VERIFY.md; promotion needs its own forward evidence and your approval (§12a) |
 
 ## 17. Build process: how "done" is defined
 
