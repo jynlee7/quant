@@ -54,7 +54,6 @@ def vetoed(verdict: RiskVerdict, check: RiskCheck, *, halts: bool = False) -> Ve
 
 
 @pytest.mark.spec("C3", "SPEC§10", "ARCH§8.1")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.parametrize(
     ("quantity", "context", "check"),
     [
@@ -84,7 +83,6 @@ def test_vetoed_intents_count_and_the_twenty_first_halts(
 
 
 @pytest.mark.spec("C3", "ARCH§8.1")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError)
 def test_a_twenty_first_intent_that_passes_says_it_halted() -> None:
     d = desk()
     for leg in range(1, 21):
@@ -97,7 +95,6 @@ def test_a_twenty_first_intent_that_passes_says_it_halted() -> None:
 
 
 @pytest.mark.spec("C3", "ARCH§4.4", "SPEC§10")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 @pytest.mark.parametrize("side", [Side.BUY, Side.SELL], ids=str)
 def test_the_sixtieth_submission_publishes_its_halt_before_spend_returns(side: Side) -> None:
     seen: list[RiskState] = []
@@ -114,7 +111,6 @@ def test_the_sixtieth_submission_publishes_its_halt_before_spend_returns(side: S
 
 
 @pytest.mark.spec("C3", "ARCH§4.4", "ARCH§8.3")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 def test_a_buy_past_the_submission_limit_is_refused_with_its_own_error() -> None:
     d = desk()
     sell = intent(Side.SELL, 1)
@@ -141,7 +137,6 @@ def test_a_buy_past_the_submission_limit_is_refused_with_its_own_error() -> None
 
 
 @pytest.mark.spec("ARCH§4.3", "SPEC§10", "C3", "C8")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 def test_every_state_change_is_published_before_the_call_returns() -> None:
     seen: list[RiskState] = []
     d = desk(on_change=seen.append)
@@ -172,7 +167,6 @@ def test_every_state_change_is_published_before_the_call_returns() -> None:
 
 
 @pytest.mark.spec("ARCH§4.3", "ARCH§4.4", "C3")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 def test_a_state_that_cannot_be_persisted_stops_the_call() -> None:
     def persist(state: RiskState) -> None:
         if state.submissions or len(state.intents) > 1:
@@ -192,7 +186,6 @@ def test_a_state_that_cannot_be_persisted_stops_the_call() -> None:
 
 
 @pytest.mark.spec("ARCH§8.3", "SPEC§10")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 def test_a_resume_clears_the_halt_and_keeps_the_day_s_locks_and_counts() -> None:
     d = desk()
     d.engine.mark(98_000.0)  # the daily-loss lock
@@ -223,7 +216,6 @@ def test_a_resume_clears_the_halt_and_keeps_the_day_s_locks_and_counts() -> None
 
 
 @pytest.mark.spec("ARCH§8.3", "SPEC§10", "C8")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 def test_a_resume_after_the_drawdown_trigger_keeps_the_peak() -> None:
     d = desk()
     d.engine.mark(105_000.0)
@@ -252,7 +244,6 @@ def test_a_resume_after_the_drawdown_trigger_keeps_the_peak() -> None:
 
 
 @pytest.mark.spec("ARCH§8.3", "SPEC§10")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 def test_a_later_halt_keeps_the_first_reason() -> None:
     d = desk()
     d.engine.mark(105_000.0)
@@ -271,7 +262,6 @@ def test_a_later_halt_keeps_the_first_reason() -> None:
 
 
 @pytest.mark.spec("D7", "ARCH§8.4", "SPEC§10")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 def test_approving_a_pending_order_refuses_a_price_moved_past_the_collar() -> None:
     d = desk(mode=TradingMode.LIVE)
     pending = d.check(intent(Side.BUY, 251))
@@ -295,7 +285,6 @@ def test_approving_a_pending_order_refuses_a_price_moved_past_the_collar() -> No
 
 
 @pytest.mark.spec("ARCH§8.1", "ARCH§4.4")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 def test_the_engine_lets_go_of_approvals_once_they_expire() -> None:
     d = desk(mode=TradingMode.LIVE)
     refs: list[weakref.ref[object]] = []

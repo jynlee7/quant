@@ -15,7 +15,8 @@ the intent itself (RiskCheck.INTENT):
 3. LIMITS: long or flat only, gross exposure, the label cap, the single-order cap, and the
    overnight cap on the last decision that can fill (A3).
 4. LOCKS: the daily-loss lock, a drift freeze and rule 6 veto entries.
-5. RATE: more than `max_intents_per_day` intents in a session halts trading (C3).
+5. RATE: more than `max_intents_per_day` intents in a session halts trading (C3). Every
+   intent counts, vetoed or not, and the one past the limit halts whichever check decides it.
 6. PRICE: the limit sits inside the collar of a fresh quote, and every entry carries a stop.
 7. APPROVAL (D7): a live BUY above the notional threshold waits for you; paper flags it.
 
@@ -37,7 +38,11 @@ inclusive boundary such as exactly 2%, 10%, a cap or 10 bp holds however the flo
 would round.
 
 The engine also keeps C3's counters, the daily-loss lock and the drawdown trigger (`mark`, fed
-by the minute monitor, C8). Its state is a RiskState the live engine persists with EngineState.
+by the minute monitor, C8). Its state is a RiskState the live engine persists with EngineState;
+every change reaches the engine's `on_change` before the call that made it returns, so B14 can
+persist it first. Every halt is signalled where it happens: `Veto.halts`,
+`RiskApprovedOrder.halts`, `MarkOutcome.kill`, SubmissionLimitError, and the published state.
+A halt keeps its first reason, and only `resume` (B14's `quant resume`) clears it.
 The kill executor, reconciliation snapshots, the minute monitor itself and the broker port are
 B9b's. "Now" comes from the engine's Clock. Every veto and halt is logged with structlog.
 """
@@ -45,7 +50,8 @@ B9b's. "Now" comes from the engine's Clock. Every veto and halt is logged with s
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -60,7 +66,13 @@ from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.canonical import sha256_hex
 from quant.core.clock import Clock
 from quant.core.epoch import to_us
-from quant.core.errors import ApprovalError, CalendarError, QuantError, RiskError
+from quant.core.errors import (
+    ApprovalError,
+    CalendarError,
+    QuantError,
+    RiskError,
+    SubmissionLimitError,
+)
 from quant.core.model import StrictModel
 from quant.core.orders import (
     SYMBOL,
@@ -79,6 +91,11 @@ log = structlog.get_logger()
 
 _TOKEN: Final = object()
 """The private token every approved type's constructor demands. It never leaves this module."""
+
+INTENT_LIMIT: Final = "daily intent limit exceeded"
+SUBMISSION_LIMIT: Final = "raw submission limit reached"
+DRAWDOWN: Final = "maximum drawdown reached"
+"""The halt reasons the engine's own counters and trigger give (`RiskState.halt_reason`)."""
 
 
 class RiskCheck(StrEnum):
@@ -144,11 +161,13 @@ class RiskApprovedOrder(_Approved):
     - `notional`: `quantity * limit_price`, dollars;
     - `expires_at`: the end of the bar in which the decision executes; `spend` refuses it from
       then on;
-    - `flagged`: a BUY above D7's threshold, approved because the engine trades paper. The
-      engine alerts on it.
+    - `flagged`: a BUY above D7's threshold, approved because the engine trades paper, or one
+      you approved (`approve_pending`). The engine alerts on it;
+    - `halts`: this check halted trading (a risk-reducing intent past C3's intent limit). The
+      caller persists HALTED and alerts, as for a Veto with `halts`.
     """
 
-    __slots__ = ("expires_at", "flagged", "intent", "limit_price", "notional", "quantity")
+    __slots__ = ("expires_at", "flagged", "halts", "intent", "limit_price", "notional", "quantity")
 
     intent: OrderIntent
     quantity: int
@@ -156,6 +175,7 @@ class RiskApprovedOrder(_Approved):
     notional: float
     expires_at: datetime
     flagged: bool
+    halts: bool
 
     def __init__(
         self,
@@ -169,6 +189,7 @@ class RiskApprovedOrder(_Approved):
         issued_at: datetime,
         expires_at: datetime,
         flagged: bool,
+        halts: bool,
     ) -> None:
         _initialize(
             self,
@@ -182,6 +203,7 @@ class RiskApprovedOrder(_Approved):
                 "issued_at": issued_at,
                 "expires_at": expires_at,
                 "flagged": flagged,
+                "halts": halts,
             },
         )
 
@@ -299,8 +321,8 @@ class PendingApproval:
 class Veto:
     """An intent the engine refused. `check` names the first check that failed and `reason`
     says why in plain words. `halts` is True when this verdict halted trading (a reconciliation
-    mismatch, a short position, or the intent past C3's limit); the engine then persists HALTED
-    and alerts."""
+    mismatch, a short position, or the intent past C3's limit, whichever check refused it); the
+    caller then persists HALTED and alerts."""
 
     intent: OrderIntent
     check: RiskCheck
@@ -342,13 +364,13 @@ class RiskState(StrictModel):
     - `session`: the session started last (`start_session`), or None before the first;
     - `start_equity`: that session's start-of-day equity;
     - `peak_equity`: the highest equity seen, across sessions;
-    - `intents`: the intents of this session that reached check 5, as `"<decision_id>#<leg>"`
+    - `intents`: every intent checked this session, vetoed or not, as `"<decision_id>#<leg>"`
       in the order first seen;
     - `submissions`: raw broker submissions this session: RiskApprovedOrders spent;
     - `daily_loss_locked`: entries locked until the next session (spec §10);
-    - `halted`, `halt_reason`: trading halted by this engine, and why. Only a resume (B14)
-      clears it;
-    - `killed`: the drawdown trigger has fired;
+    - `halted`, `halt_reason`: trading halted by this engine, and the first reason it halted
+      for (a later halt keeps it). Only `RiskEngine.resume` clears them;
+    - `killed`: the drawdown trigger has fired. Only `RiskEngine.resume` clears it;
     - `issued`: approvals and pending approvals issued so far, which numbers the next id.
     """
 
@@ -373,7 +395,7 @@ class MarkOutcome:
     - `locked`: the daily-loss lock holds after this mark;
     - `flatten`: this mark set the lock, so the monitor must flatten now;
     - `kill`: this mark fired the drawdown trigger, so the kill switch must run now. It fires
-      once; the engine is halted from then on.
+      once; the engine is halted from then on, until a resume.
     """
 
     equity: float
@@ -427,6 +449,16 @@ class RiskEngine:
 
     Outstanding approvals (see the module docstring) live in the engine object, not in
     RiskState: a restarted engine never honours an earlier object's approvals, so it has none.
+    The engine lets go of an order approval once it expires, of a pending approval once it
+    expires or is approved, and of a cancel or flatten once it is spent.
+
+    **Persisting (C7).** Every public method that changes RiskState calls `on_change` with the
+    new state once, before it returns or raises: `start_session`, `mark`, `resume`, `check`,
+    `approve_pending`, `approve_cancel`, `approve_flatten` and `spend`. The live engine (B14)
+    persists the state there, so a crash after a call never restores a state from before it;
+    `spend` persists the submission before the adapter sends. An exception from `on_change`
+    propagates out of the method (`check` included), so nothing is sent on a state that wasn't
+    saved; the change stays in the engine's memory.
     """
 
     def __init__(
@@ -444,7 +476,8 @@ class RiskEngine:
         """An engine with `config`'s limits, trading in `mode`.
 
         `calendar` defaults to `TradingCalendar.xnys()`, `timing` to `Timing()`, `spent` to a new
-        MemorySpentApprovals, and `state` to `RiskState()`. The engine starts with no approvals
+        MemorySpentApprovals, and `state` to `RiskState()`. `on_change` receives every new state
+        (see the class docstring); None persists nothing. The engine starts with no approvals
         issued: approvals from an earlier engine object are never honoured, even with the same
         `spent` store and state."""
         self._config = config
@@ -459,8 +492,7 @@ class RiskEngine:
         self._outstanding: dict[str, _Hold] = {}  # by "<decision_id>#<leg>"
         self._in_flight: list[_InFlight] = []
         self._revoked: dict[Approval, str] = {}
-        if on_change is not None:
-            raise NotImplementedError("red:B9 on_change")
+        self._on_change = on_change
 
     @property
     def state(self) -> RiskState:
@@ -481,18 +513,41 @@ class RiskEngine:
             raise RiskError(str(exc)) from exc
         if self.state.session is not None and day <= self.state.session:
             raise RiskError("a new session must be later than the current session")
-        self._update(
-            session=day,
-            start_equity=float(equity),
-            peak_equity=max(self.state.peak_equity or equity, equity),
-            intents=(),
-            submissions=0,
-            daily_loss_locked=False,
-        )
+        with self._publishing():
+            self._forget_expired(self._clock.now())
+            self._update(
+                session=day,
+                start_equity=float(equity),
+                peak_equity=max(self.state.peak_equity or equity, equity),
+                intents=(),
+                submissions=0,
+                daily_loss_locked=False,
+            )
 
     def resume(self, *, equity: float) -> None:
-        """Clear a halt (B14's `quant resume`). Not built yet."""
-        raise NotImplementedError("red:B9 resume")
+        """Clear the engine's halt and the drawdown trigger (C8). Only B14's `quant resume`
+        calls it, after your typed confirmation and a clean reconciliation (ARCHITECTURE §8.3).
+
+        `halted`, `halt_reason` and `killed` clear, and the peak rises to `equity` if it is
+        higher. Nothing else changes: the session's intent and submission counts, the
+        daily-loss lock (until the next session) and the peak stay, so a counter already past
+        its limit halts again at the next new intent or submission, and the drawdown trigger is
+        armed again against the same peak. Approvals revoked by the halt stay revoked.
+
+        RiskError, changing nothing, when no session has started, `equity` isn't finite and
+        positive, or `equity` is still `max_drawdown_fraction` or more below the peak (the
+        trigger would fire again at once; lowering the peak is your decision, not the
+        engine's)."""
+        _check_equity(equity)
+        peak = self.state.peak_equity
+        if self.state.session is None or peak is None:
+            raise RiskError("a resume needs a started session")
+        peak = max(peak, equity)
+        if _fell_by(peak, equity, self._config.max_drawdown_fraction):
+            raise RiskError("equity is still past the drawdown limit from the peak")
+        with self._publishing():
+            self._update(peak_equity=float(peak), halted=False, halt_reason=None, killed=False)
+        log.warning("risk_resumed", equity=equity, peak_equity=peak)
 
     def mark(self, equity: float) -> MarkOutcome:
         """One equity mark from the minute monitor, on the freshest price (C8), or from a broker
@@ -518,16 +573,17 @@ class RiskEngine:
         drawdown_breach = _fell_by(peak, equity, self._config.max_drawdown_fraction)
         flatten = daily_breach and not self.state.daily_loss_locked
         kill = drawdown_breach and not self.state.killed
-        self._update(
-            peak_equity=float(peak),
-            daily_loss_locked=self.state.daily_loss_locked or daily_breach,
-            killed=self.state.killed or kill,
-        )
-        if flatten:
-            log.warning("risk_daily_loss_lock", equity=equity, start_equity=start)
-            self._revoke_side(Side.BUY, "the daily-loss lock set")
-        if kill:
-            self._halt("maximum drawdown reached")
+        with self._publishing():
+            self._update(
+                peak_equity=float(peak),
+                daily_loss_locked=self.state.daily_loss_locked or daily_breach,
+                killed=self.state.killed or kill,
+            )
+            if flatten:
+                log.warning("risk_daily_loss_lock", equity=equity, start_equity=start)
+                self._revoke_side(Side.BUY, "the daily-loss lock set")
+            if kill:
+                self._halt(DRAWDOWN)
         return MarkOutcome(
             float(equity),
             (start - equity) / start,
@@ -554,7 +610,13 @@ class RiskEngine:
         Before the precondition, outstanding approvals that have expired are dropped, a
         re-check revokes the earlier approval of the same `"<decision_id>#<leg>"` whatever its
         verdict, and a context with `halted`, `drift_frozen` or not `healthy` revokes every
-        outstanding BUY.
+        outstanding BUY. Then, once a session has started, the intent's key is counted toward
+        C3's limit the first time the engine sees it, whatever the verdict turns out to be;
+        re-checks of a counted key (re-quotes) don't count again. The key that makes
+        `len(state.intents)` exceed `max_intents_per_day` while the engine isn't halted is
+        *over the limit*: its verdict halts trading, whichever check decides it. A Veto then has
+        `halts=True` (the first check that fails still names it), and check 5 below decides
+        only when nothing before it fails.
 
         1. **HALTED.** When `state.halted` or `context.halted`, a BUY is vetoed.
         2. **Reconciliation.** Vetoed when the snapshot is older than `snapshot_max_age_s`
@@ -581,31 +643,38 @@ class RiskEngine:
              decimal values.
         4. **Locks.** A BUY is vetoed while `state.daily_loss_locked`, `context.drift_frozen`,
            or not `context.healthy` (rule 6).
-        5. **Rate.** The intent's key `"<decision_id>#<leg>"` is counted the first time it gets
-           here; re-checks of a counted intent (re-quotes) don't count again. The key that would
-           make `len(state.intents)` exceed `max_intents_per_day` is counted and halts trading:
-           a BUY is vetoed (`halts=True`), and a SELL goes on as it would under HALTED.
+        5. **Rate.** An intent over the limit halts trading: a BUY is vetoed (`halts=True`),
+           and a SELL goes on as it would under HALTED, its approval carrying `halts=True`.
         6. **Price.** Vetoed when the quote is older than `quote_max_age_s` (exactly the maximum
            passes) or from the future, when it is crossed (`bid > ask`), or unless
            `abs(limit_price - ref) <= ref * collar_bp / 10_000` in decimal values, with `ref`
-           the ask for a BUY and the bid for a SELL. A BUY is vetoed unless `intent.stop_price`
-           is set and below `limit_price`.
+           the ask for a BUY and the bid for a SELL. The collar binds SELLs too: spec §10 gives
+           discretionary exits the same ±10 bp, and only the kill switch's exits widen, through
+           a RiskApprovedFlatten that no collar checks. A BUY is vetoed unless
+           `intent.stop_price` is set and below `limit_price`.
         7. **Approval (D7).** A BUY whose notional `intent.quantity * limit_price` exceeds
            `manual_approval_notional` (exactly the threshold doesn't) returns a registered
            PendingApproval when `mode` is LIVE, and a RiskApprovedOrder with `flagged=True`
-           when it is PAPER.
+           when it is PAPER. Approving a PendingApproval vetoes a price moved more than the
+           collar above the one you were asked about (`approve_pending`).
 
         A pass returns a registered RiskApprovedOrder, expiring at the window's end, and
         outstanding from then on. Checking never raises for a bad intent or context: every
-        refusal is a Veto.
+        refusal is a Veto. Only `on_change` can make it raise (class docstring).
         """
-        return self._check(intent, context, manual_approval=False)
+        with self._publishing():
+            return self._check(intent, context, pending=None)
 
     def approve_pending(self, pending: PendingApproval, context: RiskContext) -> RiskVerdict:
         """Your approval of `pending` (D7, ARCHITECTURE §8.4): checks 1–6 run again on its intent
         with `context`, and a pass returns a RiskApprovedOrder with `flagged=True`. A Veto is
         returned as from `check`. The intent is not counted again. A PendingApproval holds no
         exposure, so approving it counts every approval outstanding by then.
+
+        You approved the order at `pending.limit_price`, so check 7 vetoes it when
+        `context.limit_price` is more than `collar_bp` above that price, in decimal values
+        (exactly the collar passes; a lower price always does). The pending approval stays
+        approvable until it expires, at a price that passes.
 
         ApprovalError when this engine object didn't issue `pending` (judged by identity), it
         was already approved, or `now >= pending.expires_at`."""
@@ -616,7 +685,8 @@ class RiskEngine:
             raise ApprovalError("pending approval was not issued here or has changed")
         if self._clock.now() >= pending.expires_at:
             raise ApprovalError("pending approval has expired")
-        verdict = self._check(pending.intent, context, manual_approval=True)
+        with self._publishing():
+            verdict = self._check(pending.intent, context, pending=pending)
         if isinstance(verdict, RiskApprovedOrder):
             del self._pending[pending]
         return verdict
@@ -624,40 +694,46 @@ class RiskEngine:
     def approve_cancel(self, client_order_id: str, *, reason: str) -> RiskApprovedCancel:
         """A registered approval to cancel `client_order_id`, issued whatever the state."""
         now = self._clock.now()
-        approval = RiskApprovedCancel(
-            token=_TOKEN,
-            approval_id=self._next_id("C", now),
-            client_order_id=client_order_id,
-            reason=reason,
-            issued_at=now,
-        )
-        self._issued[approval] = _Issued(_approval_fields(approval))
+        with self._publishing():
+            approval = RiskApprovedCancel(
+                token=_TOKEN,
+                approval_id=self._next_id("C", now),
+                client_order_id=client_order_id,
+                reason=reason,
+                issued_at=now,
+            )
+            self._issued[approval] = _Issued(_approval_fields(approval))
         return approval
 
     def approve_flatten(self, *, reason: str) -> RiskApprovedFlatten:
         """A registered approval for the kill switch to close the whole SPY position, issued
         whatever the state."""
         now = self._clock.now()
-        approval = RiskApprovedFlatten(
-            token=_TOKEN,
-            approval_id=self._next_id("F", now),
-            symbol=SYMBOL,
-            reason=reason,
-            issued_at=now,
-        )
-        self._issued[approval] = _Issued(_approval_fields(approval))
+        with self._publishing():
+            approval = RiskApprovedFlatten(
+                token=_TOKEN,
+                approval_id=self._next_id("F", now),
+                symbol=SYMBOL,
+                reason=reason,
+                issued_at=now,
+            )
+            self._issued[approval] = _Issued(_approval_fields(approval))
         return approval
 
     def release(self, approval: RiskApprovedOrder) -> None:
         """Give up `approval` unsent: execution calls this when it drops an approved order
         without sending it. The approval stops holding exposure or shares, and `spend` refuses
         it from then on. Releasing one already spent, released, revoked or expired changes
-        nothing.
+        nothing; an expired one isn't even looked up, since the engine lets go of it.
 
         ApprovalError, as in `spend` cases 1–3, when `approval` is not exactly a
         RiskApprovedOrder this engine object issued."""
         if type(approval) is not RiskApprovedOrder:
             raise ApprovalError("only an approved order can be released")
+        if getattr(approval, "_token", None) is not _TOKEN:
+            raise ApprovalError("approval is missing the risk engine's private token")
+        if self._clock.now() >= approval.expires_at:
+            return
         issued = self._registered(approval)
         hold = self._outstanding.get(issued.key)
         if hold is not None and hold.approval is approval:
@@ -678,15 +754,18 @@ class RiskEngine:
         4. a RiskApprovedOrder at or after its `expires_at`;
         5. an id the SpentApprovals store already holds (reused);
         6. a RiskApprovedOrder that was released or revoked, so no longer outstanding;
-        7. a BUY while `state.halted`, `state.killed` or `state.daily_loss_locked`; and a BUY
-           that would be submission number `submission_halt_at` this session, which halts
-           trading. A SELL is never refused here; it is counted, and halts trading the same way
-           when it reaches the number.
+        7. SubmissionLimitError, halting trading, for a BUY when the session already has
+           `submission_halt_at` submissions (reachable only after a resume, since reaching the
+           number halts); ApprovalError for a BUY while `state.halted`, `state.killed` or
+           `state.daily_loss_locked`. A SELL is never refused here.
 
         Then the id is recorded in the store (`spend` returning False is case 5). A
-        RiskApprovedOrder counts as one raw submission (C3) and is in flight from now on; a
-        RiskApprovedFlatten revokes every outstanding order approval. Cancels and flattens never
-        count as submissions.
+        RiskApprovedOrder counts as one raw submission (C3) and is in flight from now on; the
+        submission that brings the count to `submission_halt_at` or past it is sent and halts
+        trading (C3 halts *at* 60, so the 60th goes out, BUY or SELL). A RiskApprovedFlatten
+        revokes every outstanding order approval. Cancels and flattens never count as
+        submissions, and the engine lets go of them once spent. Every change is published
+        through `on_change` before `spend` returns or raises.
         """
         if type(approval) not in (RiskApprovedOrder, RiskApprovedCancel, RiskApprovedFlatten):
             raise ApprovalError("expected exactly an approved order, cancel or flatten")
@@ -697,26 +776,31 @@ class RiskEngine:
             raise ApprovalError("order approval has expired")
         if self._spent.is_spent(approved.approval_id):
             raise ApprovalError("approval has already been spent")
-        if isinstance(approved, RiskApprovedOrder):
-            hold = self._outstanding.get(issued.key)
-            if hold is None or hold.approval is not approved:
-                reason = self._revoked.get(approved, "it is no longer outstanding")
-                raise ApprovalError(f"order approval was revoked: {reason}")
-            buy = hold.side is Side.BUY
-            if buy and (self.state.halted or self.state.killed or self.state.daily_loss_locked):
-                raise ApprovalError("entries are halted or locked")
-            if self.state.submissions + 1 >= self._config.submission_halt_at:
-                self._halt("raw submission limit reached")
-                if buy:
-                    raise ApprovalError("raw submission limit reached")
-        if not self._spent.spend(approved.approval_id, now):
-            raise ApprovalError("approval has already been spent")
-        if isinstance(approved, RiskApprovedOrder):
-            hold = self._outstanding.pop(issued.key)
-            self._in_flight.append(_InFlight(hold.side, hold.quantity, now))
-            self._update(submissions=self.state.submissions + 1)
-        elif isinstance(approved, RiskApprovedFlatten):
-            self._revoke_side(None, "a flatten was sent")
+        with self._publishing():
+            limit = self._config.submission_halt_at
+            if isinstance(approved, RiskApprovedOrder):
+                hold = self._outstanding.get(issued.key)
+                if hold is None or hold.approval is not approved:
+                    reason = self._revoked.get(approved, "it is no longer outstanding")
+                    raise ApprovalError(f"order approval was revoked: {reason}")
+                if hold.side is Side.BUY:
+                    if self.state.submissions >= limit:
+                        self._halt(SUBMISSION_LIMIT)
+                        raise SubmissionLimitError(SUBMISSION_LIMIT)
+                    if self.state.halted or self.state.killed or self.state.daily_loss_locked:
+                        raise ApprovalError("entries are halted or locked")
+            if not self._spent.spend(approved.approval_id, now):
+                raise ApprovalError("approval has already been spent")
+            if isinstance(approved, RiskApprovedOrder):
+                hold = self._outstanding.pop(issued.key)
+                self._in_flight.append(_InFlight(hold.side, hold.quantity, now))
+                self._update(submissions=self.state.submissions + 1)
+                if self.state.submissions >= limit:
+                    self._halt(SUBMISSION_LIMIT)
+            else:
+                del self._issued[approved]
+                if isinstance(approved, RiskApprovedFlatten):
+                    self._revoke_side(None, "a flatten was sent")
         return approved
 
     def _registered(self, approved: Approval) -> _Issued:
@@ -745,46 +829,79 @@ class RiskEngine:
                 self._revoke(key, reason)
 
     def _forget_expired(self, now: datetime) -> None:
-        """Drop outstanding approvals that have expired, and in-flight orders every acceptable
-        snapshot must already show."""
+        """Let go of approvals that have expired (outstanding, issued, revoked and pending), and
+        of in-flight orders every acceptable snapshot must already show."""
         for key, hold in list(self._outstanding.items()):
             if now >= hold.expires_at:
                 del self._outstanding[key]
+        for approval, issued in list(self._issued.items()):
+            if issued.expires_at is not None and now >= issued.expires_at:
+                del self._issued[approval]
+                self._revoked.pop(approval, None)
+        for pending in [p for p in self._pending if now >= p.expires_at]:
+            del self._pending[pending]
         horizon = now - timedelta(seconds=self._config.snapshot_max_age_s)
         self._in_flight = [f for f in self._in_flight if f.spent_at >= horizon]
+
+    @contextmanager
+    def _publishing(self) -> Iterator[None]:
+        """Run the body, then hand `on_change` the state if the body changed it, even when the
+        body raises (class docstring)."""
+        before = self._state
+        try:
+            yield
+        finally:
+            if self._on_change is not None and self._state != before:
+                self._on_change(self._state)
 
     def _update(self, **changes: Any) -> None:
         self._state = self.state.model_copy(update=changes)
 
     def _halt(self, reason: str) -> None:
-        self._update(halted=True, halt_reason=reason)
-        log.error("risk_halted", reason=reason)
+        """Halt trading. A halt already in force keeps its first reason (C10)."""
+        first = self.state.halt_reason if self.state.halted else None
+        self._update(halted=True, halt_reason=first or reason)
+        log.error("risk_halted", reason=reason, halt_reason=self.state.halt_reason)
         self._revoke_side(Side.BUY, f"trading halted: {reason}")
-
-    def _veto(
-        self, intent: OrderIntent, check: RiskCheck, reason: str, *, halts: bool = False
-    ) -> Veto:
-        if halts:
-            self._halt(reason)
-        log.warning("risk_veto", check=check.value, reason=reason, halts=halts)
-        return Veto(intent, check, reason, halts)
 
     def _next_id(self, prefix: str, now: datetime) -> str:
         self._update(issued=self.state.issued + 1)
         return f"{prefix}{self.state.issued}-{to_us(now)}"
 
+    def _count(self, key: str) -> bool:
+        """Count `key` toward C3's intent limit if a session has started and it is new. True when
+        this made the count exceed the limit while the engine wasn't halted (`check`)."""
+        if self.state.session is None or key in self.state.intents:
+            return False
+        self._update(intents=(*self.state.intents, key))
+        return len(self.state.intents) > self._config.max_intents_per_day and not (
+            self.state.halted
+        )
+
     def _check(
-        self, intent: OrderIntent, context: RiskContext, *, manual_approval: bool
+        self, intent: OrderIntent, context: RiskContext, *, pending: PendingApproval | None
     ) -> RiskVerdict:
         now = self._clock.now()
         config = self._config
         stage = RiskCheck.INTENT
+        over = False  # this intent is over C3's limit, so its verdict halts trading
+
+        def veto(reason: str, *, halts: bool = False) -> Veto:
+            if halts:
+                self._halt(reason)
+            if over:
+                self._halt(INTENT_LIMIT)
+            log.warning("risk_veto", check=stage.value, reason=reason, halts=halts or over)
+            return Veto(intent, stage, reason, halts or over)
+
         try:
             self._forget_expired(now)
             key = f"{intent.decision_id}#{intent.leg}"
             self._revoke(key, "replaced by a re-check of its intent")
             if context.halted or context.drift_frozen or not context.healthy:
                 self._revoke_side(Side.BUY, "a check saw HALTED, a drift freeze or rule 6")
+            if pending is None:
+                over = self._count(key)
             # Revalidate even a model constructed or copied without pydantic validation.
             OrderIntent.model_validate(intent.model_dump())
             day = intent.tau.astimezone(NEW_YORK).date()
@@ -797,7 +914,7 @@ class RiskEngine:
                 None,
             )
             if decision is None:
-                return self._veto(intent, stage, "intent is not a scheduled decision")
+                return veto("intent is not a scheduled decision")
             execution_day = decision.executes_at.astimezone(NEW_YORK).date()
             session = self._calendar.session(execution_day)
             expires = next(
@@ -806,14 +923,14 @@ class RiskEngine:
                 if bar.t_open <= decision.executes_at < bar.t_close
             )
             if self.state.session != execution_day:
-                return self._veto(intent, stage, "intent needs its execution session started")
+                return veto("intent needs its execution session started")
             if not decision.executes_at <= now < expires:
-                return self._veto(intent, stage, "intent is outside its execution window")
+                return veto("intent is outside its execution window")
             buy = intent.side is Side.BUY
 
             stage = RiskCheck.HALTED
             if buy and (self.state.halted or context.halted):
-                return self._veto(intent, stage, "trading is halted")
+                return veto("trading is halted")
 
             stage = RiskCheck.RECONCILIATION
             broker, book = context.broker, context.book
@@ -821,15 +938,13 @@ class RiskEngine:
             InternalBook.model_validate(book.model_dump())
             age = (now - broker.taken_at).total_seconds()
             if not 0 <= age <= config.snapshot_max_age_s:
-                return self._veto(intent, stage, "broker snapshot is stale or from the future")
+                return veto("broker snapshot is stale or from the future")
             if (
                 broker.position < 0
                 or broker.position != book.position
                 or Counter(broker.open_orders) != Counter(book.open_orders)
             ):
-                return self._veto(
-                    intent,
-                    stage,
+                return veto(
                     "broker and internal positions or orders disagree, or the position is short",
                     halts=True,
                 )
@@ -853,7 +968,7 @@ class RiskEngine:
                 self._revoke_side(Side.SELL, "a snapshot holds fewer shares than they reserve")
             if buy:
                 if decision.reduce_only:
-                    return self._veto(intent, stage, "this decision can only reduce exposure")
+                    return veto("this decision can only reduce exposure")
                 held = (
                     broker.position
                     + quantity
@@ -876,57 +991,53 @@ class RiskEngine:
                 # Invalid prices are refused by PRICE; they cannot earn an approval.
                 equity = _exact(broker.equity)
                 if valid_price and _exact(held) * _exact(price) > _exact(cap) * equity:
-                    return self._veto(intent, stage, "resulting position exceeds its exposure cap")
+                    return veto("resulting position exceeds its exposure cap")
                 if valid_price and _exact(quantity) * _exact(price) > (
                     _exact(config.single_order_cap) * equity
                 ):
-                    return self._veto(intent, stage, "order exceeds the single-order cap")
+                    return veto("order exceeds the single-order cap")
             else:
                 quantity = min(quantity, sellable - self._outstanding_quantity(Side.SELL))
                 if quantity <= 0:
-                    return self._veto(intent, stage, "no unreserved shares remain to sell")
+                    return veto("no unreserved shares remain to sell")
 
             stage = RiskCheck.LOCKS
             if buy:
                 if self.state.daily_loss_locked:
-                    return self._veto(intent, stage, "daily-loss lock blocks entries")
+                    return veto("daily-loss lock blocks entries")
                 if context.drift_frozen:
-                    return self._veto(intent, stage, "drift freeze blocks entries")
+                    return veto("drift freeze blocks entries")
                 if not context.healthy:
-                    return self._veto(intent, stage, "rule 6 blocks entries")
+                    return veto("rule 6 blocks entries")
 
             stage = RiskCheck.RATE
-            if key not in self.state.intents:
-                self._update(intents=(*self.state.intents, key))
-            if len(self.state.intents) > config.max_intents_per_day:
-                if buy:
-                    return self._veto(intent, stage, "daily intent limit exceeded", halts=True)
-                self._halt("daily intent limit exceeded")
+            if over and buy:
+                return veto(INTENT_LIMIT)
 
             stage = RiskCheck.PRICE
             quote = context.quote
             Quote.model_validate(quote.model_dump())
             age = (now - quote.at).total_seconds()
             if not 0 <= age <= config.quote_max_age_s:
-                return self._veto(intent, stage, "quote is stale or from the future")
+                return veto("quote is stale or from the future")
             if quote.bid > quote.ask:
-                return self._veto(intent, stage, "quote is crossed")
+                return veto("quote is crossed")
             ref = _exact(quote.ask if buy else quote.bid)
-            if (
-                not valid_price
-                or abs(_exact(price) - ref) > ref * _exact(config.collar_bp) / 10_000
-            ):
-                return self._veto(intent, stage, "limit price is invalid or outside the collar")
+            collar = _exact(config.collar_bp) / 10_000
+            if not valid_price or abs(_exact(price) - ref) > ref * collar:
+                return veto("limit price is invalid or outside the collar")
             if buy and (intent.stop_price is None or intent.stop_price >= price):
-                return self._veto(intent, stage, "entry needs a protective stop below its limit")
+                return veto("entry needs a protective stop below its limit")
             notional = quantity * price
             if not isfinite(notional):
-                return self._veto(intent, stage, "order notional must be finite")
+                return veto("order notional must be finite")
 
             stage = RiskCheck.APPROVAL
+            if pending is not None and _exact(price) > _exact(pending.limit_price) * (1 + collar):
+                return veto("re-priced more than the collar above the price you approved")
             large = buy and notional > config.manual_approval_notional
-            if large and self._mode is TradingMode.LIVE and not manual_approval:
-                pending = PendingApproval(
+            if large and self._mode is TradingMode.LIVE and pending is None:
+                waiting = PendingApproval(
                     self._next_id("P", now),
                     intent,
                     quantity,
@@ -935,12 +1046,14 @@ class RiskEngine:
                     now,
                     expires,
                 )
-                self._pending[pending] = _pending_fields(pending)
+                self._pending[waiting] = _pending_fields(waiting)
                 log.warning(
-                    "risk_pending_approval", pending_id=pending.pending_id, notional=notional
+                    "risk_pending_approval", pending_id=waiting.pending_id, notional=notional
                 )
-                return pending
-            flagged = large or manual_approval
+                return waiting
+            if over:
+                self._halt(INTENT_LIMIT)  # a reduction past the limit passes, and halts
+            flagged = large or pending is not None
             approval = RiskApprovedOrder(
                 token=_TOKEN,
                 approval_id=self._next_id("O", now),
@@ -951,8 +1064,11 @@ class RiskEngine:
                 issued_at=now,
                 expires_at=expires,
                 flagged=flagged,
+                halts=over,
             )
-            self._issued[approval] = _Issued(_approval_fields(approval), key, _intent_hash(intent))
+            self._issued[approval] = _Issued(
+                _approval_fields(approval), key, _intent_hash(intent), expires
+            )
             self._outstanding[key] = _Hold(approval, intent.side, quantity, expires)
             if flagged:
                 log.warning(
@@ -960,7 +1076,7 @@ class RiskEngine:
                 )
             return approval
         except (QuantError, ValueError, TypeError, AttributeError, ArithmeticError) as exc:
-            return self._veto(intent, stage, f"invalid intent or context: {exc}")
+            return veto(f"invalid intent or context: {exc}")
 
     def _outstanding_quantity(self, side: Side) -> int:
         return sum(hold.quantity for hold in self._outstanding.values() if hold.side is side)
@@ -971,7 +1087,7 @@ def verdict_record(verdict: RiskVerdict) -> dict[str, Any]:
     JSON. Never the token.
 
     - approved: `{"verdict": "approved", "approval_id", "intent", "quantity", "limit_price",
-      "notional", "issued_at", "expires_at", "flagged"}`;
+      "notional", "issued_at", "expires_at", "flagged", "halts"}`;
     - pending: `{"verdict": "pending", "pending_id", "intent", "quantity", "limit_price",
       "notional", "issued_at", "expires_at"}`;
     - veto: `{"verdict": "veto", "intent", "check", "reason", "halts"}`, `check` as its value.
@@ -997,18 +1113,24 @@ def verdict_record(verdict: RiskVerdict) -> dict[str, Any]:
     if isinstance(verdict, PendingApproval):
         record.update(verdict="pending", pending_id=verdict.pending_id)
     else:
-        record.update(verdict="approved", approval_id=verdict.approval_id, flagged=verdict.flagged)
+        record.update(
+            verdict="approved",
+            approval_id=verdict.approval_id,
+            flagged=verdict.flagged,
+            halts=verdict.halts,
+        )
     return record
 
 
 @dataclass(frozen=True)
 class _Issued:
     """How the engine registered an approval: its fields as issued and, for an order, the key
-    of its intent and the intent's canonical hash."""
+    of its intent, the intent's canonical hash and its expiry."""
 
     fields: tuple[object, ...]
     key: str = ""
     intent_hash: str | None = None
+    expires_at: datetime | None = None  # an order's; the engine lets go of it from then on
 
 
 @dataclass(frozen=True, eq=False)

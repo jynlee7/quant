@@ -1,6 +1,6 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.5 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). Each change is tagged where it lands.
+**Status:** APPROVED v1.7 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). v1.7 records how B9 built the risk engine: the checks' precondition, how approvals hold exposure until they are spent, how intents and submissions are counted, how halts are signalled, persisted and resumed, and that SELLs keep the ±10 bp collar (§4.4, §8.1). Each change is tagged where it lands.
 **Builds on:** [SPEC.md](SPEC.md) v1.2, which is v1.0 plus this document's C1–C10 and the plan's C11–C17
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
@@ -190,7 +190,7 @@ Steps 2–11 are the pure core. Features, the filter and every accumulator are s
 
 ### 4.4 Typed choke points
 
-- **`RiskApprovedOrder`** is a frozen type whose constructor demands a private token held by `risk.engine`. It carries the intent, an approval id and an expiry at the end of the bar. The Alpaca adapter's `submit` accepts nothing else, refuses expired approvals, and spends each approval id once (persisted, so a restart can't reuse one). Cancels and kill-switch closes use `RiskApprovedCancel` and `RiskApprovedFlatten`, which the risk engine always issues because they only reduce risk. The adapter has no other method that changes anything at the broker. (I4)
+- **`RiskApprovedOrder`** is a frozen type whose constructor demands a private token held by `risk.engine`. It carries the intent, an approval id and an expiry at the end of the bar. The Alpaca adapter's `submit` accepts nothing else, refuses expired approvals, and spends each approval id once (persisted, so a restart can't reuse one). Cancels and kill-switch closes use `RiskApprovedCancel` and `RiskApprovedFlatten`, which the risk engine always issues because they only reduce risk. The adapter has no other method that changes anything at the broker. (I4) The adapter spends an approval through `RiskEngine.spend` right before it sends. That refuses copies, forgeries, changed approvals, and approvals that have expired, been spent, been released or been revoked. Until it is spent, an approval holds its exposure or its shares (B9, §8.1).
 - **`TrialTicket`** is issued only by the trial ledger, after it has appended the trial. The walk-forward refuses to score the development period without one. (A2) It also refuses a ticket whose `config_hash` or `code_hash` differs from the release and code it runs, and it runs yardsticks (baselines and cost-sensitivity runs) only inside the measured run's own walk-forward, under that run's ticket (B10, built in B11).
 - **Live broker client:** the constructor requires `TRADING_MODE=live` *and* `golive.verify()` to pass. v1 ships with the checklist unsigned, so the constructor always refuses. (I5)
 
@@ -306,6 +306,34 @@ The engine tracks the 35-bar rolling mean of the predictive log-likelihood. When
 Risk-reducing intents skip the caps in 3, the locks in 4 and the approval in 7. They are clamped so they can never flip the position short.
 
 Limits load from `config/risk.yaml` at start and are frozen. The engine refuses to start if that file differs from the committed version, and any change on disk sends an alert.
+
+**How B9 built it (v1.7).** These rules come from building and reviewing the engine; none changes an approved limit.
+
+- **Before check 1:** the engine looks τ up in the decision schedule itself. An intent must be a scheduled decision, checked inside its execution window, with its execution session started. The window runs from the decision's execution time to the end of that bar, so the closing bar's intent executes in the next session's first bar. Anything else is vetoed and never sent late.
+- **Prices:** the caller proposes the limit, check 6 checks it, and every exposure is valued at it. Working BUY limits count as held.
+- **SELLs:** in a long-or-flat system a SELL is exactly a risk-reducing intent. The clamp subtracts working SELL limits and SELLs already approved, but not the stop, because execution cancels the stop before it sells (§8.2). The ±10 bp collar binds SELLs too, as spec §10 says for discretionary exits. Only the kill switch's exits widen, through `RiskApprovedFlatten`, which no collar checks. So §8.2's exit that "keeps re-quoting, widening each time" re-quotes around each fresh bid and stays within 10 bp of it. This is an open question for you: allowing more than 10 bp would change spec §10.
+- **Counting intents (C3):** every intent the engine checks after a session has started counts once for its decision and leg, whether it is vetoed or not. Re-quotes don't count again. The 21st intent halts trading, whichever check decides it. A BUY is vetoed; a SELL passes.
+- **Counting submissions (C3):** a submission is counted when the adapter spends the approval. C3 halts *at* 60, so the 60th submission goes out, BUY or SELL, and trading halts. After a resume, a BUY at or past 60 is refused with `SubmissionLimitError` and halts trading again. A SELL is never refused.
+- **Outstanding approvals:** an approval is risk until it is sent. Unspent BUYs count in the gross, label and overnight caps, and unspent SELLs reserve their shares. A spent order keeps counting until a broker snapshot taken after the spend can show it.
+- **Revocation:** re-checking the same decision and leg replaces the earlier approval. These revoke every unspent BUY:
+  - HALTED;
+  - a drift freeze or rule 6 in the context;
+  - the daily-loss lock;
+  - any halt.
+
+  A snapshot holding fewer shares than the SELLs reserve (the stop fired) revokes the SELLs. A spent flatten revokes every unspent order.
+- **Pending approvals (D7):** a PendingApproval reserves nothing. Approving it re-runs checks 1–6 against everything outstanding by then. It is vetoed if the price has risen more than the collar above the price you were asked about. The single-order cap applies to each approval that can be spent.
+- **Spending:**
+  - The adapter calls `RiskEngine.spend` right before it sends. It takes the intent's canonical hash at issue and checks it at spend, so a changed intent is refused.
+  - It refuses a BUY once trading is halted, killed or locked.
+  - Cancels and flattens never expire and never count as submissions.
+  - Execution (B13) calls `release` on any approval it drops. On a re-quote it spends the old approval before it re-checks.
+- **Ids:** approval ids are `{O|C|F|P}{n}-{µs}`, where the counter n is kept in the risk state. The engine lets go of an order or pending approval when it expires, and of a cancel or flatten once it is spent.
+- **Exact limits:** `mark`, the caps, the single-order cap and the collar compare the decimal values the floats print as. So exactly 2%, 10%, a cap or 10 bp lands on the inclusive side. D7's $25,000 still compares floats.
+- **Halts are signalled where they happen:** `Veto.halts`, `RiskApprovedOrder.halts` (a SELL past the intent limit), `MarkOutcome.kill`, `SubmissionLimitError`, and the published state. A later halt keeps the first halt's reason.
+- **Persisting:** each call that changes the risk state hands the new state to the engine's `on_change` before it returns or raises. The live engine (B14) persists it there, so `spend` saves the submission before anything is sent. If `on_change` fails, the call raises and nothing is sent. Outstanding approvals live only in the engine object, so a restart starts with none.
+- **Resume:** `RiskEngine.resume(equity)`, behind `quant resume` (§8.3), clears HALTED, its reason and the drawdown trigger. It keeps the session's counts, the daily-loss lock and the peak. It refuses while equity is still 10% or more below the peak, because the trigger would fire again at once. Whether a resume after a drawdown kill may lower the peak is yours to decide (B14).
+- **`risk.yaml`** leaves out the kill switch's settings; B9b adds them.
 
 ### 8.2 Execution
 

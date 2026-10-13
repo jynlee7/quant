@@ -380,18 +380,7 @@ def test_5_a_risk_reducing_twenty_first_intent_halts_and_still_passes() -> None:
 
 
 @pytest.mark.spec("C3", "ARCH§4.4", "SPEC§10")
-@pytest.mark.parametrize(
-    "side",
-    [
-        pytest.param(
-            Side.BUY,
-            id=str(Side.BUY),
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=ApprovalError),
-        ),
-        Side.SELL,
-    ],
-    ids=str,
-)
+@pytest.mark.parametrize("side", [Side.BUY, Side.SELL], ids=str)
 def test_the_sixtieth_raw_submission_halts_trading(side: Side) -> None:
     d = desk()
     order_intent = intent(side, 1)
@@ -585,23 +574,8 @@ ORDER_CASES: dict[str, Case] = {
 }
 
 
-RED_ORDER_CASES = {"locks, then rate": AssertionError}  # B9a review 2, R6
-
-
 @pytest.mark.spec("ARCH§8.1", "C3")
-@pytest.mark.parametrize(
-    "case",
-    [
-        pytest.param(
-            case,
-            id=name,
-            marks=[pytest.mark.xfail(strict=True, reason="red:B9", raises=RED_ORDER_CASES[name])]
-            if name in RED_ORDER_CASES
-            else [],
-        )
-        for name, case in ORDER_CASES.items()
-    ],
-)
+@pytest.mark.parametrize("case", ORDER_CASES.values(), ids=ORDER_CASES.keys())
 def test_the_first_failing_check_decides(case: Case) -> None:
     assert tuple(RiskCheck) == CHECK_ORDER
     verdict, first, halts = case()
