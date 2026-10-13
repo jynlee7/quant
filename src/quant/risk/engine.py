@@ -45,6 +45,7 @@ B9b's. "Now" comes from the engine's Clock. Every veto and halt is logged with s
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -438,6 +439,7 @@ class RiskEngine:
         timing: Timing | None = None,
         spent: SpentApprovals | None = None,
         state: RiskState | None = None,
+        on_change: Callable[[RiskState], None] | None = None,
     ) -> None:
         """An engine with `config`'s limits, trading in `mode`.
 
@@ -457,6 +459,8 @@ class RiskEngine:
         self._outstanding: dict[str, _Hold] = {}  # by "<decision_id>#<leg>"
         self._in_flight: list[_InFlight] = []
         self._revoked: dict[Approval, str] = {}
+        if on_change is not None:
+            raise NotImplementedError("red:B9 on_change")
 
     @property
     def state(self) -> RiskState:
@@ -485,6 +489,10 @@ class RiskEngine:
             submissions=0,
             daily_loss_locked=False,
         )
+
+    def resume(self, *, equity: float) -> None:
+        """Clear a halt (B14's `quant resume`). Not built yet."""
+        raise NotImplementedError("red:B9 resume")
 
     def mark(self, equity: float) -> MarkOutcome:
         """One equity mark from the minute monitor, on the freshest price (C8), or from a broker

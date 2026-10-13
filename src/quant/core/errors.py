@@ -66,3 +66,9 @@ class ApprovalError(RiskError):
     without its token, never issued by this engine (copies, other engines' approvals), changed
     since it was issued, expired, already spent, or risk-increasing while trading is halted (I4,
     K5, ARCHITECTURE §4.4)."""
+
+
+class SubmissionLimitError(ApprovalError):
+    """A genuine BUY approval refused at spend because the session has already reached C3's raw
+    submission limit (spec §10). Unlike the other ApprovalErrors it says nothing is wrong with
+    the approval itself; the refusal halts trading."""

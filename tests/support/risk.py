@@ -8,6 +8,7 @@ Thanksgiving 2018, which closes at 13:00 ET.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -166,9 +167,11 @@ def desk(
     spent: SpentApprovals | None = None,
     state: RiskState | None = None,
     risk_config: RiskConfig | None = None,
+    on_change: Callable[[RiskState], None] | None = None,
 ) -> Desk:
     """A desk whose clock reads `at` (default: 30 s after DAY's first decision). It starts
-    session `day` with `equity` unless `state` is given or `day` is None."""
+    session `day` with `equity` unless `state` is given or `day` is None. `on_change` receives
+    every new RiskState, as B14 will persist it."""
     clock = SimClock(decisions()[0].tau + timedelta(seconds=30) if at is None else at)
     engine = RiskEngine(
         config() if risk_config is None else risk_config,
@@ -177,6 +180,7 @@ def desk(
         calendar=CAL,
         spent=spent,
         state=state,
+        on_change=on_change,
     )
     if state is None and day is not None:
         engine.start_session(day, equity=equity)

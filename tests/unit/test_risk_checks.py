@@ -380,7 +380,18 @@ def test_5_a_risk_reducing_twenty_first_intent_halts_and_still_passes() -> None:
 
 
 @pytest.mark.spec("C3", "ARCH§4.4", "SPEC§10")
-@pytest.mark.parametrize("side", [Side.BUY, Side.SELL], ids=str)
+@pytest.mark.parametrize(
+    "side",
+    [
+        pytest.param(
+            Side.BUY,
+            id=str(Side.BUY),
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=ApprovalError),
+        ),
+        Side.SELL,
+    ],
+    ids=str,
+)
 def test_the_sixtieth_raw_submission_halts_trading(side: Side) -> None:
     d = desk()
     order_intent = intent(side, 1)
@@ -393,14 +404,11 @@ def test_the_sixtieth_raw_submission_halts_trading(side: Side) -> None:
     assert d.engine.state.submissions == 59
     assert not d.engine.state.halted
     last = approved(d.check(order_intent, position=100))
-    if side is Side.BUY:
-        with pytest.raises(ApprovalError):
-            d.engine.spend(last)
-        assert d.engine.state.submissions == 59
-    else:
-        assert d.engine.spend(last) is last
-        assert d.engine.state.submissions == 60
+    # C3 halts *at* 60: the 60th submission is sent, whatever its side, and then trading halts.
+    assert d.engine.spend(last) is last
+    assert d.engine.state.submissions == 60
     assert d.engine.state.halted
+    vetoed(d.check(intent(Side.BUY, 1, leg=2), position=100), RiskCheck.HALTED)
 
 
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "I4")
@@ -513,7 +521,8 @@ def test_7_a_pending_approval_expires_rechecks_and_cannot_be_forged() -> None:
 
 # --- the order of the checks -----------------------------------------------------------------------
 
-Case = Callable[[], tuple[RiskVerdict, RiskCheck]]
+Case = Callable[[], tuple[RiskVerdict, RiskCheck, bool]]
+"""A verdict, the check that must decide it, and whether it halts trading."""
 
 
 def _twenty_intents(d: Desk) -> None:
@@ -521,45 +530,48 @@ def _twenty_intents(d: Desk) -> None:
         approved(d.check(intent(Side.BUY, 1, leg=leg)))
 
 
-def _intent_before_halted() -> tuple[RiskVerdict, RiskCheck]:
+def _intent_before_halted() -> tuple[RiskVerdict, RiskCheck, bool]:
     d = desk()
     late = intent(tau=decisions()[0].tau - timedelta(minutes=1))
-    return d.check(late, halted=True), RiskCheck.INTENT
+    return d.check(late, halted=True), RiskCheck.INTENT, False
 
 
-def _halted_before_reconciliation() -> tuple[RiskVerdict, RiskCheck]:
+def _halted_before_reconciliation() -> tuple[RiskVerdict, RiskCheck, bool]:
     d = desk()
-    return d.check(intent(), halted=True, snapshot_age=FIVE_S + US), RiskCheck.HALTED
+    return d.check(intent(), halted=True, snapshot_age=FIVE_S + US), RiskCheck.HALTED, False
 
 
-def _reconciliation_before_limits() -> tuple[RiskVerdict, RiskCheck]:
+def _reconciliation_before_limits() -> tuple[RiskVerdict, RiskCheck, bool]:
     d = desk()
-    return d.check(intent(Side.BUY, 501), snapshot_age=FIVE_S + US), RiskCheck.RECONCILIATION
+    verdict = d.check(intent(Side.BUY, 501), snapshot_age=FIVE_S + US)
+    return verdict, RiskCheck.RECONCILIATION, False
 
 
-def _limits_before_locks() -> tuple[RiskVerdict, RiskCheck]:
+def _limits_before_locks() -> tuple[RiskVerdict, RiskCheck, bool]:
     d = desk()
-    return d.check(intent(Side.BUY, 501), drift_frozen=True), RiskCheck.LIMITS
+    return d.check(intent(Side.BUY, 501), drift_frozen=True), RiskCheck.LIMITS, False
 
 
-def _locks_before_rate() -> tuple[RiskVerdict, RiskCheck]:
+def _locks_before_rate() -> tuple[RiskVerdict, RiskCheck, bool]:
     d = desk()
     _twenty_intents(d)
     verdict = d.check(intent(Side.BUY, 1, leg=21), healthy=False)
-    assert len(d.engine.state.intents) == 20
-    assert not d.engine.state.halted
-    return verdict, RiskCheck.LOCKS
+    # Every intent counts, vetoed or not (B9a review 2, R6): LOCKS decides the verdict, and the
+    # 21st intent still halts trading.
+    assert len(d.engine.state.intents) == 21
+    assert d.engine.state.halted
+    return verdict, RiskCheck.LOCKS, True
 
 
-def _rate_before_price() -> tuple[RiskVerdict, RiskCheck]:
+def _rate_before_price() -> tuple[RiskVerdict, RiskCheck, bool]:
     d = desk()
     _twenty_intents(d)
-    return d.check(intent(Side.BUY, 1, leg=21), quote_age=FIVE_S + US), RiskCheck.RATE
+    return d.check(intent(Side.BUY, 1, leg=21), quote_age=FIVE_S + US), RiskCheck.RATE, True
 
 
-def _price_before_approval() -> tuple[RiskVerdict, RiskCheck]:
+def _price_before_approval() -> tuple[RiskVerdict, RiskCheck, bool]:
     d = desk(mode=TradingMode.LIVE)
-    return d.check(intent(Side.BUY, 300), quote_age=FIVE_S + US), RiskCheck.PRICE
+    return d.check(intent(Side.BUY, 300), quote_age=FIVE_S + US), RiskCheck.PRICE, False
 
 
 ORDER_CASES: dict[str, Case] = {
@@ -573,12 +585,27 @@ ORDER_CASES: dict[str, Case] = {
 }
 
 
-@pytest.mark.spec("ARCH§8.1")
-@pytest.mark.parametrize("case", ORDER_CASES.values(), ids=ORDER_CASES.keys())
+RED_ORDER_CASES = {"locks, then rate": AssertionError}  # B9a review 2, R6
+
+
+@pytest.mark.spec("ARCH§8.1", "C3")
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            case,
+            id=name,
+            marks=[pytest.mark.xfail(strict=True, reason="red:B9", raises=RED_ORDER_CASES[name])]
+            if name in RED_ORDER_CASES
+            else [],
+        )
+        for name, case in ORDER_CASES.items()
+    ],
+)
 def test_the_first_failing_check_decides(case: Case) -> None:
     assert tuple(RiskCheck) == CHECK_ORDER
-    verdict, first = case()
-    vetoed(verdict, first, halts=first is RiskCheck.RATE)
+    verdict, first, halts = case()
+    vetoed(verdict, first, halts=halts)
 
 
 # --- records ---------------------------------------------------------------------------------------
