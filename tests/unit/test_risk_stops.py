@@ -183,3 +183,28 @@ def test_a_stop_is_issued_and_spent_while_halted_and_is_never_a_submission() -> 
     assert d.engine.state.submissions == 0
     with pytest.raises(ApprovalError):
         d.engine.spend(stop)
+
+
+@pytest.mark.spec("I4", "D9", "ARCH§8.1")
+def test_a_sell_that_claims_a_working_stop_s_shares_revokes_outstanding_stops() -> None:
+    # B9c, found by the full tier's stop property: 100 shares, a 1-share stop working, a
+    # 1-share stop approved; a SELL then takes 99, counting on the working stop being cancelled
+    # first (ARCHITECTURE §8.2). Placing the approved stop after it would sell 101 shares.
+    d = desk()
+    working = (order("stop-1", Side.SELL, OrderKind.STOP, 1, STOP),)
+    stop = d.stop(1, position=100, open_orders=working)
+    sell = d.check(intent(Side.SELL, 100), position=100, open_orders=working)
+    assert isinstance(sell, RiskApprovedOrder)
+    assert sell.quantity == 99
+    with pytest.raises(ApprovalError):
+        d.engine.spend(stop)
+
+
+@pytest.mark.spec("I4", "D9", "ARCH§8.1")
+def test_a_sell_clear_of_working_stops_leaves_outstanding_stops_alone() -> None:
+    d = desk()
+    stop = d.stop(100)
+    sell = d.check(intent(Side.SELL, 100), position=300)
+    assert isinstance(sell, RiskApprovedOrder)
+    assert sell.quantity == 100
+    assert d.engine.spend(stop) is stop

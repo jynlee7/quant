@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from quant.core.errors import ApprovalError, BrokerError
@@ -53,6 +53,8 @@ steps = st.lists(st.tuples(KINDS, SHARES, st.booleans()), min_size=2, max_size=1
     working=st.lists(st.tuples(st.sampled_from(OrderKind), SHARES), max_size=2),
     run=steps,
 )
+# Found by the full tier: a SELL took the shares under a working stop after a stop was approved.
+@example(position=100, working=[(OrderKind.STOP, 1)], run=[("stop", 1, False), ("sell", 100, True)])
 def test_no_sequence_with_stops_goes_short(
     position: int, working: list[tuple[OrderKind, int]], run: list[tuple[str, int, bool]]
 ) -> None:

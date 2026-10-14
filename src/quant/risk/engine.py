@@ -769,8 +769,12 @@ class RiskEngine:
            quantity and the in-flight SELLs' (stops don't count: execution cancels the stop
            before it sells, ARCHITECTURE §8.2). When the outstanding SELLs reserve more than
            `sellable`, they are all revoked.
-           - SELL: clamped to `sellable` minus the outstanding SELLs' quantity. Vetoed when
-             nothing is left to sell. No cap applies.
+           - SELL: clamped to `sellable` minus the outstanding SELLs' quantity (stop approvals
+             included). Vetoed when nothing is left to sell. No cap applies. A SELL approved
+             for shares that working STOP orders cover (more than the clamp minus them)
+             revokes every outstanding stop approval when it is issued: each was approved
+             counting those stops as covering their shares, so placing it after this SELL
+             could sell a share twice (B9c).
            - BUY: vetoed on a decision that can only reduce (`d.reduce_only`). Otherwise let
              `held = broker.position + open BUY LIMIT quantity + in-flight BUYs + outstanding
              BUYs + intent.quantity`; vetoed unless `held * limit_price <= cap * equity`, where
@@ -1082,6 +1086,12 @@ class RiskEngine:
             if side is None or hold.side is side:
                 self._revoke(key, reason)
 
+    def _revoke_stops(self, reason: str) -> None:
+        """Revoke every outstanding stop approval."""
+        for key, hold in list(self._outstanding.items()):
+            if isinstance(hold.approval, RiskApprovedStop):
+                self._revoke(key, reason)
+
     def _forget_expired(self, now: datetime) -> None:
         """Let go of approvals that have expired (outstanding, issued, revoked and pending), and
         of in-flight orders every acceptable snapshot must already show."""
@@ -1156,6 +1166,7 @@ class RiskEngine:
         config = self._config
         stage = RiskCheck.INTENT
         over = False  # this intent is over C3's limit, so its verdict halts trading
+        claims_stopped = False  # a SELL that needs a working stop cancelled first
 
         def veto(reason: str, *, halts: bool = False) -> Veto:
             if halts:
@@ -1262,9 +1273,16 @@ class RiskEngine:
                 ):
                     return veto("order exceeds the single-order cap")
             else:
-                quantity = min(quantity, sellable - self._outstanding_quantity(Side.SELL))
+                unreserved = sellable - self._outstanding_quantity(Side.SELL)
+                quantity = min(quantity, unreserved)
                 if quantity <= 0:
                     return veto("no unreserved shares remain to sell")
+                stopped = sum(
+                    order.quantity
+                    for order in broker.open_orders
+                    if order.side is Side.SELL and order.kind is OrderKind.STOP
+                )
+                claims_stopped = quantity > unreserved - stopped
 
             stage = RiskCheck.LOCKS
             if buy:
@@ -1318,6 +1336,8 @@ class RiskEngine:
                 return waiting
             if over:
                 self._halt(INTENT_LIMIT)  # a reduction past the limit passes, and halts
+            if claims_stopped:  # an outstanding stop counted those shares as covered
+                self._revoke_stops("a SELL claims the shares a working stop covers")
             flagged = large or pending is not None
             approval = RiskApprovedOrder(
                 token=_TOKEN,
