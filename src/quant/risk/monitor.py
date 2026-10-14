@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from math import isfinite
 
 import structlog
@@ -40,7 +41,8 @@ class MinuteInput:
     - `price`: the freshest SPY price (C8), dollars;
     - `price_at`: that price's own time, UTC;
     - `cash`: the account's cash balance at the broker, dollars (B13's adapter reports it; the
-      simulated broker in a backtest). Finite; it may be negative;
+      simulated broker in a backtest). It may be negative; one that isn't a finite number is a
+      data fault (MonitorReport.data_fault);
     - `snapshot`: the broker's position and working orders, read for this tick;
     - `book`: the engine's position and working orders.
     """
@@ -70,7 +72,10 @@ class MonitorReport:
       must take the position flat now, with entries locked until the next session;
     - `kill`: the triggers that fire on this tick, in the order DRAWDOWN, RECONCILIATION,
       STOP_MISSING; the caller runs the kill executor when it is not empty, unless one has
-      already run for the halt in force.
+      already run for the halt in force;
+    - `data_fault`: why this tick's cash or price can't be used (a cash that isn't a finite
+      number, a price that isn't finite and positive), or None. Nothing is marked and no
+      DRAWDOWN fires on it; the caller treats the engine as unhealthy (rule 6) and alerts.
     """
 
     at: datetime
@@ -83,6 +88,7 @@ class MonitorReport:
     replace_stop: bool
     flatten: bool
     kill: tuple[KillTrigger, ...]
+    data_fault: str | None = None
 
 
 class MinuteMonitor:
@@ -119,13 +125,17 @@ class MinuteMonitor:
            A MISMATCH adds RECONCILIATION to `kill`; STALE adds nothing.
         2. **Mark.** The price is fresh when it is finite and positive and
            `0 <= now - minute.price_at <= monitor_price_max_age_s` seconds (exactly the maximum
-           is fresh). When the price is fresh, the snapshot isn't STALE and the engine has
-           started a session, `equity = minute.cash + minute.snapshot.position * minute.price`
-           and the engine is marked with it (`RiskEngine.mark`, which publishes through
-           `on_change`). `flatten` is the mark's `flatten`, and the mark's `kill` adds DRAWDOWN.
-           An equity that isn't finite and positive is not marked and adds DRAWDOWN: the
-           account has lost everything the drawdown limit protects. Otherwise nothing is marked
-           and the engine is untouched; `price_stale` says whether the price was the reason.
+           is fresh). A cash that isn't a finite number, or a price that isn't finite and
+           positive, is a `data_fault`: nothing is marked and nothing fires. When the price is
+           fresh, the cash is good, the snapshot isn't STALE and the engine has started a
+           session, `equity = minute.cash + minute.snapshot.position * minute.price`, summed in
+           the decimal values the floats print (as `RiskEngine.mark` compares them, so exactly
+           2% or 10% lands on the inclusive side), and the engine is marked with it
+           (`RiskEngine.mark`, which publishes through `on_change`). `flatten` is the mark's
+           `flatten`, and the mark's `kill` adds DRAWDOWN. An equity at or below 0 is not
+           marked and adds DRAWDOWN: the account has lost everything the drawdown limit
+           protects. Otherwise nothing is marked and the engine is untouched; `price_stale`
+           says whether the price was the reason.
         3. **Stop.** Skipped (`stop_covered=None`, `stop_missing_since` unchanged, no
            `replace_stop`) when the snapshot is STALE. Otherwise the position is covered when
            `snapshot.position <= 0`, or the snapshot's open STOP SELL orders hold at least
@@ -151,18 +161,26 @@ class MinuteMonitor:
         if reconciliation.mismatch:
             fired.add(KillTrigger.RECONCILIATION)
 
+        data_fault = _data_fault(minute)
+        if data_fault is not None:
+            log.error("monitor_data_fault", fault=data_fault)
         price_fresh = _fresh(minute.price, minute.price_at, now, config.monitor_price_max_age_s)
         equity: float | None = None
         mark: MarkOutcome | None = None
-        if price_fresh and not stale_snapshot and self._engine.state.session is not None:
-            value = minute.cash + snapshot.position * minute.price
-            if isfinite(value) and value > 0:
+        if (
+            data_fault is None
+            and price_fresh
+            and not stale_snapshot
+            and self._engine.state.session is not None
+        ):
+            value = _exact(minute.cash) + snapshot.position * _exact(minute.price)
+            if value > 0:
                 equity = float(value)
                 mark = self._engine.mark(equity)
                 if mark.kill:
                     fired.add(KillTrigger.DRAWDOWN)
             else:
-                log.error("monitor_equity_wiped_out", equity=value, price=minute.price)
+                log.error("monitor_equity_wiped_out", equity=str(value), price=minute.price)
                 fired.add(KillTrigger.DRAWDOWN)
 
         stop_covered: bool | None = None
@@ -190,6 +208,7 @@ class MinuteMonitor:
             replace_stop=replace_stop,
             flatten=mark is not None and mark.flatten,
             kill=tuple(t for t in _KILL_ORDER if t in fired),
+            data_fault=data_fault,
         )
         if report.kill or report.flatten or report.replace_stop or reconciliation.mismatch:
             log.warning(
@@ -209,6 +228,25 @@ _KILL_ORDER: tuple[KillTrigger, ...] = (
     KillTrigger.STOP_MISSING,
 )
 """The order of `MonitorReport.kill`."""
+
+
+def _finite(value: object) -> bool:
+    """True when `value` is a finite int or float (not a bool)."""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and isfinite(value)
+
+
+def _data_fault(minute: MinuteInput) -> str | None:
+    """Why `minute`'s cash or price can't be used, or None (MonitorReport.data_fault)."""
+    if not _finite(minute.cash):
+        return f"cash is not a finite number: {minute.cash!r}"
+    if not _finite(minute.price) or minute.price <= 0:
+        return f"price is not finite and positive: {minute.price!r}"
+    return None
+
+
+def _exact(value: float) -> Decimal:
+    """The decimal value `value` prints as (as quant.risk.engine compares limits)."""
+    return Decimal(repr(value))
 
 
 def _fresh(price: float, price_at: datetime, now: datetime, max_age_s: float) -> bool:

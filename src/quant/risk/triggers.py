@@ -97,8 +97,9 @@ def health_verdict(health: EngineHealth, *, now: datetime, config: KillConfig) -
       `now - health.flatten_since >= flatten_incomplete_s`.
 
     A late bar fires nothing by itself (module docstring). ClockError for a naive `now` or a
-    naive time in `health`; times after `now` count as at `now` (a heartbeat from the future is
-    fresh, a start from the future is in the window)."""
+    naive time in `health`. A time after `now` hasn't happened yet at `now`: a start after it
+    isn't counted, and a heartbeat or a rule-6 flatten after it has elapsed less than nothing,
+    so neither fires (a clock that runs ahead never brings a kill forward)."""
     now = ensure_utc(now)
     failures: list[KillTrigger] = []
     if _elapsed(now, health.last_heartbeat) >= config.heartbeat_lost_s:
@@ -126,17 +127,17 @@ def order_errors_fire(errors: Sequence[datetime], *, now: datetime, config: Kill
     `[now - order_error_window_s, now]` (ARCHITECTURE §8.3 and §16: 5 errors within 10 minutes
     fire the kill, which keeps retrying while the broker-side stop protects the position).
     `errors` may be in any order and include old ones, which are ignored; an error after `now`
-    counts as at `now`. ClockError for a naive time."""
+    hasn't happened yet and isn't counted. ClockError for a naive time."""
     now = ensure_utc(now)
     return _count_within(errors, now, config.order_error_window_s) >= config.order_errors
 
 
 def _elapsed(now: datetime, then: datetime) -> float:
-    """Seconds from `then` to `now`; a `then` after `now` counts as at `now` (0)."""
-    return max((now - ensure_utc(then)).total_seconds(), 0.0)
+    """Seconds from `then` to `now`; negative for a `then` after `now`."""
+    return (now - ensure_utc(then)).total_seconds()
 
 
 def _count_within(times: Sequence[datetime], now: datetime, window_s: float) -> int:
-    """How many of `times` lie in `[now - window_s, now]`, a time after `now` counting as at
-    `now`. Every time is checked for a timezone, old ones included."""
-    return sum(1 for t in times if _elapsed(now, t) <= window_s)
+    """How many of `times` lie in `[now - window_s, now]`; a time after `now` is not counted.
+    Every time is checked for a timezone, old and future ones included."""
+    return sum(1 for t in times if 0 <= _elapsed(now, t) <= window_s)

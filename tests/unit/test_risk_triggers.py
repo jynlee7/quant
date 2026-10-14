@@ -91,7 +91,6 @@ def test_five_order_errors_within_10_minutes_fire_the_kill() -> None:
     assert not order_errors_fire([], now=NOW, config=KILL)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("C2", "ARCH§8.3", "ARCH§16")
 def test_starts_and_order_errors_after_now_are_ignored() -> None:
     # B9b review R6: an event stamped after `now` hasn't happened yet at `now`.

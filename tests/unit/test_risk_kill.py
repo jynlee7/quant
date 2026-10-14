@@ -450,7 +450,6 @@ class SqliteFailingStore(RecordingKillStore):
         raise sqlite3.OperationalError("database is locked (fake)")
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "I4")
 def test_a_kill_that_finds_the_account_flat_still_revokes_every_outstanding_sell() -> None:
     # B9b review R1: the stop sold the 300 shares before the kill, so the kill sends no flatten
@@ -473,25 +472,21 @@ def test_a_kill_that_finds_the_account_flat_still_revokes_every_outstanding_sell
             RiskError("ops.db is full"),
             {2},
             id="the stop's cancel approval",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError),
         ),
         pytest.param(
             sqlite3.OperationalError("database is locked"),
             {2},
             id="sqlite, the stop's cancel approval",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=sqlite3.OperationalError),
         ),
         pytest.param(
             RiskError("ops.db is full"),
             {3},
             id="the exit's flatten approval",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError),
         ),
         pytest.param(
             sqlite3.OperationalError("database is locked"),
             {1},
             id="sqlite, the halt",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=sqlite3.OperationalError),
         ),
     ],
 )
@@ -512,7 +507,6 @@ def test_a_failed_save_of_the_risk_state_never_stops_the_kill(
     assert not rig.lock.held
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=sqlite3.OperationalError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
 @pytest.mark.parametrize(
     ("at", "status"),
@@ -531,7 +525,6 @@ def test_a_store_failing_as_sqlite_does_never_stops_the_kill(
     assert rig.alerts.reports == [report]
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
 def test_a_lock_that_cant_be_taken_still_halts_flattens_and_alerts(tmp_path: Path) -> None:
     # B9b review C8: the break-glass `quant kill --direct` must not die on a missing var/.
@@ -558,7 +551,6 @@ class BlockingBroker(FakeBroker):
         return super().snapshot()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
 @pytest.mark.spec("ARCH§8.3")
 def test_a_second_kill_on_another_thread_is_busy_with_the_file_lock(tmp_path: Path) -> None:
     # B9b review C7: the monitor's thread and a command's thread share one executor.
@@ -581,7 +573,6 @@ def test_a_second_kill_on_another_thread_is_busy_with_the_file_lock(tmp_path: Pa
     assert [r.status for r in first] == [KillStatus.FLAT]
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
 def test_a_kill_started_before_the_open_queues_its_exit_for_that_open() -> None:
     # B9b review R3/C3: two failed snapshots carry the run from 09:29:59 past 09:30.
@@ -606,7 +597,6 @@ class SlowQuoteBroker(FakeBroker):
         return super().quote()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
 def test_no_exit_is_sent_after_the_close_that_a_slow_quote_ran_into() -> None:
     # B9b review R4: the half day closes at 13:00; the quote asked for at 12:59:59 arrives at
@@ -626,7 +616,6 @@ def test_no_exit_is_sent_after_the_close_that_a_slow_quote_ran_into() -> None:
     assert report.queued_exit_at == CAL.session(date(2018, 11, 26)).open
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
 def test_no_exit_is_sent_after_the_deadline_that_a_slow_quote_ran_into() -> None:
     # B9b review R4: the quote asked for at the start arrives 301 s later, past the deadline.
@@ -639,7 +628,6 @@ def test_no_exit_is_sent_after_the_deadline_that_a_slow_quote_ran_into() -> None
     assert report.status is KillStatus.INCOMPLETE
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§8.1")
 def test_control_db_gets_the_halt_reason_in_force() -> None:
     # B9b review C9: trading was already halted; RiskState keeps that first reason (C10), and
@@ -666,7 +654,6 @@ class RacingEntryBroker(FakeBroker):
         super().cancel(approval)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16")
 def test_outside_hours_a_position_that_appears_keeps_its_new_stop() -> None:
     # B9b review C10: the account looked flat with an entry working; the entry filled.

@@ -3,7 +3,8 @@
 One implementation, shared by the engine, quant-control and the CLI (`quant kill --direct`),
 with a lock so only one copy runs at a time. In regular hours it:
 
-1. halts: `RiskEngine.halt` and the HALTED flag in control.db (`KillStore.write_halted`);
+1. halts: `RiskEngine.halt`, `RiskEngine.revoke_orders` and the HALTED flag in control.db
+   (`KillStore.write_halted`);
 2. cancels every working order, stops included (each through a RiskApprovedCancel);
 3. closes the position with limit orders (each through a RiskApprovedFlatten) that start at the
    ±`collar_bp` collar and widen by `kill.widen_bp` after every `kill.requote_s` unfilled, up to
@@ -30,15 +31,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
-from typing import Final, Protocol
+from typing import Final, Protocol, TypeVar
 
 import structlog
 
 from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.clock import Clock, ensure_utc
-from quant.core.errors import BrokerError, QuantError, RiskError
+from quant.core.errors import RiskError
 from quant.core.orders import BrokerSnapshot, OpenOrder, OrderKind, Quote
 from quant.risk.broker import BrokerPort
 from quant.risk.engine import RiskEngine
@@ -88,8 +89,9 @@ class KillReport:
     """What one run did. The executor sends it to `KillAlerts.send` and returns it.
 
     - `request`, `status`;
-    - `halt_reason`: the reason given to `RiskEngine.halt` and `KillStore.write_halted`:
-      `f"kill switch ({trigger}, {source}): {reason}"`; empty for BUSY;
+    - `halt_reason`: the reason this kill gave `RiskEngine.halt`:
+      `f"kill switch ({trigger}, {source}): {reason}"`; empty for BUSY. `KillStore.write_halted`
+      gets the reason in force, which is an earlier halt's when trading was already halted;
     - `started_at`, `finished_at`: the clock when the run began and ended;
     - `regular_hours`: `in_regular_hours(started_at)`, which picks the path;
     - `cancelled`: the client order id of every cancel sent, in order, repeats included;
@@ -130,46 +132,55 @@ class KillLock(Protocol):
 class FileKillLock:
     """A KillLock across processes: an exclusive, non-blocking `fcntl.flock` on a file, so the
     engine, quant-control and the CLI exclude one another on the same machine. The kernel drops
-    the lock if its holder dies, so a crashed copy never blocks the next."""
+    the lock if its holder dies, so a crashed copy never blocks the next. Threads that share one
+    object exclude one another too (the minute monitor's thread and a command's)."""
 
     def __init__(self, path: Path) -> None:
         """A lock on `path` (for example var/kill.lock). Nothing is opened until `acquire`."""
         self._path = Path(path)
         self._fd: int | None = None
+        self._owner: int | None = None  # the thread that holds it
+        self._guard = threading.Lock()
 
     def acquire(self) -> bool:
         """Open `path` (creating it with mode 0o600 if missing; its directory must exist) and
         try `flock(LOCK_EX | LOCK_NB)`. True when taken. False, closing the file, when any other
-        holder has it: another process, or another FileKillLock object on the same path in this
-        process. RiskError when this object already holds it, or the file can't be opened."""
-        if self._fd is not None:
-            raise RiskError(f"this kill lock already holds {self._path}")
-        try:
-            fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
-        except OSError as exc:
-            raise RiskError(f"can't open the kill lock {self._path}: {exc}") from exc
-        try:
-            os.fchmod(fd, 0o600)  # whatever the umask made of it
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            return False
-        except OSError as exc:
-            os.close(fd)
-            raise RiskError(f"can't lock {self._path}: {exc}") from exc
-        self._fd = fd
-        return True
+        holder has it: another process, another FileKillLock object on the same path in this
+        process, or another thread holding this object. RiskError when the calling thread
+        already holds it (it isn't re-entrant), or the file can't be opened or locked."""
+        with self._guard:
+            if self._fd is not None:
+                if self._owner == threading.get_ident():
+                    raise RiskError(f"this kill lock already holds {self._path}")
+                return False
+            try:
+                fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+            except OSError as exc:
+                raise RiskError(f"can't open the kill lock {self._path}: {exc}") from exc
+            try:
+                os.fchmod(fd, 0o600)  # whatever the umask made of it
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                return False
+            except OSError as exc:
+                os.close(fd)
+                raise RiskError(f"can't lock {self._path}: {exc}") from exc
+            self._fd = fd
+            self._owner = threading.get_ident()
+            return True
 
     def release(self) -> None:
         """Unlock and close the file; the file stays. RiskError when this object doesn't hold
         the lock."""
-        if self._fd is None:
-            raise RiskError(f"this kill lock doesn't hold {self._path}")
-        fd, self._fd = self._fd, None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with self._guard:
+            if self._fd is None:
+                raise RiskError(f"this kill lock doesn't hold {self._path}")
+            fd, self._fd, self._owner = self._fd, None, None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 class MemoryKillLock:
@@ -275,7 +286,7 @@ def kill_limit_price(
 
 class KillExecutor:
     """Runs the kill switch (module docstring). One executor serves one engine and one broker;
-    the lock is what keeps copies in other processes out."""
+    the lock is what keeps other copies out, in this process and in others."""
 
     def __init__(
         self,
@@ -305,22 +316,33 @@ class KillExecutor:
     def execute(self, request: KillRequest) -> KillReport:
         """Run the kill switch for `request` and return the report.
 
+        **A kill never dies halfway.** Every step is attempted on its own: an exception of any
+        type from a step (the engine and its `on_change`, the store, the broker, the broker's
+        spend) is recorded in `errors` and the run goes on, a broker step being retried after
+        the next wait. An exception outside any step ends the run INCOMPLETE, recorded the same
+        way. The alert is always attempted, and the report always returned. A failing
+        `on_change` means the engine issues no approval, so under a lasting failure the run
+        sends nothing and ends INCOMPLETE at the deadline, still halted and alerted.
+
         **Lock.** `lock.acquire()` first. When it returns False the run is BUSY: it returns a
         KillReport with status BUSY, an empty `halt_reason` and nothing else done (no halt, no
-        broker call, no alert). Otherwise the lock is released however `execute` ends.
+        broker call, no alert). When it raises (say var/ is missing), the error is recorded and
+        the kill runs without the lock: halting and flattening matter more than excluding a
+        copy, and a second copy's exit is refused while the first's reserves the shares.
+        Otherwise the lock is released however `execute` ends.
 
         **1. Halt**, before any broker call: `engine.halt(halt_reason)`, then
-        `store.write_halted(halt_reason, now)`. A QuantError or OSError from either is recorded
-        in `errors` and the run goes on: reducing risk never waits on a write.
+        `engine.revoke_orders(halt_reason)` (every outstanding order approval, SELLs included:
+        a SELL approved against shares the stop has since sold would open a short), then
+        `store.write_halted(reason, started_at)` with the reason in force, which is the
+        engine's first one (`state.halt_reason`, C10) when trading was already halted.
 
         Then `regular_hours = in_regular_hours(now, calendar)` picks the path. Throughout,
         `deadline = started_at + kill.deadline_s`. Waiting means `clock.sleep_until(min(now +
-        kill.poll_s, deadline))` and then a fresh `broker.snapshot()`. A BrokerError from any
-        broker call is recorded in `errors` and the step is retried after the next wait. When
-        `now >= deadline` before the run is done, it stops where it is, leaving any working
-        exit at the broker: INCOMPLETE, and the caller runs the executor again (ARCHITECTURE
-        §16: the kill keeps retrying). ApprovalError from the broker's spend is a bug and
-        propagates.
+        kill.poll_s, deadline))` and then a fresh `broker.snapshot()`. When `now >= deadline`
+        before the run is done, it stops where it is, leaving any working exit at the broker:
+        INCOMPLETE, and the caller runs the executor again (ARCHITECTURE §16: the kill keeps
+        retrying).
 
         *Cancelling* an order means `engine.approve_cancel(client_order_id, reason=halt_reason)`
         and `broker.cancel(approval)`; *cancelling until gone* means cancelling, then waiting
@@ -333,31 +355,37 @@ class KillExecutor:
            §8.2: open sell orders reserve the shares an exit needs). Orders that appear while
            waiting are cancelled too.
         3. For attempt = 0, 1, 2 ...: when the latest snapshot shows `position == 0` and no
-           open orders, the run is FLAT (step 4). Otherwise read `broker.quote()`, take
-           `limit = kill_limit_price(quote, snapshot.position, attempt, collar_bp, kill)`, get
-           `engine.approve_flatten(reason=halt_reason)`, send `broker.flatten(approval,
-           limit_price=limit)` and record a KillExit. Wait until a snapshot shows the account
-           flat with no open orders (FLAT), or until `kill.requote_s` has passed since the exit
-           was sent; then cancel until gone every open order (the unfilled exit's remainder
-           among them) and go on with the next attempt, so after a partial fill the next exit
-           closes only what is left.
+           open orders, the run is FLAT (step 4). Otherwise read `broker.quote()`. If the
+           deadline or the close has come by the time the quote arrives, no exit is sent.
+           Else take `limit = kill_limit_price(quote, snapshot.position, attempt, collar_bp,
+           kill)`, get `engine.approve_flatten(reason=halt_reason)`, send
+           `broker.flatten(approval, limit_price=limit)` and record a KillExit. Wait until a
+           snapshot shows the account flat with no open orders (FLAT), or until
+           `kill.requote_s` has passed since the exit was sent; then cancel until gone every
+           open order (the unfilled exit's remainder among them) and go on with the next
+           attempt, so after a partial fill the next exit closes only what is left. A failed
+           quote or exit keeps the attempt number.
         4. **Verify.** FLAT only on a snapshot read after the last exit or cancel was sent that
            shows `position == 0` and no open orders; it becomes `final`.
            If the session closes (`now >= session.close`) first, the run stops: it cancels
            until gone the working exit (once, without waiting past the deadline), queues the
-           exit for `next_open(now)` (`store.queue_exit`) and is INCOMPLETE with
-           `queued_exit_at` set. Re-placing a protective stop over the night is execution's
-           (B13), not the executor's.
+           exit and is INCOMPLETE with `queued_exit_at` set. Re-placing a protective stop over
+           the night is execution's (B13), not the executor's.
 
         **Outside regular hours.**
 
         2. Read a snapshot. With `position == 0`, cancel until gone every open order, stops
-           included: FLAT once a snapshot shows none.
+           included, but only while the account stays flat: once a snapshot shows a position
+           (an entry filled before its cancel landed), its stops are kept. FLAT once a snapshot
+           shows no position and no order.
         3. Otherwise cancel until gone every open LIMIT order (entries and exits) and keep every
-           STOP order (`kept`, by client order id), send no exit, and
-           `store.queue_exit(next_open(now), halt_reason)`: QUEUED, with `queued_exit_at` set,
-           once a snapshot shows no LIMIT order. A QuantError or OSError from `queue_exit` is
-           recorded in `errors`, and the run is still QUEUED.
+           STOP order (`kept`, by client order id), send no exit, and queue the exit: QUEUED,
+           with `queued_exit_at` set, once a snapshot shows no LIMIT order.
+
+        *Queueing the exit* is `store.queue_exit(next_open(started_at), halt_reason)`: the
+        first open at or after the moment the kill started, so a run that crosses 09:30 queues
+        that morning's open, which has then passed and runs at once. A failed write is
+        recorded, and the run's status stands.
 
         **5. Alert.** `alerts.send(report)` with the finished report, for every status but BUSY.
         An exception from it is logged with structlog and swallowed; the same report is
@@ -366,7 +394,14 @@ class KillExecutor:
         Every step is logged with structlog.
         """
         started = self._clock.now()
-        if not self._lock.acquire():
+        errors: list[str] = []
+        try:
+            locked = self._lock.acquire()
+        except Exception as exc:  # a kill never waits on its lock's file (docstring)
+            errors.append(_error(exc))
+            log.error("kill_lock_failed", error=str(exc), error_type=type(exc).__name__)
+            locked = None
+        if locked is False:
             log.warning("kill_busy", trigger=request.trigger.value, source=request.source)
             return KillReport(
                 request=request,
@@ -377,22 +412,36 @@ class KillExecutor:
                 regular_hours=in_regular_hours(started, self._calendar),
             )
         try:
-            run = _Run(self, request, started)
-            report = run.execute()
+            report = _Run(self, request, started, errors).execute()
             try:
                 self._alerts.send(report)
             except Exception:  # an alert never stops a kill (ARCHITECTURE §8.3)
                 log.exception("kill_alert_failed", status=report.status.value)
             return report
         finally:
-            self._lock.release()
+            if locked:
+                try:
+                    self._lock.release()
+                except Exception:
+                    log.exception("kill_lock_release_failed")
+
+
+class _Failed(Enum):
+    """What `_Run.attempt` returns for a step that raised."""
+
+    FAILED = "failed"
+
+
+_T = TypeVar("_T")
 
 
 class _Run:
     """One run of the executor, after it has taken the lock: what it did so far, for the
     report, and the waiting and cancelling every path shares (KillExecutor.execute)."""
 
-    def __init__(self, executor: KillExecutor, request: KillRequest, started: datetime) -> None:
+    def __init__(
+        self, executor: KillExecutor, request: KillRequest, started: datetime, errors: list[str]
+    ) -> None:
         self.engine = executor._engine
         self.broker = executor._broker
         self.store = executor._store
@@ -414,7 +463,7 @@ class _Run:
         self.exits: list[KillExit] = []
         self.queued_exit_at: datetime | None = None
         self.final: BrokerSnapshot | None = None
-        self.errors: list[str] = []
+        self.errors = errors
 
     def execute(self) -> KillReport:
         log.error(
@@ -425,7 +474,11 @@ class _Run:
             regular_hours=self.regular_hours,
         )
         self.halt()
-        status = self.regular() if self.regular_hours else self.outside()
+        try:
+            status = self.regular() if self.regular_hours else self.outside()
+        except Exception as exc:  # outside any step: the run ends, and still alerts
+            self.record(exc, "run")
+            status = KillStatus.INCOMPLETE
         report = KillReport(
             request=self.request,
             status=status,
@@ -453,15 +506,13 @@ class _Run:
     # --- 1. halt ---------------------------------------------------------------------------------
 
     def halt(self) -> None:
-        """Halt the engine, then write HALTED durably; a failure of either is recorded only."""
-        try:
-            self.engine.halt(self.reason)
-        except (QuantError, OSError) as exc:
-            self.record(exc, "engine.halt")
-        try:
-            self.store.write_halted(self.reason, self.started)
-        except (QuantError, OSError) as exc:
-            self.record(exc, "store.write_halted")
+        """Halt the engine, revoke its order approvals, then write HALTED durably with the
+        reason in force; a failure of any is recorded only."""
+        self.attempt("engine.halt", lambda: self.engine.halt(self.reason))
+        self.attempt("engine.revoke_orders", lambda: self.engine.revoke_orders(self.reason))
+        state = self.engine.state
+        reason = (state.halt_reason if state.halted else None) or self.reason
+        self.attempt("store.write_halted", lambda: self.store.write_halted(reason, self.started))
 
     # --- the two paths ---------------------------------------------------------------------------
 
@@ -496,7 +547,7 @@ class _Run:
                 return KillStatus.INCOMPLETE
             snapshot = self.wait()
         if snapshot.position == 0:
-            cleared = self.clear(snapshot, _every)
+            cleared = self.clear(snapshot, _every_while_flat)
             if cleared is None:
                 return KillStatus.INCOMPLETE
             if _flat(cleared):
@@ -505,7 +556,7 @@ class _Run:
         cleared = self.clear(snapshot, _limit)
         last = cleared if cleared is not None else self.final
         if last is not None:
-            self.kept = tuple(o.client_order_id for o in last.open_orders if not _limit(o))
+            self.kept = tuple(o.client_order_id for o in last.open_orders if not _limit(last, o))
             log.warning("kill_stops_kept", kept=list(self.kept))
         self.queue_exit()
         return KillStatus.QUEUED if cleared is not None else KillStatus.INCOMPLETE
@@ -530,19 +581,32 @@ class _Run:
     # --- the steps -------------------------------------------------------------------------------
 
     def send_exit(self, position: int, attempt: int) -> datetime | None:
-        """Send kill exit `attempt` for `position` shares; when it was sent, or None when the
-        broker failed (recorded, and retried after the next wait)."""
-        try:
-            quote = self.broker.quote()
-        except BrokerError as exc:
-            self.record(exc, "broker.quote")
+        """Send kill exit `attempt` for `position` shares; when it was sent, or None when a
+        step failed (recorded, and retried after the next wait) or the run must stop by the
+        time the quote arrives."""
+        quote = self.attempt("broker.quote", self.broker.quote)
+        if isinstance(quote, _Failed):
             return None
-        limit = kill_limit_price(quote, position, attempt, collar_bp=self.collar_bp, kill=self.kill)
-        approval = self.engine.approve_flatten(reason=self.reason)
-        try:
-            order_id = self.broker.flatten(approval, limit_price=limit)
-        except BrokerError as exc:
-            self.record(exc, "broker.flatten")
+        if self.stopping():  # the quote took us past the deadline or the close
+            log.error("kill_exit_not_sent", reason="the deadline or the close came first")
+            return None
+        limit = self.attempt(
+            "kill_limit_price",
+            lambda: kill_limit_price(
+                quote, position, attempt, collar_bp=self.collar_bp, kill=self.kill
+            ),
+        )
+        if isinstance(limit, _Failed):
+            return None
+        approval = self.attempt(
+            "engine.approve_flatten", lambda: self.engine.approve_flatten(reason=self.reason)
+        )
+        if isinstance(approval, _Failed):
+            return None
+        order_id = self.attempt(
+            "broker.flatten", lambda: self.broker.flatten(approval, limit_price=limit)
+        )
+        if isinstance(order_id, _Failed):
             return None
         sent = self.clock.now()
         width = kill_collar_bp(attempt, collar_bp=self.collar_bp, kill=self.kill)
@@ -570,14 +634,17 @@ class _Run:
         return snapshot
 
     def clear(
-        self, snapshot: BrokerSnapshot | None, select: Callable[[OpenOrder], bool]
+        self,
+        snapshot: BrokerSnapshot | None,
+        select: Callable[[BrokerSnapshot, OpenOrder], bool],
     ) -> BrokerSnapshot | None:
-        """Cancel until gone every open order `select` picks, those that appear meanwhile
-        included: the first snapshot that shows none, or None when the run must stop first."""
+        """Cancel until gone every open order `select` picks on the latest snapshot, those that
+        appear meanwhile included: the first snapshot that shows none, or None when the run
+        must stop first."""
         sent: dict[str, datetime] = {}
         while True:
             if snapshot is not None:
-                targets = [o.client_order_id for o in snapshot.open_orders if select(o)]
+                targets = [o.client_order_id for o in snapshot.open_orders if select(snapshot, o)]
                 if not targets:
                     return snapshot
                 now = self.clock.now()
@@ -591,25 +658,25 @@ class _Run:
             snapshot = self.wait()
 
     def cancel(self, order_id: str) -> bool:
-        """Cancel `order_id` through a new approval; False when the broker failed (recorded)."""
-        approval = self.engine.approve_cancel(order_id, reason=self.reason)
-        try:
-            self.broker.cancel(approval)
-        except BrokerError as exc:
-            self.record(exc, "broker.cancel")
+        """Cancel `order_id` through a new approval; False when a step failed (recorded)."""
+        approval = self.attempt(
+            "engine.approve_cancel",
+            lambda: self.engine.approve_cancel(order_id, reason=self.reason),
+        )
+        if isinstance(approval, _Failed):
+            return False
+        if isinstance(self.attempt("broker.cancel", lambda: self.broker.cancel(approval)), _Failed):
             return False
         self.cancelled.append(order_id)
         log.info("kill_order_cancelled", client_order_id=order_id)
         return True
 
     def queue_exit(self) -> None:
-        """Queue the exit for the next open, durably; a failed write is recorded only."""
-        run_at = next_open(self.clock.now(), self.calendar)
+        """Queue the exit for the first open at or after the start, durably; a failed write is
+        recorded only."""
+        run_at = next_open(self.started, self.calendar)
         self.queued_exit_at = run_at
-        try:
-            self.store.queue_exit(run_at, self.reason)
-        except (QuantError, OSError) as exc:
-            self.record(exc, "store.queue_exit")
+        self.attempt("store.queue_exit", lambda: self.store.queue_exit(run_at, self.reason))
         log.warning("kill_exit_queued", run_at=run_at)
 
     # --- waiting and reading ---------------------------------------------------------------------
@@ -629,16 +696,23 @@ class _Run:
 
     def snapshot(self) -> BrokerSnapshot | None:
         """A fresh broker snapshot, which becomes `final`; None when the broker failed."""
-        try:
-            snapshot = self.broker.snapshot()
-        except BrokerError as exc:
-            self.record(exc, "broker.snapshot")
+        snapshot = self.attempt("broker.snapshot", self.broker.snapshot)
+        if isinstance(snapshot, _Failed):
             return None
         self.final = snapshot
         return snapshot
 
+    def attempt(self, step: str, call: Callable[[], _T]) -> _T | _Failed:
+        """Run one step: what it returns, or FAILED with its exception recorded (the policy in
+        KillExecutor.execute)."""
+        try:
+            return call()
+        except Exception as exc:
+            self.record(exc, step)
+            return _Failed.FAILED
+
     def record(self, exc: Exception, step: str) -> None:
-        self.errors.append(f"{type(exc).__name__}: {exc}")
+        self.errors.append(_error(exc))
         log.warning("kill_step_failed", step=step, error=str(exc), error_type=type(exc).__name__)
 
 
@@ -650,13 +724,23 @@ def _exact(value: float) -> Decimal:
     return Decimal(repr(value))
 
 
+def _error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _flat(snapshot: BrokerSnapshot) -> bool:
     return snapshot.position == 0 and not snapshot.open_orders
 
 
-def _every(order: OpenOrder) -> bool:
+def _every(snapshot: BrokerSnapshot, order: OpenOrder) -> bool:
     return True
 
 
-def _limit(order: OpenOrder) -> bool:
+def _limit(snapshot: BrokerSnapshot, order: OpenOrder) -> bool:
     return order.kind is OrderKind.LIMIT
+
+
+def _every_while_flat(snapshot: BrokerSnapshot, order: OpenOrder) -> bool:
+    """Every order while the account is flat; once a position shows, only LIMIT orders, so a
+    stop over shares that just arrived is kept."""
+    return snapshot.position == 0 or _limit(snapshot, order)

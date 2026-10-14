@@ -598,6 +598,14 @@ class RiskEngine:
             self._halt(reason)
         return True
 
+    def revoke_orders(self, reason: str) -> None:
+        """Revoke every outstanding order approval, BUY and SELL, for `reason`: the kill
+        executor's step after `halt`, since its own exits replace every order (ARCHITECTURE
+        §8.3). A SELL approved against shares the stop has since sold would otherwise open a
+        short. Cancels, flattens and pending approvals are left alone. RiskState doesn't change,
+        so `on_change` isn't called."""
+        self._revoke_side(None, reason)
+
     def mark(self, equity: float) -> MarkOutcome:
         """One equity mark from the minute monitor, on the freshest price (C8), or from a broker
         snapshot. The peak rises to `equity` if it is higher.

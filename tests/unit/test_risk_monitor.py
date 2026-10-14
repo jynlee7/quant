@@ -211,7 +211,6 @@ def test_a_stop_covers_the_position_only_with_stop_sells_for_every_share(
 # --- B9b review ------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("C8", "SPEC§10")
 def test_equity_is_summed_exactly_so_the_exact_2_and_10_percent_lines_hold() -> None:
     # B9b review R5: in floats, 18,828.80 + 192 x 412.35 is 98,000.00000000001.
@@ -235,31 +234,26 @@ def test_equity_is_summed_exactly_so_the_exact_2_and_10_percent_lines_hold() -> 
             100.0,
             math.nan,
             id="cash nan",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError),
         ),
         pytest.param(
             100.0,
             math.inf,
             id="cash inf",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError),
         ),
         pytest.param(
             100.0,
             -math.inf,
             id="cash -inf",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError),
         ),
         pytest.param(
             math.nan,
             0.0,
             id="price nan",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError),
         ),
         pytest.param(
             math.inf,
             0.0,
             id="price inf",
-            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError),
         ),
     ],
 )
