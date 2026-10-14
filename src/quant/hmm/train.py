@@ -14,23 +14,36 @@
    symmetrized exactly as 0.5 * (Σ + Σᵀ), so a diag model's off-diagonal entries stay exactly 0.
 4. Its training log-likelihood is ours, never hmmlearn's: `float(numpy.sum(forward_pass(params,
    scaler, rows, columns=...).loglik))`, the density of the raw rows (Jacobian included).
-5. A restart *fails* when hmmlearn raises, `GaussianParams` refuses its parameters, or the
-   forward pass raises ModelError. A failed restart is left out of the record's `seeds` and
-   `restart_logliks` and listed in `info` instead (index, seed and the exception's type name);
-   when every restart fails, the candidate raises ModelError.
+5. A restart *fails* when it raises one of the expected fit failures, ModelError or ValueError
+   (hmmlearn's parameter checks, numpy's LinAlgError, `GaussianParams` refusing the
+   parameters, the forward pass). Any other exception (TypeError, AssertionError, ...) is a
+   bug and propagates. Seeds can't fail: TrainConfig keeps every seed in [0, SEED_MAX]. A
+   failed restart is left out of the record's `seeds` and `restart_logliks` and listed in
+   `info` instead (index, seed and the exception's type name). A *fit* whose restarts all
+   fail is a failed fit: `fit_candidate` raises ModelError for it, and selection sets its
+   candidate aside.
 6. The winner is `select.choose_restart` over the recorded log-likelihoods in restart order:
    the highest, a tie going to the lowest index, and a structlog warning "hmm optimum
-   unstable" when fewer than 3 restarts (the winner included) land within 0.1% of the best.
+   unstable" (naming the fit, "full" or "validation") when fewer than 3 restarts (the winner
+   included) land within 0.1% of the best, measured on the standardized rows' log-likelihood
+   (`jacobian` = n · -Σ log std of the fit's scaler), so the features' units can't change it.
 
 **Parallelism** (ARCHITECTURE §7.1, §14): `workers=1` runs the restarts one after another in
 the calling process. Otherwise they run in a `concurrent.futures.ProcessPoolExecutor` with the
 "spawn" context and `workers` processes (None: `os.cpu_count()`), and results are collected
-in restart order. Every fit, in a pool or serial, runs inside
-`threadpoolctl.threadpool_limits(limits=1)` (single-threaded BLAS and OpenMP; threadpoolctl
-comes with scikit-learn, and the green commit lists it in pyproject.toml), so the pool and the
-serial path give the same bits and the same artifact hash. `select_and_train` sends every
-restart of every candidate, both fits, through one pool. The worker count is never recorded:
-it can't change the model.
+in restart order. The pool's workers are started with OMP_NUM_THREADS, OPENBLAS_NUM_THREADS,
+MKL_NUM_THREADS and VECLIB_MAXIMUM_THREADS set to 1 in their environment, so each worker's BLAS
+is single-threaded from before it imports numpy: Apple's Accelerate reads only
+VECLIB_MAXIMUM_THREADS, at load, and threadpoolctl can't limit it. The caller's environment is
+restored once the pool closes. Each worker receives the blocks of rows and the config once (the
+pool's initializer); a task is just (block index, restart index). Every fit, in a pool or
+serial, also runs inside `threadpoolctl.threadpool_limits(limits=1)` (OpenMP and the BLAS
+libraries threadpoolctl can see). The serial path runs in the caller's process, whose BLAS
+threads were fixed when it imported numpy: ARCHITECTURE §14 has the engine, backtest and
+harness set the same variables before that, and then the pool and the serial path give the
+same bits and the same artifact hash. `select_and_train` sends every restart of every
+candidate, both fits, through one pool. The worker count is never recorded: it can't change
+the model.
 
 **Selection** (`select_and_train`, spec §4, the rules in quant.hmm.select): for every candidate
 of `config.candidates`, in order,
@@ -44,16 +57,29 @@ of `config.candidates`, in order,
   block from the end of that fit's forward pass, with `config.bootstrap_draws` draws and seed
   `config.base_seed`, the same draws for every candidate.
 
-`select.select` picks the candidate. "Refit the winner on the full window" is its full-window
-fit, already done: same rows, scaler, seeds and config, so `train_candidate(data, chosen, ...)`
-gives the same parameters bit for bit.
+A candidate with a failed fit (either one) is *set aside*: it gets no score, takes no part in
+the selection, and is listed in the report with its failed restarts. Selection raises
+ModelError only when every candidate is set aside or rejected. `select.select` picks among the
+rest. "Refit the winner on the full window" is its full-window fit, already done: same rows,
+scaler, seeds and config, so `train_candidate(data, chosen, ...)` gives the same parameters bit
+for bit.
+
+**The validation record** (spec §5, ARCHITECTURE §7.2, §7.5): every model, a refit's too,
+records its own candidate's validation fit: `train_candidate` runs the same two fits for its one
+candidate. It holds the validation block's l_t distribution and the drift baseline
+(`select.drift_threshold`), the 1st percentile of the block's 35-bar rolling mean of l_t, which
+the live engine compares its own rolling mean with. Both are densities of the raw rows, so the
+validation fit's scaler and the live model's don't need reconciling.
 
 **The model** is the chosen fit's parameters, the full-window scaler (`ScalerParams.from_scaler`),
 the fit window, the labels (`hmm.labels.label_states(data.returns, trace.state_probs,
-thresholds)` with the winner's filtered probabilities over the window) and a TrainingRecord:
+thresholds)` with the winner's filtered probabilities over the window; a state with no filtered
+mass at all has no label, and the fit is then refused as the sanity reject it is) and a
+TrainingRecord:
 `base_seed`, the recorded `seeds` and `restart_logliks` of the full-window fit, `best` from
 `choose_restart`, and `info` (`TrainResult` lists its keys). Nothing in it depends on wall time,
-paths or the worker count, so the same data, seeds and config give the same artifact hash.
+paths or the worker count, so the same data, seeds and config on the same platform give the
+same artifact hash.
 
 Times are UTC. "Now" is never read (K6).
 """
@@ -63,17 +89,19 @@ from __future__ import annotations
 import hashlib
 import math
 import multiprocessing
+import os
 import platform
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from importlib.metadata import version
-from typing import Any, Self
+from typing import Any, Final, Self
 
 import numpy as np
+import scipy
 from hmmlearn.hmm import GaussianHMM
 from pydantic import model_validator
 from threadpoolctl import threadpool_limits  # type: ignore[import-untyped]
@@ -90,13 +118,34 @@ from quant.hmm import select as selection_rules
 from quant.hmm.filter import ForwardTrace, forward_pass
 from quant.hmm.labels import BARS_PER_YEAR, LabelThresholds, label_states
 from quant.hmm.model import GaussianParams, HmmModel, ScalerParams, TrainingRecord
-from quant.hmm.select import Candidate, RestartChoice, SanityReport, Selection
+from quant.hmm.select import (
+    Candidate,
+    CandidateScore,
+    FitName,
+    RestartChoice,
+    SanityReport,
+    Selection,
+    ValidationScore,
+)
+
+# numpy's seeds are 32-bit: every restart's seed base_seed + i must be at most this.
+SEED_MAX: Final = 2**32 - 1
+# The thread counts a pool worker is started with (ARCHITECTURE §14).
+BLAS_THREAD_VARIABLES: Final = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+# What a bad local optimum raises. numpy's LinAlgError is a ValueError. Anything else is a bug.
+_FIT_FAILURES: Final = (ModelError, ValueError)
 
 
 class TrainConfig(StrictModel):
     """Everything that defines a training run, recorded in `info["config"]` (so in the hash).
 
-    - `base_seed`: restart i uses `base_seed + i`; the bootstrap uses `base_seed`;
+    - `base_seed`: restart i uses `base_seed + i`, at most SEED_MAX; the bootstrap uses
+      `base_seed`;
     - `n_restarts`: restarts per fit (spec §4: 50);
     - `candidates`: the selection grid, in the order the table reports it;
       `train_candidate` ignores it;
@@ -118,10 +167,10 @@ class TrainConfig(StrictModel):
 
     @model_validator(mode="after")
     def _valid(self) -> Self:
-        """Return self when base_seed ≥ 0, n_restarts ≥ 1, `candidates` is non-empty with no
-        duplicate and every K ≥ 2, n_iter ≥ 1, tol > 0, min_covar > 0, bootstrap_draws ≥ 2
-        and validation_months ≥ 1. Otherwise raise ValueError naming the field (pydantic
-        reports a ValidationError)."""
+        """Return self when base_seed ≥ 0, n_restarts ≥ 1, base_seed + n_restarts - 1 ≤
+        SEED_MAX, `candidates` is non-empty with no duplicate and every K ≥ 2, n_iter ≥ 1,
+        tol > 0, min_covar > 0, bootstrap_draws ≥ 2 and validation_months ≥ 1. Otherwise raise
+        ValueError naming the field (pydantic reports a ValidationError)."""
         for name, minimum in (
             ("base_seed", 0),
             ("n_restarts", 1),
@@ -131,6 +180,8 @@ class TrainConfig(StrictModel):
         ):
             if getattr(self, name) < minimum:
                 raise ValueError(f"{name} must be at least {minimum}")
+        if self.base_seed + self.n_restarts - 1 > SEED_MAX:
+            raise ValueError(f"base_seed + n_restarts - 1 must be at most {SEED_MAX}")
         for name in ("tol", "min_covar"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
@@ -259,6 +310,15 @@ class FailedRestart:
 
 
 @dataclass(frozen=True, eq=False)
+class FailedFit:
+    """A fit whose restarts all failed: its candidate, which fit it was, and the failures."""
+
+    candidate: Candidate
+    fit: FitName
+    failed: tuple[FailedRestart, ...]
+
+
+@dataclass(frozen=True, eq=False)
 class CandidateFit:
     """One candidate trained on one block of rows (`fit_candidate`).
 
@@ -267,7 +327,8 @@ class CandidateFit:
     - `seeds`, `logliks`, `iterations`: one entry per recorded (non-failed) restart, in restart
       order: its seed, its training log-likelihood (Σ l_t), and EM's iteration count
       (`monitor_.iter`);
-    - `choice`: `choose_restart(logliks)`; `choice.best` indexes the recorded tuples;
+    - `choice`: `choose_restart(logliks, jacobian=n·J, fit=...)`; `choice.best` indexes the
+      recorded tuples;
     - `failed`: the failed restarts, in restart order.
     """
 
@@ -298,11 +359,14 @@ def fit_candidate(
 ) -> CandidateFit:
     """Fit `candidate` on `rows` (n, d), raw feature rows named by `columns` (exactly
     `scaler.columns`), by the module docstring's steps 1–6 with `config.n_restarts` restarts.
+    The fit is named "full" in the instability warning.
 
     Raises ModelError when `columns` isn't the scaler's, a row isn't finite, n < K, or every
     restart fails, and when workers < 1.
     """
-    return _fit_blocks(((rows, scaler, candidate),), columns, config, workers)[0]
+    return _required(
+        _fit_blocks((_Block(rows, scaler, candidate, "full"),), columns, config, workers)[0]
+    )
 
 
 @dataclass(frozen=True, eq=False)
@@ -323,26 +387,63 @@ class TrainResult:
         (sigma_k · sqrt(BARS_PER_YEAR)), "duration_bars" (1 / (1 - a_kk), null when infinite),
         "duration_sessions" (duration_bars / BARS_PER_SESSION, null when infinite),
         "occupancy"}, μ_k and sigma_k by hmm.labels's weighted formulas over the window;
+      - "validation": the model's own candidate's validation fit, on both paths: {"start" (ISO
+        UTC), "rows", "sessions", "draws", "seed", "mean", "se", "near_best", "stable" (its
+        restarts), "quantiles": {"0.01", "0.05", "0.25", "0.5", "0.75", "0.95", "0.99" →
+        numpy.quantile of the block's l_t, linear}, "drift": {"window" (DRIFT_WINDOW),
+        "quantile" (DRIFT_QUANTILE), "threshold" (`select.drift_threshold` of the block's
+        l_t)}};
       - "selection": null from `train_candidate`; from `select_and_train` {"rule", "chosen",
         "best_bic", "best_validation", "close" (candidates as {"n_states",
-        "covariance_type"}), "se", "validation": {"start" (ISO UTC), "rows", "sessions",
-        "draws", "seed"}, "table": one row per candidate in grid order {"n_states",
-        "covariance_type", "n_params", "loglik", "bic", "validation_mean", "validation_se",
-        "near_best", "stable", "sanity_passed", "sanity_reasons"}, "distribution": the chosen
-        candidate's validation l_t as {"mean", "se", "quantiles": {"0.01", "0.05", "0.25",
-        "0.5", "0.75", "0.95", "0.99" → numpy.quantile, linear}}};
+        "covariance_type"}), "se", "table": one row per scored candidate in grid order
+        {"n_states", "covariance_type", "n_params", "loglik", "bic", "validation_mean",
+        "validation_se", "near_best", "stable", "validation_near_best", "validation_stable",
+        "sanity_passed", "sanity_reasons"}, "set_aside": one entry per candidate set aside, in
+        grid order, {"n_states", "covariance_type", "failed": {fit name: [{"index", "seed",
+        "error"}]} for each failed fit}};
       - "provenance": the caller's `provenance` mapping, verbatim (code commit, lockfile hash);
       - "versions": {"python", "numpy", "scipy", "scikit-learn", "hmmlearn"}, version strings;
-      - "blas": {"name", "version"} of numpy's BLAS, from `numpy.show_config(mode="dicts")`'s
-        build dependencies (no paths).
+      - "platform": {"system", "release", "machine", "platform"} from the `platform` module;
+      - "blas": the BLAS and LAPACK builds numpy and scipy were compiled against, {"numpy",
+        "scipy"} → {"blas", "lapack"} → {"name", "version", "detection method", "openblas
+        configuration"}, each a string from `show_config(mode="dicts")` (no paths). Accelerate
+        reports no version: the OS release in "platform" identifies it.
     - `sanity`: the model's SanityReport. `train_candidate` returns a model that fails it
-      rather than raising, so a refit job can store and not activate it (spec §5);
+      rather than raising, so a refit job can store and not activate it (spec §5), except when
+      a state has no filtered mass at all: such a state has no v, d or label, and the fit
+      raises ModelError "sanity reject: <reasons>" (ARCHITECTURE §7.3: a sanity reject keeps
+      the current model and alerts);
     - `selection`: the Selection, or None from `train_candidate`.
     """
 
     model: HmmModel
     sanity: SanityReport
     selection: Selection | None
+
+
+@dataclass(frozen=True, eq=False)
+class _Split:
+    """The validation split of a fit window: the block's start, its row mask, and the scaler
+    fit on the rows before it."""
+
+    start: datetime
+    block: np.ndarray[Any, np.dtype[np.bool_]]
+    scaler: ScalerParams
+
+
+def _split(data: TrainingData, config: TrainConfig) -> _Split:
+    start = selection_rules.validation_start(data.fit_end, config.validation_months)
+    block = data.matrix.available_at >= to_us(start)
+    if any(len(np.unique(data.sessions[mask])) < 2 for mask in (block, ~block)):
+        raise ModelError("training and validation blocks must each span at least two sessions")
+    if int(block.sum()) < selection_rules.DRIFT_WINDOW:
+        raise ModelError("the validation block is shorter than the drift window")
+    scaler = ScalerParams.from_scaler(Scaler.fit(data.matrix, start=data.fit_start, end=start))
+    return _Split(start, block, scaler)
+
+
+def _full_scaler(data: TrainingData) -> ScalerParams:
+    return ScalerParams.from_scaler(Scaler.fit(data.matrix, start=data.fit_start, end=data.fit_end))
 
 
 def train_candidate(
@@ -355,21 +456,31 @@ def train_candidate(
     workers: int | None = None,
 ) -> TrainResult:
     """Train one fixed candidate on the whole fit window: the full-window fit of the module
-    docstring, its sanity report and labels, and the model. `config.candidates` is not
-    consulted. Raises ModelError as `fit_candidate` and `label_states` do, or when
+    docstring, its sanity report and labels, the candidate's validation fit and score (for the
+    validation record), and the model. `config.candidates` is not consulted. Raises
+    ModelError as `fit_candidate` and `label_states` do, when either fit fails, when the
+    validation block or the rows before it span fewer than 2 sessions or the block has fewer
+    than DRIFT_WINDOW rows, for a state with no filtered mass (a sanity reject), or when
     `provenance` has no canonical JSON form."""
-    scaler = ScalerParams.from_scaler(
-        Scaler.fit(data.matrix, start=data.fit_start, end=data.fit_end)
+    scaler, split = _full_scaler(data), _split(data, config)
+    rows = data.matrix.values
+    train_rows = rows[~split.block]
+    full, validation = (
+        _required(fit)
+        for fit in _fit_blocks(
+            (
+                _Block(rows, scaler, candidate, "full"),
+                _Block(train_rows, split.scaler, candidate, "validation"),
+            ),
+            data.matrix.columns,
+            config,
+            workers,
+        )
     )
-    fit = fit_candidate(
-        data.matrix.values,
-        scaler,
-        candidate,
-        columns=data.matrix.columns,
-        config=config,
-        workers=workers,
-    )
-    return _build_result(data, scaler, fit, thresholds, config, provenance, None, None)
+    with threadpool_limits(limits=1):
+        score = _validation_score(data, split, validation, config)
+        report = _validation_report(score, validation, split, data, config)
+        return _build_result(data, scaler, full, thresholds, config, provenance, report, None, None)
 
 
 def select_and_train(
@@ -382,65 +493,67 @@ def select_and_train(
 ) -> TrainResult:
     """Spec §4's selection over `config.candidates`, then the chosen candidate's model (module
     docstring). Raises ModelError when the validation block or the rows before it span fewer
-    than 2 sessions, when every candidate fails its sanity check (`select.select`), or as
-    `train_candidate` does."""
-    start = selection_rules.validation_start(data.fit_end, config.validation_months)
-    block = data.matrix.available_at >= to_us(start)
-    if any(len(np.unique(data.sessions[mask])) < 2 for mask in (block, ~block)):
-        raise ModelError("training and validation blocks must each span at least two sessions")
-    scaler = ScalerParams.from_scaler(
-        Scaler.fit(data.matrix, start=data.fit_start, end=data.fit_end)
-    )
-    train_scaler = ScalerParams.from_scaler(
-        Scaler.fit(data.matrix, start=data.fit_start, end=start)
-    )
+    than 2 sessions or the block has fewer than DRIFT_WINDOW rows, when every candidate is set
+    aside or fails its sanity check (`select.select`), or as `train_candidate` does."""
+    scaler, split = _full_scaler(data), _split(data, config)
     rows = data.matrix.values
+    train_rows = rows[~split.block]
     blocks = tuple(
-        item
+        block
         for c in config.candidates
-        for item in ((rows, scaler, c), (rows[~block], train_scaler, c))
+        for block in (
+            _Block(rows, scaler, c, "full"),
+            _Block(train_rows, split.scaler, c, "validation"),
+        )
     )
     fits = _fit_blocks(blocks, data.matrix.columns, config, workers)
-    scores = []
+    scores: list[CandidateScore] = []
+    kept: list[tuple[CandidateFit, CandidateFit]] = []
+    set_aside: list[dict[str, Any]] = []
     with threadpool_limits(limits=1):
         for i, candidate in enumerate(config.candidates):
-            full, train = fits[2 * i : 2 * i + 2]
-            validation = selection_rules.validation_score(
-                train.params,
-                train_scaler,
-                rows[~block],
-                rows[block],
-                data.sessions[block],
-                columns=data.matrix.columns,
-                draws=config.bootstrap_draws,
-                seed=config.base_seed,
-            )
+            full, validation = fits[2 * i : 2 * i + 2]
+            if not isinstance(full, CandidateFit) or not isinstance(validation, CandidateFit):
+                set_aside.append(_set_aside_entry(candidate, (full, validation)))
+                continue
             p = candidate.n_free_params(rows.shape[1])
             scores.append(
-                selection_rules.CandidateScore(
+                CandidateScore(
                     candidate,
                     p,
                     full.loglik,
                     selection_rules.bic(full.loglik, p, len(rows)),
-                    validation,
+                    _validation_score(data, split, validation, config),
                     selection_rules.sanity_check(full.params, full.trace.state_probs),
                 )
             )
+            kept.append((full, validation))
+        if not scores:
+            raise ModelError("no candidate survives: every one has a fit whose restarts all failed")
         selection = selection_rules.select(tuple(scores), rows.shape[1])
-        chosen_index = config.candidates.index(selection.chosen)
-        report = _selection_report(selection, fits[::2], start, data.sessions[block], config)
+        chosen = next(i for i, s in enumerate(scores) if s.candidate == selection.chosen)
+        full, validation = kept[chosen]
         return _build_result(
-            data, scaler, fits[2 * chosen_index], thresholds, config, provenance, selection, report
+            data,
+            scaler,
+            full,
+            thresholds,
+            config,
+            provenance,
+            _validation_report(scores[chosen].validation, validation, split, data, config),
+            selection,
+            _selection_report(selection, tuple(kept), set_aside),
         )
 
 
-@dataclass(frozen=True)
-class _RestartTask:
+@dataclass(frozen=True, eq=False)
+class _Block:
+    """One fit: its raw rows, the scaler that standardizes them, the candidate, its name."""
+
     rows: Floats
     scaler: ScalerParams
     candidate: Candidate
-    config: TrainConfig
-    index: int
+    fit: FitName
 
 
 @dataclass(frozen=True)
@@ -450,18 +563,35 @@ class _RestartResult:
     iterations: int
 
 
-def _restart(task: _RestartTask) -> _RestartResult | FailedRestart:
+# Set in each pool worker, once, by the pool's initializer.
+_WORKER: tuple[tuple[_Block, ...], TrainConfig] | None = None
+
+
+def _init_worker(blocks: tuple[_Block, ...], config: TrainConfig) -> None:
+    global _WORKER
+    _WORKER = (blocks, config)
+
+
+def _pooled_restart(key: tuple[int, int]) -> _RestartResult | FailedRestart:
+    """Restart key[1] of block key[0], from the blocks the initializer gave this worker."""
+    if _WORKER is None:
+        raise ModelError("the training worker was not initialized")
+    blocks, config = _WORKER
+    return _restart(blocks[key[0]], config, key[1])
+
+
+def _restart(block: _Block, config: TrainConfig, index: int) -> _RestartResult | FailedRestart:
     """The same fitting and scoring path in the caller and in spawned workers."""
-    seed = task.config.base_seed + task.index
+    seed = config.base_seed + index
     try:
         with threadpool_limits(limits=1):
-            z = task.scaler.standardize(task.rows, columns=task.scaler.columns)
+            z = block.scaler.standardize(block.rows, columns=block.scaler.columns)
             estimator = GaussianHMM(
-                n_components=task.candidate.n_states,
-                covariance_type=task.candidate.covariance_type,
-                min_covar=task.config.min_covar,
-                n_iter=task.config.n_iter,
-                tol=task.config.tol,
+                n_components=block.candidate.n_states,
+                covariance_type=block.candidate.covariance_type,
+                min_covar=config.min_covar,
+                n_iter=config.n_iter,
+                tol=config.tol,
                 random_state=seed,
                 implementation="log",
                 init_params="stmc",
@@ -470,51 +600,68 @@ def _restart(task: _RestartTask) -> _RestartResult | FailedRestart:
             estimator.fit(z)
             covariance = np.asarray(estimator.covars_, dtype=np.float64)
             params = GaussianParams(
-                task.candidate.covariance_type,
+                block.candidate.covariance_type,
                 np.asarray(estimator.startprob_, dtype=np.float64),
                 np.asarray(estimator.transmat_, dtype=np.float64),
                 np.asarray(estimator.means_, dtype=np.float64),
                 0.5 * (covariance + covariance.transpose(0, 2, 1)),
             )
-            trace = forward_pass(params, task.scaler, task.rows, columns=task.scaler.columns)
+            trace = forward_pass(params, block.scaler, block.rows, columns=block.scaler.columns)
             loglik = float(np.sum(trace.loglik))
             if not math.isfinite(loglik):
                 raise ModelError("training log-likelihood overflows float64")
             return _RestartResult(params, loglik, int(estimator.monitor_.iter))
-    except Exception as exc:
-        # A bad local optimum must not discard the usable restarts.
-        return FailedRestart(task.index, seed, type(exc).__name__)
+    except _FIT_FAILURES as exc:
+        # A bad local optimum must not discard the usable restarts; a bug still raises.
+        return FailedRestart(index, seed, type(exc).__name__)
+
+
+@contextmanager
+def _single_threaded_children() -> Iterator[None]:
+    """Set BLAS_THREAD_VARIABLES to "1" in os.environ, which processes started now inherit,
+    and restore the caller's values (or their absence) afterwards."""
+    saved = {name: os.environ.get(name) for name in BLAS_THREAD_VARIABLES}
+    os.environ.update(dict.fromkeys(BLAS_THREAD_VARIABLES, "1"))
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _fit_blocks(
-    blocks: tuple[tuple[Floats, ScalerParams, Candidate], ...],
+    blocks: tuple[_Block, ...],
     columns: tuple[str, ...],
     config: TrainConfig,
     workers: int | None,
-) -> tuple[CandidateFit, ...]:
-    """Submit all blocks to one pool and reduce results in seed order."""
+) -> tuple[CandidateFit | FailedFit, ...]:
+    """Run every restart of every block, in one pool, and reduce each block in seed order."""
     if workers is not None and workers < 1:
         raise ModelError("workers must be positive")
-    tasks: list[_RestartTask] = []
-    for rows, scaler, candidate in blocks:
-        scaler.standardize(rows, columns=columns)
-        if rows.ndim != 2 or len(rows) < candidate.n_states or candidate.n_states < 1:
-            raise ModelError("a fit needs at least K rows and a positive state count")
-        tasks.extend(
-            _RestartTask(rows, scaler, candidate, config, i) for i in range(config.n_restarts)
-        )
-    context = (
-        nullcontext(None)
-        if workers == 1
-        else ProcessPoolExecutor(
-            max_workers=workers, mp_context=multiprocessing.get_context("spawn")
-        )
-    )
-    with context as pool:
-        results = list(map(_restart, tasks) if pool is None else pool.map(_restart, tasks))
-    fits = []
+    for block in blocks:
+        block.scaler.standardize(block.rows, columns=columns)
+        if block.rows.ndim != 2 or len(block.rows) < block.candidate.n_states:
+            raise ModelError("a fit needs at least K rows")
+    keys = [(b, i) for b in range(len(blocks)) for i in range(config.n_restarts)]
+    if workers == 1:
+        results = [_restart(blocks[b], config, i) for b, i in keys]
+    else:
+        with (
+            _single_threaded_children(),
+            ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=_init_worker,
+                initargs=(blocks, config),
+            ) as pool,
+        ):
+            results = list(pool.map(_pooled_restart, keys))
+    fits: list[CandidateFit | FailedFit] = []
     with threadpool_limits(limits=1):
-        for block_index, (rows, scaler, candidate) in enumerate(blocks):
+        for block_index, block in enumerate(blocks):
             offset = block_index * config.n_restarts
             batch = results[offset : offset + config.n_restarts]
             good = [
@@ -522,9 +669,15 @@ def _fit_blocks(
             ]
             failed = tuple(result for result in batch if isinstance(result, FailedRestart))
             if not good:
-                raise ModelError(f"all restarts failed for {candidate}: {failed}")
+                fits.append(FailedFit(block.candidate, block.fit, failed))
+                continue
             logliks = tuple(result.loglik for _, result in good)
-            choice = selection_rules.choose_restart(logliks, candidate=candidate)
+            choice = selection_rules.choose_restart(
+                logliks,
+                candidate=block.candidate,
+                jacobian=len(block.rows) * -float(np.log(block.scaler.std).sum()),
+                fit=block.fit,
+            )
             params = good[choice.best][1].params
             # Reconstruct to retain array immutability after process transport.
             params = GaussianParams(
@@ -534,10 +687,10 @@ def _fit_blocks(
                 params.means,
                 params.covars,
             )
-            trace = forward_pass(params, scaler, rows, columns=columns)
+            trace = forward_pass(params, block.scaler, block.rows, columns=columns)
             fits.append(
                 CandidateFit(
-                    candidate,
+                    block.candidate,
                     params,
                     trace,
                     tuple(config.base_seed + i for i, _ in good),
@@ -550,18 +703,80 @@ def _fit_blocks(
     return tuple(fits)
 
 
+def _required(fit: CandidateFit | FailedFit) -> CandidateFit:
+    if isinstance(fit, FailedFit):
+        raise ModelError(f"all restarts failed for {fit.candidate} ({fit.fit}): {fit.failed}")
+    return fit
+
+
+def _failures(failed: tuple[FailedRestart, ...]) -> list[dict[str, Any]]:
+    return [{"index": f.index, "seed": f.seed, "error": f.error} for f in failed]
+
+
+def _set_aside_entry(
+    candidate: Candidate, fits: tuple[CandidateFit | FailedFit, ...]
+) -> dict[str, Any]:
+    return {
+        **candidate.model_dump(mode="json"),
+        "failed": {f.fit: _failures(f.failed) for f in fits if isinstance(f, FailedFit)},
+    }
+
+
+def _validation_score(
+    data: TrainingData, split: _Split, fit: CandidateFit, config: TrainConfig
+) -> ValidationScore:
+    rows = data.matrix.values
+    return selection_rules.validation_score(
+        fit.params,
+        split.scaler,
+        rows[~split.block],
+        rows[split.block],
+        data.sessions[split.block],
+        columns=data.matrix.columns,
+        draws=config.bootstrap_draws,
+        seed=config.base_seed,
+    )
+
+
 def _finite_or_none(value: float) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
-def _selection_report(
-    selection: Selection,
-    fits: tuple[CandidateFit, ...],
-    start: datetime,
-    sessions: Ints,
+def _validation_report(
+    score: ValidationScore,
+    fit: CandidateFit,
+    split: _Split,
+    data: TrainingData,
     config: TrainConfig,
 ) -> dict[str, Any]:
-    chosen = next(s for s in selection.scores if s.candidate == selection.chosen)
+    sessions = data.sessions[split.block]
+    return {
+        "start": split.start,
+        "rows": len(sessions),
+        "sessions": len(np.unique(sessions)),
+        "draws": config.bootstrap_draws,
+        "seed": config.base_seed,
+        "mean": score.mean,
+        "se": score.se,
+        "near_best": fit.choice.near_best,
+        "stable": fit.choice.stable,
+        "quantiles": {
+            str(q): float(np.quantile(score.loglik, q))
+            for q in (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
+        },
+        "drift": {
+            "window": selection_rules.DRIFT_WINDOW,
+            "quantile": selection_rules.DRIFT_QUANTILE,
+            "threshold": selection_rules.drift_threshold(score.loglik),
+        },
+    }
+
+
+def _selection_report(
+    selection: Selection,
+    fits: tuple[tuple[CandidateFit, CandidateFit], ...],
+    set_aside: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "rule": selection.rule,
         "chosen": selection.chosen.model_dump(mode="json"),
@@ -569,13 +784,6 @@ def _selection_report(
         "best_validation": selection.best_validation.model_dump(mode="json"),
         "close": [c.model_dump(mode="json") for c in selection.close],
         "se": selection.se,
-        "validation": {
-            "start": start,
-            "rows": len(sessions),
-            "sessions": len(np.unique(sessions)),
-            "draws": config.bootstrap_draws,
-            "seed": config.base_seed,
-        },
         "table": [
             {
                 **score.candidate.model_dump(mode="json"),
@@ -584,22 +792,30 @@ def _selection_report(
                 "bic": score.bic,
                 "validation_mean": score.validation.mean,
                 "validation_se": score.validation.se,
-                "near_best": fit.choice.near_best,
-                "stable": fit.choice.stable,
+                "near_best": full.choice.near_best,
+                "stable": full.choice.stable,
+                "validation_near_best": validation.choice.near_best,
+                "validation_stable": validation.choice.stable,
                 "sanity_passed": score.sanity.passed,
                 "sanity_reasons": score.sanity.reasons,
             }
-            for score, fit in zip(selection.scores, fits, strict=True)
+            for score, (full, validation) in zip(selection.scores, fits, strict=True)
         ],
-        "distribution": {
-            "mean": chosen.validation.mean,
-            "se": chosen.validation.se,
-            "quantiles": {
-                str(q): float(np.quantile(chosen.validation.loglik, q))
-                for q in (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
-            },
-        },
+        "set_aside": set_aside,
     }
+
+
+def _blas_builds() -> dict[str, Any]:
+    """numpy's and scipy's BLAS and LAPACK builds, without paths (TrainResult)."""
+    fields = ("name", "version", "detection method", "openblas configuration")
+    builds: dict[str, Any] = {}
+    for library in (np, scipy):
+        built = library.show_config(mode="dicts")["Build Dependencies"]
+        builds[library.__name__] = {
+            api: {field: str(built[api].get(field)) for field in fields}
+            for api in ("blas", "lapack")
+        }
+    return builds
 
 
 def _build_result(
@@ -609,19 +825,22 @@ def _build_result(
     thresholds: LabelThresholds,
     config: TrainConfig,
     provenance: Mapping[str, Any],
+    validation_report: dict[str, Any],
     selection: Selection | None,
     selection_report: dict[str, Any] | None,
 ) -> TrainResult:
     with threadpool_limits(limits=1):
         sanity = selection_rules.sanity_check(fit.params, fit.trace.state_probs)
-        labels = label_states(data.returns, fit.trace.state_probs, thresholds)
         weights = fit.trace.state_probs.sum(axis=0)
+        if (weights <= 0).any():
+            # No filtered mass: no v, d or label. Occupancy 0 is already among the reasons.
+            raise ModelError("sanity reject: " + "; ".join(sanity.reasons))
+        labels = label_states(data.returns, fit.trace.state_probs, thresholds)
         means = (fit.trace.state_probs * data.returns[:, None]).sum(axis=0) / weights
         deviations = np.sqrt(
             (fit.trace.state_probs * (data.returns[:, None] - means) ** 2).sum(axis=0) / weights
         )
     p = fit.candidate.n_free_params(fit.params.n_features)
-    blas = np.show_config(mode="dicts")["Build Dependencies"]["blas"]
     info = {
         "data_hash": data.data_hash(),
         "config": config.model_dump(mode="json"),
@@ -633,7 +852,7 @@ def _build_result(
             "near_best": fit.choice.near_best,
             "stable": fit.choice.stable,
             "iterations": fit.iterations,
-            "failed": [{"index": f.index, "seed": f.seed, "error": f.error} for f in fit.failed],
+            "failed": _failures(fit.failed),
         },
         "sanity": {
             "passed": sanity.passed,
@@ -658,13 +877,20 @@ def _build_result(
             }
             for k, label in enumerate(labels.states)
         ],
+        "validation": validation_report,
         "selection": selection_report,
         "provenance": provenance,
         "versions": {
             "python": platform.python_version(),
             **{name: version(name) for name in ("numpy", "scipy", "scikit-learn", "hmmlearn")},
         },
-        "blas": {"name": blas["name"], "version": blas["version"]},
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "platform": platform.platform(),
+        },
+        "blas": _blas_builds(),
     }
     try:
         # Validate before pydantic serializes arbitrary caller provenance.

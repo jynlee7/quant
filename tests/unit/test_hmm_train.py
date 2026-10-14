@@ -354,14 +354,14 @@ def test_the_training_record_and_report_are_complete() -> None:
     info = record.info
     assert set(info) == {
         "data_hash", "config", "candidate", "n_rows", "loglik", "bic", "restarts", "sanity",
-        "states", "selection", "provenance", "versions", "blas",
+        "states", "validation", "selection", "provenance", "versions", "platform", "blas",
     }  # fmt: skip
     assert info["data_hash"] == data.data_hash()
     assert dict(info["provenance"]) == PROVENANCE
     assert info["config"]["n_restarts"] == config.n_restarts
     assert info["versions"]["hmmlearn"] == "0.3.3"
     assert set(info["versions"]) == {"python", "numpy", "scipy", "scikit-learn", "hmmlearn"}
-    assert set(info["blas"]) == {"name", "version"}
+    assert set(info["blas"]) == {"numpy", "scipy"}
     n, k = len(data.matrix), model.params.n_states
     p = ref_n_params(k, 2, model.params.covariance_type)
     assert (info["n_rows"], info["loglik"]) == (n, loglik)
@@ -406,7 +406,7 @@ def test_the_training_record_and_report_are_complete() -> None:
         assert row["validation_se"] > 0
     chosen_row = table[FAST_GRID.index((3, "full"))]
     assert (chosen_row["loglik"], chosen_row["bic"]) == (info["loglik"], info["bic"])
-    validation = selection["validation"]
+    validation = info["validation"]
     start = validation_start(data.fit_end, 12)
     assert datetime.fromisoformat(validation["start"]) == start
     block = data.matrix.available_at >= to_us(start)
@@ -415,9 +415,9 @@ def test_the_training_record_and_report_are_complete() -> None:
     )
     assert validation["sessions"] == len(np.unique(data.sessions[block]))
     assert (validation["draws"], validation["seed"]) == (1000, R1_BASE_SEED)
-    distribution = selection["distribution"]
-    assert set(distribution["quantiles"]) == {"0.01", "0.05", "0.25", "0.5", "0.75", "0.95", "0.99"}
-    assert distribution["mean"] == chosen_row["validation_mean"]
+    assert set(validation["quantiles"]) == {"0.01", "0.05", "0.25", "0.5", "0.75", "0.95", "0.99"}
+    assert validation["mean"] == chosen_row["validation_mean"]
+    assert selection["set_aside"] == ()
 
 
 # --- Determinism ------------------------------------------------------------------------------
@@ -578,7 +578,6 @@ def test_each_restart_fits_with_its_own_seed(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 def test_restart_stability_does_not_depend_on_feature_units() -> None:
     """The same rows in units a quarter the size give the same standardized rows, so the same
     fits, gaps and stability; only the raw log-likelihood's Jacobian moves."""
@@ -609,7 +608,6 @@ def test_restart_stability_does_not_depend_on_feature_units() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
 def test_every_seed_must_be_in_numpys_seed_range() -> None:
     import pydantic
 
@@ -622,7 +620,6 @@ def test_every_seed_must_be_in_numpys_seed_range() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=ModelError)
 def test_a_programming_error_in_a_restart_is_raised_not_recorded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -654,7 +651,6 @@ def _collinear_data() -> Any:
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=ModelError)
 def test_a_candidate_whose_restarts_all_fail_is_set_aside() -> None:
     from quant.hmm.train import select_and_train
 
@@ -692,7 +688,6 @@ def test_selection_fails_when_no_candidate_survives() -> None:
 
 
 @pytest.mark.spec("SPEC§4", "ARCH§14")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 def test_pool_workers_start_with_single_threaded_blas(monkeypatch: pytest.MonkeyPatch) -> None:
     """Accelerate ignores threadpoolctl, so the limit must be in each spawned worker's
     environment before it imports numpy, whatever the caller's environment says."""
@@ -718,7 +713,6 @@ def test_pool_workers_start_with_single_threaded_blas(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.spec("ARCH§7.1")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 def test_pool_tasks_ship_indices_not_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each worker receives the rows once; a task is a few bytes, whatever the rows' size."""
     import pickle
@@ -756,7 +750,6 @@ def test_pool_tasks_ship_indices_not_rows(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.mark.spec("ARCH§7.2", "ARCH§14")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
 def test_the_record_names_the_platform_and_the_blas_build() -> None:
     import platform
 
@@ -786,7 +779,6 @@ def _rolling_quantile(loglik: Any, window: int, q: float) -> float:
 
 
 @pytest.mark.spec("SPEC§4", "SPEC§5", "ARCH§7.2")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
 def test_the_record_carries_the_drift_baseline() -> None:
     """Spec §5's live check compares the 35-bar rolling mean of l_t with the 1st percentile of
     its distribution on the validation block, so meta.json stores that percentile."""
@@ -804,7 +796,6 @@ def test_the_record_carries_the_drift_baseline() -> None:
 
 
 @pytest.mark.spec("SPEC§5", "ARCH§7.2")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
 def test_a_refit_records_its_own_drift_baseline() -> None:
     from quant.hmm.train import train_candidate
 
@@ -820,7 +811,6 @@ def test_a_refit_records_its_own_drift_baseline() -> None:
 
 
 @pytest.mark.spec("SPEC§4", "SPEC§5")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 def test_a_refit_with_a_state_that_never_holds_is_a_sanity_reject(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -853,7 +843,6 @@ def test_a_refit_with_a_state_that_never_holds_is_a_sanity_reject(
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
 def test_validation_fits_warn_as_validation_and_record_their_stability() -> None:
     from quant.hmm.train import select_and_train
 

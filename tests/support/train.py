@@ -13,6 +13,7 @@ from __future__ import annotations
 import itertools
 import math
 from datetime import UTC, date, datetime, timedelta
+from fractions import Fraction
 from typing import Any
 
 import numpy as np
@@ -148,10 +149,18 @@ def ref_se(means: Floats) -> float:
 def ref_sanity(transmat: Floats, covars: Floats, state_probs: Floats) -> dict[str, list[bool]]:
     """Spec §4's rejects per state, True where the state fails: occupancy (mean filtered
     probability) under 0.02, expected duration 1 / (1 - a_kk) under 2 bars, covariance
-    condition number (largest over smallest eigenvalue) above 1e6."""
-    k = len(transmat)
-    occupancy = [math.fsum(state_probs[:, j]) / len(state_probs) < 0.02 for j in range(k)]
-    duration = [transmat[j, j] < 1.0 and 1.0 / (1.0 - transmat[j, j]) < 2.0 for j in range(k)]
+    condition number (largest over smallest eigenvalue) above 1e6. Occupancy and duration are
+    compared in exact rationals on the floats' decimal values, the sum of a state's
+    probabilities rounded once (math.fsum)."""
+    k, n = len(transmat), len(state_probs)
+    occupancy = [
+        Fraction(repr(math.fsum(state_probs[:, j]))) / n < Fraction(2, 100) for j in range(k)
+    ]
+    duration = [
+        Fraction(repr(float(transmat[j, j]))) < 1
+        and 1 / (1 - Fraction(repr(float(transmat[j, j])))) < 2
+        for j in range(k)
+    ]
     eig = [np.linalg.eigvalsh(c) for c in covars]
     condition = [float(e.max() / e.min()) > 1e6 for e in eig]
     return {"occupancy": occupancy, "duration": duration, "condition": condition}

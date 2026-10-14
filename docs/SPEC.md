@@ -1,6 +1,6 @@
 # SPEC — SPY Regime Trader
 
-**Status:** APPROVED v1.3 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). Each one is tagged where it lands.
+**Status:** APPROVED v1.6 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). v1.6 spells out how B4 reads §4–§6: instability measured on the standardized rows, candidates whose restarts all fail set aside, inclusive sanity edges, the drift baseline every model records, and the filter's log-likelihood, missing bars, absorbing labels and entropy (2026-10-14). Each one is tagged where it lands.
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The spec, the architecture and the [plan](PLAN.md) are approved, and the build started 2026-10-05. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -107,9 +107,9 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
 
 - `hmmlearn.GaussianHMM` on Python 3.12, because hmmlearn 0.3.3 ships no wheels for your default Python 3.14.
 - **Candidates:** K ∈ {2, 3, 4, 5} × covariance ∈ {diag, full}.
-- **Restarts:** 50 per candidate, with seeds `base_seed + i` and `base_seed` fixed in config. The run with the highest training log-likelihood wins. A warning fires if fewer than 3 restarts land within 0.1% of the best, which signals an unstable optimum.
-- **Selection:** each candidate gets two scores: BIC on the fit window, and mean one-step-ahead predictive log-likelihood on a validation block. The validation block is the last 12 months of the fit window, with the model fit on the rest. "Close" means within 10 BIC points, or within one standard error of the best validation log-likelihood (session-block bootstrap). The pick is the simplest candidate that is close to the best on both scores. If no candidate is, the pick is the simpler of the two winners. The chosen candidate is then refit on the full window.
-- **Sanity rejects:** a candidate is rejected if any state has under 2% occupancy, an expected duration under 2 bars, or a covariance condition number above 10⁶.
+- **Restarts:** 50 per candidate, with seeds `base_seed + i` and `base_seed` fixed in config. The run with the highest training log-likelihood wins. A warning fires if fewer than 3 restarts land within 0.1% of the best, which signals an unstable optimum. The 0.1% is taken of the best log-likelihood of the *standardized* rows, so the features' units can't change it (v1.6).
+- **Selection:** each candidate gets two scores: BIC on the fit window, and mean one-step-ahead predictive log-likelihood on a validation block. The validation block is the last 12 months of the fit window, with the model fit on the rest. "Close" means within 10 BIC points, or within one standard error of the best validation log-likelihood (session-block bootstrap). The pick is the simplest candidate that is close to the best on both scores. If no candidate is, the pick is the simpler of the two winners. The chosen candidate is then refit on the full window. A candidate whose restarts all fail, on either fit, is set aside like a rejected one and listed in the report; selection fails only when no candidate is left (v1.6).
+- **Sanity rejects:** a candidate is rejected if any state has under 2% occupancy, an expected duration under 2 bars, or a covariance condition number above 10⁶. Each edge is inclusive and compared on the decimal values of the numbers: exactly 2%, exactly 2 bars or exactly 10⁶ passes (v1.6).
 - **Report for every model version:** the transition matrix. For each state: annualized mean return and volatility, expected duration `1 / (1 − a_kk)` in bars and in sessions, occupancy and label. Plus the BIC and validation log-likelihood table for every candidate.
 - **Auto-labels:** the thresholds are fixed in config before any out-of-sample run. Define `v = σ_state / σ_all` and `d = μ_state / σ_state`, both annualized and computed from raw returns weighted by filtered probability over the fit window. Rules are checked in order:
 
@@ -131,7 +131,7 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
   - a matched state's expected duration changes by more than 50%;
   - a matched state's mean moves more than 0.5 units on any feature, measured in the previous model's standardized units;
   - a matched state's rule-derived label differs from the label it inherited;
-  - in live trading, the 35-bar rolling mean of the predictive log-likelihood falls below the 1st percentile of its distribution on the validation block.
+  - in live trading, the 35-bar rolling mean of the predictive log-likelihood falls below the 1st percentile of its distribution on the validation block. That distribution is the means of every full 35-bar window of the block's log-likelihoods under the validation fit (§4). Every model records its own, a refit included, which fits its validation block for this alone. Both sides are densities of the raw rows, so the two models' scalers need no reconciling (v1.6).
 - **Failed refit:** a refit that fails a drift check is stored but not activated. The current model keeps running, with entries frozen (C5).
 - **Unfreeze:** either the next refit passes every check, or you acknowledge the drift manually (logged). The backtest simulates only the first path.
 - **Versioning:** every model, playbook and strategy.md is an immutable version behind a `current` pointer. Rollback is one command. Refits, promotions and rollbacks take effect at the next session open, never mid-session. An urgent rollback is the kill switch, then the rollback, then a resume (C7).
@@ -140,6 +140,11 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
 
 - **Our own forward filter**, in log space and normalized: `p_t ∝ b(x_t) ⊙ (p_{t−1} A)`. Emission log-densities are computed with scipy from the model's means and covariances, not from hmmlearn internals.
 - **Outputs on every bar:** filtered state and label probabilities; next-bar probabilities `q_t = p_t A`; normalized label entropy `H_t ∈ [0, 1]`; the predictive log-likelihood `log p(x_t | x_{<t})`; and the expected remaining duration of the active label.
+- **Clarifications (v1.6):**
+  1. The predictive log-likelihood is the density of the raw row, so it includes the scaler's Jacobian, −Σ log std.
+  2. A missing or NaN bar is absent from the filter: no transition is taken for it, and rule 6 handles the decision.
+  3. A model with a reachable label it can never leave, other than a label covering every state, is a model error when its filter is built.
+  4. Entropy is normalized by ln(the number of labels in the model).
 - **Model swap:** a new model's filter is initialized by running it over its own fit window up to the swap time, so it only ever sees past data.
 - **What hmmlearn does:** `predict_proba` and `score_samples` return *smoothed* posteriors, and `predict` and `decode` return Viterbi paths. All four are banned from the decision path (I2). Smoothed posteriors exist only in `eval/`, for calibration and for the nightly review of wrong state calls. EM training uses forward-backward internally, but only on the fit window; that is estimation on past data, not a decision.
 

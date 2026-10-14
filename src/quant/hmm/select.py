@@ -40,7 +40,20 @@ candidates that pass the sanity rejects only; rejected candidates are never pick
 **Sanity rejects** (spec §4, `sanity_check`): a model is rejected when any state has an
 occupancy under OCCUPANCY_MIN, an expected duration under DURATION_MIN bars, or a covariance
 condition number above CONDITION_MAX. All three thresholds are strict: a value exactly at one
-passes.
+passes. They compare exactly, on the decimal values of the floats (`Decimal(repr(x))`, as the
+risk engine compares its limits): occupancy as math.fsum(p_tk over t) < OCCUPANCY_MIN · n, so
+1,000 rows of 0.02 are exactly 2% however a float mean rounds; duration as DURATION_MIN ·
+(1 - a_kk) > 1, so a_kk = 0.49999999999999994 is under 2 bars though 1 / (1 - a_kk) rounds to 2.
+
+**Instability** (spec §4): "within 0.1% of the best" is NEAR_BEST_RTOL of the best restart's
+log-likelihood of the *standardized* rows, LL - n·J, J = -Σ log std being the scaler's Jacobian
+the raw-row log-likelihood carries per row. The Jacobian is set by the features' units alone,
+so measured on the raw LL the same fits could be stable in one unit and unstable in another.
+
+**Drift baseline** (spec §5, ARCHITECTURE §7.5): the live engine compares the DRIFT_WINDOW-bar
+rolling mean of l_t with the DRIFT_QUANTILE quantile of that rolling mean over the validation
+block (`drift_threshold`). Both are densities of the raw rows (the Jacobian included), so the
+validation fit's l_t and the live model's are on one scale, whatever their scalers.
 """
 
 from __future__ import annotations
@@ -49,6 +62,7 @@ import calendar
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Final, Literal
 
 import numpy as np
@@ -72,10 +86,16 @@ CONDITION_MAX: Final = 1e6
 # training log-likelihood is within NEAR_BEST_RTOL of the best's, relative to |best|.
 NEAR_BEST_RTOL: Final = 1e-3
 NEAR_BEST_MIN: Final = 3
+# Spec §5's live drift check: the 35-bar rolling mean of l_t against its 1st percentile on the
+# validation block.
+DRIFT_WINDOW: Final = 35
+DRIFT_QUANTILE: Final = 0.01
 # Bars per session, for durations in sessions (spec §4's report): the labels' annualization.
 BARS_PER_SESSION: Final = BARS_PER_YEAR // 252
 
 SelectionRule = Literal["close_on_both", "simpler_winner"]
+# Which of a candidate's two fits a restart choice belongs to (select_and_train fits both).
+FitName = Literal["full", "validation"]
 
 
 class Candidate(StrictModel):
@@ -123,7 +143,8 @@ class RestartChoice:
     - `best`: the index of the highest log-likelihood, a tie going to the lowest index
       (`int(numpy.argmax(logliks))`);
     - `near_best`: how many restarts, the winner included, have |LL_i - LL_best| ≤
-      NEAR_BEST_RTOL * |LL_best| (inclusive);
+      NEAR_BEST_RTOL * |LL_best - jacobian| (inclusive), LL_best - jacobian being the best
+      restart's standardized-row log-likelihood (module docstring);
     - `stable`: near_best ≥ NEAR_BEST_MIN.
     """
 
@@ -132,23 +153,30 @@ class RestartChoice:
     stable: bool
 
 
-def choose_restart(logliks: tuple[float, ...], *, candidate: Candidate) -> RestartChoice:
+def choose_restart(
+    logliks: tuple[float, ...], *, candidate: Candidate, jacobian: float, fit: FitName
+) -> RestartChoice:
     """The RestartChoice for one candidate's restart log-likelihoods, in restart order.
 
+    `logliks` are raw-row log-likelihoods and `jacobian` the total log-Jacobian they carry, n·J
+    with J = -Σ log std of the fit's scaler (0 for standardized rows). `fit` names the fit.
+
     When the result isn't stable, log one structlog warning, event "hmm optimum unstable",
-    with the fields n_states, covariance_type, near_best, restarts (len(logliks)) and
+    with the fields fit, n_states, covariance_type, near_best, restarts (len(logliks)) and
     best_loglik. A stable result logs nothing. Raises ModelError for an empty tuple or a value
     that isn't finite.
     """
-    if not logliks or not np.isfinite(logliks).all():
+    if not logliks or not np.isfinite(logliks).all() or not math.isfinite(jacobian):
         raise ModelError("restarts need finite log-likelihoods")
     best = int(np.argmax(logliks))
     value = logliks[best]
-    near = sum(abs(ll - value) <= NEAR_BEST_RTOL * abs(value) for ll in logliks)
+    tolerance = NEAR_BEST_RTOL * abs(value - jacobian)
+    near = sum(abs(ll - value) <= tolerance for ll in logliks)
     stable = near >= NEAR_BEST_MIN
     if not stable:
         structlog.get_logger().warning(
             "hmm optimum unstable",
+            fit=fit,
             n_states=candidate.n_states,
             covariance_type=candidate.covariance_type,
             near_best=near,
@@ -264,7 +292,7 @@ def bootstrap_se(loglik: Floats, sessions: Ints, *, draws: int, seed: int) -> fl
 class SanityReport:
     """Spec §4's sanity checks of one model on its fit window, one entry per state.
 
-    - `occupancy` (K,): mean filtered probability, Σ_t p_tk / n;
+    - `occupancy` (K,): mean filtered probability, math.fsum(p_tk over t) / n;
     - `durations` (K,): expected duration 1 / (1 - a_kk) in bars, +inf where a_kk = 1;
     - `condition` (K,): `numpy.linalg.cond(covars[k])`, the 2-norm condition number of the
       stored (standardized) covariance;
@@ -299,19 +327,46 @@ def sanity_check(params: GaussianParams, state_probs: Floats) -> SanityReport:
         or not np.isfinite(state_probs).all()
     ):
         raise ModelError("sanity checks need finite float64 probabilities of shape (n, K)")
-    occupancy = state_probs.mean(axis=0)
+    n = len(state_probs)
+    totals = [math.fsum(state_probs[:, k]) for k in range(params.n_states)]
+    occupancy = np.array([total / n for total in totals], dtype=np.float64)
+    stay = np.diag(params.transmat)
     with np.errstate(divide="ignore"):
-        durations = 1 / (1 - np.diag(params.transmat))
+        durations = 1 / (1 - stay)
     condition = np.array([np.linalg.cond(c) for c in params.covars], dtype=np.float64)
     reasons = []
     for k in range(params.n_states):
-        if occupancy[k] < OCCUPANCY_MIN:
+        if _exact(totals[k]) < _exact(OCCUPANCY_MIN) * n:
             reasons.append(f"state {k}: occupancy {occupancy[k]} < 0.02")
-        if durations[k] < DURATION_MIN:
+        if _exact(DURATION_MIN) * (1 - _exact(float(stay[k]))) > 1:
             reasons.append(f"state {k}: duration {durations[k]} < 2 bars")
-        if condition[k] > CONDITION_MAX:
+        if _exact(float(condition[k])) > _exact(CONDITION_MAX):
             reasons.append(f"state {k}: condition number {condition[k]} > 1e6")
     return SanityReport(occupancy, durations, condition, tuple(reasons))
+
+
+def _exact(value: float) -> Decimal:
+    """The decimal value a float stands for, as the risk engine reads its limits."""
+    return Decimal(repr(value))
+
+
+def drift_threshold(loglik: Floats) -> float:
+    """Spec §5's baseline: `float(numpy.quantile(means, DRIFT_QUANTILE))` (linear), `means`
+    being the mean of every full window of DRIFT_WINDOW consecutive values of `loglik` (the
+    validation block's l_t, in order), m - DRIFT_WINDOW + 1 of them, each
+    `math.fsum(window) / DRIFT_WINDOW`. Raises ModelError when `loglik` isn't a finite float64
+    (m,) array with m ≥ DRIFT_WINDOW."""
+    if (
+        not isinstance(loglik, np.ndarray)
+        or loglik.dtype != np.float64
+        or loglik.ndim != 1
+        or len(loglik) < DRIFT_WINDOW
+        or not np.isfinite(loglik).all()
+    ):
+        raise ModelError(f"the drift baseline needs at least {DRIFT_WINDOW} finite values")
+    windows = np.lib.stride_tricks.sliding_window_view(loglik, DRIFT_WINDOW)
+    means = np.array([math.fsum(w) / DRIFT_WINDOW for w in windows], dtype=np.float64)
+    return float(np.quantile(means, DRIFT_QUANTILE))
 
 
 @dataclass(frozen=True, eq=False)

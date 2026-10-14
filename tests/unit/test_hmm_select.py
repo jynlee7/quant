@@ -96,11 +96,20 @@ def test_bic_is_minus_two_loglik_plus_p_log_n() -> None:
 def test_restart_ties_break_to_the_lowest_index() -> None:
     from quant.hmm.select import choose_restart
 
-    choice = choose_restart((-5.0, -3.0, -3.0, -4.0), candidate=_candidate(3, "full"))
+    choice = choose_restart(
+        (-5.0, -3.0, -3.0, -4.0), candidate=_candidate(3, "full"), jacobian=0.0, fit="full"
+    )
     assert choice.best == 1
-    assert choose_restart((-2.0, -2.0, -2.0), candidate=_candidate(2, "diag")).best == 0
+    assert (
+        choose_restart(
+            (-2.0, -2.0, -2.0), candidate=_candidate(2, "diag"), jacobian=0.0, fit="full"
+        ).best
+        == 0
+    )
     logliks = (-10.0, -9.5, -9.75, -9.5, -11.0)
-    assert choose_restart(logliks, candidate=_candidate(2, "diag")).best == int(np.argmax(logliks))
+    assert choose_restart(
+        logliks, candidate=_candidate(2, "diag"), jacobian=0.0, fit="full"
+    ).best == int(np.argmax(logliks))
 
 
 @pytest.mark.spec("SPEC§4")
@@ -111,7 +120,10 @@ def test_the_instability_warning_fires_when_fewer_than_three_restarts_are_near_t
     beyond = float(np.nextafter(-1001.0, -math.inf))
     with capture_logs() as logs:
         choice = choose_restart(
-            (-1000.0, -1001.0, beyond, -1200.0), candidate=_candidate(4, "full")
+            (-1000.0, -1001.0, beyond, -1200.0),
+            candidate=_candidate(4, "full"),
+            jacobian=0.0,
+            fit="full",
         )
     assert (choice.best, choice.near_best, choice.stable) == (0, 2, False)
     warnings = [e for e in logs if e["event"] == "hmm optimum unstable"]
@@ -128,7 +140,10 @@ def test_three_restarts_near_the_best_is_stable_and_silent() -> None:
 
     with capture_logs() as logs:
         choice = choose_restart(
-            (-1001.0, -1000.0, -1000.5, -1500.0), candidate=_candidate(3, "diag")
+            (-1001.0, -1000.0, -1000.5, -1500.0),
+            candidate=_candidate(3, "diag"),
+            jacobian=0.0,
+            fit="full",
         )
     assert (choice.best, choice.near_best, choice.stable) == (1, 3, True)
     assert not [e for e in logs if e["event"] == "hmm optimum unstable"]
@@ -139,7 +154,7 @@ def test_a_single_restart_is_unstable() -> None:
     from quant.hmm.select import choose_restart
 
     with capture_logs() as logs:
-        choice = choose_restart((-5.0,), candidate=_candidate(2, "full"))
+        choice = choose_restart((-5.0,), candidate=_candidate(2, "full"), jacobian=0.0, fit="full")
     assert (choice.best, choice.near_best, choice.stable) == (0, 1, False)
     assert [e["event"] for e in logs] == ["hmm optimum unstable"]
 
@@ -150,7 +165,7 @@ def test_choose_restart_refuses_empty_or_non_finite(logliks: tuple[float, ...]) 
     from quant.hmm.select import choose_restart
 
     with pytest.raises(ModelError):
-        choose_restart(logliks, candidate=_candidate(2, "diag"))
+        choose_restart(logliks, candidate=_candidate(2, "diag"), jacobian=0.0, fit="full")
 
 
 # --- The validation block -------------------------------------------------------------------
@@ -511,7 +526,6 @@ def test_selection_fails_when_every_candidate_is_rejected_or_none_given() -> Non
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=TypeError)
 def test_near_best_is_measured_on_the_standardized_log_likelihood() -> None:
     """The raw log-likelihood carries the scaler's Jacobian n·J, a constant set by the features'
     units. 0.1% is taken of the standardized-row log-likelihood LL - n·J, so units can't move it."""
@@ -530,7 +544,6 @@ def test_near_best_is_measured_on_the_standardized_log_likelihood() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=TypeError)
 def test_the_instability_warning_names_the_fit_it_comes_from() -> None:
     from quant.hmm.select import choose_restart
 
@@ -540,7 +553,6 @@ def test_the_instability_warning_names_the_fit_it_comes_from() -> None:
 
 
 @pytest.mark.spec("SPEC§4")
-@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
 def test_sanity_thresholds_hold_exactly_at_their_decimal_edges() -> None:
     """2% and 2 bars are decimal edges: 1,000 rows of 0.02 is exactly 2% however the float sum
     rounds, and a_kk = 0.49999999999999994 is under 2 bars though 1 / (1 - a_kk) rounds to 2."""
