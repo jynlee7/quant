@@ -363,7 +363,8 @@ class RiskState(StrictModel):
 
     - `session`: the session started last (`start_session`), or None before the first;
     - `start_equity`: that session's start-of-day equity;
-    - `peak_equity`: the highest equity seen, across sessions;
+    - `peak_equity`: the highest equity seen across sessions since the last resume, which
+      re-bases it to the equity it is given;
     - `intents`: every intent checked this session, vetoed or not, as `"<decision_id>#<leg>"`
       in the order first seen;
     - `submissions`: raw broker submissions this session: RiskApprovedOrders spent;
@@ -404,6 +405,20 @@ class MarkOutcome:
     locked: bool
     flatten: bool
     kill: bool
+
+
+@dataclass(frozen=True)
+class ResumeOutcome:
+    """What one resume did (`RiskEngine.resume`), so B14 can log and alert the re-base.
+
+    - `equity`: the equity the resume was given;
+    - `old_peak`: the peak the drawdown was measured from before the resume;
+    - `new_peak`: the peak it is measured from now, which is `equity`.
+    """
+
+    equity: float
+    old_peak: float
+    new_peak: float
 
 
 class SpentApprovals(Protocol):
@@ -524,30 +539,37 @@ class RiskEngine:
                 daily_loss_locked=False,
             )
 
-    def resume(self, *, equity: float) -> None:
-        """Clear the engine's halt and the drawdown trigger (C8). Only B14's `quant resume`
-        calls it, after your typed confirmation and a clean reconciliation (ARCHITECTURE §8.3).
+    def resume(self, *, equity: float) -> ResumeOutcome:
+        """Clear the engine's halt and the drawdown trigger, and re-base the peak (C8). Only
+        B14's `quant resume` calls it, after your typed confirmation and a clean reconciliation
+        (ARCHITECTURE §8.3); B14 logs and alerts the outcome.
 
-        `halted`, `halt_reason` and `killed` clear, and the peak rises to `equity` if it is
-        higher. Nothing else changes: the session's intent and submission counts, the
-        daily-loss lock (until the next session) and the peak stay, so a counter already past
-        its limit halts again at the next new intent or submission, and the drawdown trigger is
-        armed again against the same peak. Approvals revoked by the halt stay revoked.
+        `halted`, `halt_reason` and `killed` clear, and the peak becomes `equity`, higher or
+        lower than before (your call, 2026-10-13): after a drawdown kill the account is flat and
+        equity can't recover, so the next 10% drawdown is measured from where you resumed.
+        Nothing else changes: the session's intent and submission counts and the daily-loss lock
+        (until the next session) stay, so a counter already past its limit halts again at the
+        next new intent or submission. Approvals revoked by the halt stay revoked.
 
         RiskError, changing nothing, when no session has started, `equity` isn't finite and
-        positive, or `equity` is still `max_drawdown_fraction` or more below the peak (the
-        trigger would fire again at once; lowering the peak is your decision, not the
-        engine's)."""
+        positive, or trading isn't halted (a resume with nothing to clear would only lower the
+        peak)."""
         _check_equity(equity)
-        peak = self.state.peak_equity
-        if self.state.session is None or peak is None:
+        old_peak = self.state.peak_equity
+        if self.state.session is None or old_peak is None:
             raise RiskError("a resume needs a started session")
-        peak = max(peak, equity)
-        if _fell_by(peak, equity, self._config.max_drawdown_fraction):
-            raise RiskError("equity is still past the drawdown limit from the peak")
+        if not self.state.halted:
+            raise RiskError("nothing to resume: trading isn't halted")
+        outcome = ResumeOutcome(float(equity), old_peak, float(equity))
         with self._publishing():
-            self._update(peak_equity=float(peak), halted=False, halt_reason=None, killed=False)
-        log.warning("risk_resumed", equity=equity, peak_equity=peak)
+            self._update(peak_equity=outcome.new_peak, halted=False, halt_reason=None, killed=False)
+        log.warning(
+            "risk_resumed",
+            equity=outcome.equity,
+            old_peak=outcome.old_peak,
+            new_peak=outcome.new_peak,
+        )
+        return outcome
 
     def mark(self, equity: float) -> MarkOutcome:
         """One equity mark from the minute monitor, on the freshest price (C8), or from a broker

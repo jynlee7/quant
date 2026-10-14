@@ -216,7 +216,6 @@ def test_a_resume_clears_the_halt_and_keeps_the_day_s_locks_and_counts() -> None
     approved(clean.check(intent(Side.BUY, 1, leg=2)))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "SPEC§10", "C8")
 def test_a_resume_after_the_drawdown_trigger_rebases_the_peak() -> None:
     # Owner's call (2026-10-13): your typed `quant resume` re-bases the peak to current equity.
@@ -247,7 +246,6 @@ def test_a_resume_after_the_drawdown_trigger_rebases_the_peak() -> None:
         desk(day=None).engine.resume(equity=EQUITY)  # no session yet
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
 @pytest.mark.spec("ARCH§8.1", "SPEC§10", "C8")
 def test_a_ten_percent_drop_from_the_new_peak_fires_the_trigger_again() -> None:
     d = desk()
@@ -262,7 +260,6 @@ def test_a_ten_percent_drop_from_the_new_peak_fires_the_trigger_again() -> None:
     assert d.engine.state.halt_reason == "maximum drawdown reached"
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
 @pytest.mark.spec("ARCH§8.1", "ARCH§4.4", "C8")
 def test_on_change_sees_the_rebased_state() -> None:
     seen: list[RiskState] = []
@@ -278,7 +275,6 @@ def test_on_change_sees_the_rebased_state() -> None:
     assert not seen[-1].halted
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError)
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "C8")
 def test_every_resume_rebases_the_peak_and_reports_both() -> None:
     d = desk()
@@ -292,7 +288,6 @@ def test_every_resume_rebases_the_peak_and_reports_both() -> None:
     assert d.engine.state.peak_equity == 98_000.0
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "C8")
 def test_a_resume_refuses_when_nothing_is_halted() -> None:
     # A resume lowers the peak, so one with no halt to clear would quietly widen the drawdown.
