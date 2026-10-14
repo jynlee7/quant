@@ -55,6 +55,18 @@ steps = st.lists(st.tuples(KINDS, SHARES, st.booleans()), min_size=2, max_size=1
 )
 # Found by the full tier: a SELL took the shares under a working stop after a stop was approved.
 @example(position=100, working=[(OrderKind.STOP, 1)], run=[("stop", 1, False), ("sell", 100, True)])
+# ... and one under a stop spent but not yet on the snapshot.
+@example(
+    position=300,
+    working=[],
+    run=[
+        ("stop", 100, False),
+        ("stop", 200, False),
+        ("look", 1, False),
+        ("spend", 1, False),
+        ("sell", 1, True),
+    ],
+)
 def test_no_sequence_with_stops_goes_short(
     position: int, working: list[tuple[OrderKind, int]], run: list[tuple[str, int, bool]]
 ) -> None:

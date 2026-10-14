@@ -771,10 +771,10 @@ class RiskEngine:
            `sellable`, they are all revoked.
            - SELL: clamped to `sellable` minus the outstanding SELLs' quantity (stop approvals
              included). Vetoed when nothing is left to sell. No cap applies. A SELL approved
-             for shares that working STOP orders cover (more than the clamp minus them)
-             revokes every outstanding stop approval when it is issued: each was approved
-             counting those stops as covering their shares, so placing it after this SELL
-             could sell a share twice (B9c).
+             for shares that stops cover (more than the clamp minus the working STOP orders'
+             quantity and the in-flight stops') revokes every outstanding stop approval when
+             it is issued: each was approved counting those stops as covering their shares,
+             so placing it after this SELL could sell a share twice (B9c).
            - BUY: vetoed on a decision that can only reduce (`d.reduce_only`). Otherwise let
              `held = broker.position + open BUY LIMIT quantity + in-flight BUYs + outstanding
              BUYs + intent.quantity`; vetoed unless `held * limit_price <= cap * equity`, where
@@ -1281,7 +1281,7 @@ class RiskEngine:
                     order.quantity
                     for order in broker.open_orders
                     if order.side is Side.SELL and order.kind is OrderKind.STOP
-                )
+                ) + sum(f.quantity for f in in_flight if f.stop)
                 claims_stopped = quantity > unreserved - stopped
 
             stage = RiskCheck.LOCKS

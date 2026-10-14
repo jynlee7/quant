@@ -201,6 +201,22 @@ def test_a_sell_that_claims_a_working_stop_s_shares_revokes_outstanding_stops() 
 
 
 @pytest.mark.spec("I4", "D9", "ARCH§8.1")
+def test_a_sell_that_claims_an_in_flight_stop_s_shares_revokes_outstanding_stops() -> None:
+    # The same, found next: stop A (100) is spent but the snapshot can't show it yet, and
+    # stop B (200) is still outstanding. A SELL of 1 fits beside B only by counting on A being
+    # cancelled, so B must go.
+    d = desk()
+    before = d.ctx(position=300)
+    first = d.stop(100)
+    second = d.stop(200)
+    d.engine.spend(first)
+    sell = d.engine.check(intent(Side.SELL, 1), before)
+    assert isinstance(sell, RiskApprovedOrder)
+    with pytest.raises(ApprovalError):
+        d.engine.spend(second)
+
+
+@pytest.mark.spec("I4", "D9", "ARCH§8.1")
 def test_a_sell_clear_of_working_stops_leaves_outstanding_stops_alone() -> None:
     d = desk()
     stop = d.stop(100)
