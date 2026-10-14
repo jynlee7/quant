@@ -1,6 +1,6 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.7 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). v1.7 records how B9 built the risk engine: the checks' precondition, how approvals hold exposure until they are spent, how intents and submissions are counted, how halts are signalled, persisted and resumed, that a resume re-bases the peak, and that discretionary exits keep the ±10 bp collar while only kill-switch exits widen (§4.4, §8.1–§8.3; your calls of 2026-10-13). Each change is tagged where it lands.
+**Status:** APPROVED v1.7 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). v1.7 records how B9 built the risk engine: the checks' precondition, how approvals hold exposure until they are spent, how intents and submissions are counted, how halts are signalled, persisted and resumed, that a resume re-bases the peak, and that discretionary exits keep the ±10 bp collar while only kill-switch exits widen (§4.4, §8.1–§8.3; your calls of 2026-10-13). It also records that the broker port lives in `risk/`, and how B9b built the kill executor, reconciliation and the minute monitor (§3, §8.3). Each change is tagged where it lands.
 **Builds on:** [SPEC.md](SPEC.md) v1.2, which is v1.0 plus this document's C1–C10 and the plan's C11–C17
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
@@ -117,8 +117,9 @@ quant/
     features/   streaming transforms, the feature menu, scaler
     hmm/        train (the only hmmlearn import), select, filter (ours), labels, matching, drift
     decide/     health, switching, playbook schema and primitives, sizing, edge estimates for Kelly
-    risk/       RiskEngine, approved-order types, limits, kill executor, reconciliation, minute monitor
-    execution/  broker port, Alpaca adapter with paper lock, order manager, simulated broker
+    risk/       RiskEngine, approved-order types, limits, kill executor, reconciliation, minute monitor,
+                broker port (v1.7: K1 keeps risk from importing execution)
+    execution/  Alpaca adapter with paper lock (implements risk's broker port), order manager, simulated broker
     engine/     live loop, scheduler, startup and recovery, state persistence
     store/      SQLite schemas and migrations, artifact store, pointers
     jobs/       evening pipeline: report, calibration, refit, L1 bundle
@@ -333,7 +334,8 @@ Limits load from `config/risk.yaml` at start and are frozen. The engine refuses 
 - **Halts are signalled where they happen:** `Veto.halts`, `RiskApprovedOrder.halts` (a SELL past the intent limit), `MarkOutcome.kill`, `SubmissionLimitError`, and the published state. A later halt keeps the first halt's reason.
 - **Persisting:** each call that changes the risk state hands the new state to the engine's `on_change` before it returns or raises. The live engine (B14) persists it there, so `spend` saves the submission before anything is sent. If `on_change` fails, the call raises and nothing is sent. Outstanding approvals live only in the engine object, so a restart starts with none.
 - **Resume:** `RiskEngine.resume(equity)`, behind `quant resume` (§8.3), clears HALTED, its reason and the drawdown trigger, and re-bases the peak to `equity`, so the next 10% drawdown is measured from there. This is your call of 2026-10-13: after a drawdown kill the account is flat, so equity can't recover to the old peak. The resume keeps the session's counts and the daily-loss lock. It hands the new state to `on_change` like every other change, and returns a `ResumeOutcome` with the old and new peak, which B14 logs and alerts. It refuses before the first session, on an equity that isn't finite and positive, and when trading isn't halted, since a resume with nothing to clear would only lower the peak. The typed confirmation and the clean reconciliation are B14's.
-- **`risk.yaml`** leaves out the kill switch's settings; B9b adds them.
+- **`risk.yaml`** holds the kill switch's settings under `kill`, and `monitor_price_max_age_s` (B9b, §8.3).
+- **Check 2** calls `quant.risk.reconcile.reconcile`, the comparison the minute monitor runs too, so the two can't disagree.
 
 ### 8.2 Execution
 
@@ -356,6 +358,15 @@ Limits load from `config/risk.yaml` at start and are frozen. The engine refuses 
   Outside regular hours, it cancels entries, keeps the stop and queues the exit for 09:30.
 - **Paths:** quant-control runs the executor when the engine can't, and also watches the engine's heartbeat. `quant kill --direct` is the break-glass path from a shell.
 - **Resume:** `quant resume`, run on the machine itself, with a typed confirmation and a clean reconciliation. It re-bases peak equity to the current equity, logs and alerts the old and new peak, and the next 10% drawdown is measured from the new peak (§8.1, v1.7).
+
+**How B9b built it (v1.7).**
+
+- **The broker port** is `quant.risk.broker.BrokerPort`, not part of `execution/` as §3 first listed it. K1 lets `risk` import only `core` and `store`, and the kill executor and reconciliation live in `risk`. `execution` may import `risk`, so B13's Alpaca adapter and the simulated broker implement the port there, and K4 still limits who imports the adapter. Each changing call spends its approval through the engine before it sends.
+- **Reconciliation** (`quant.risk.reconcile`) compares a broker snapshot with the engine's book and changes neither. It reports a short, a position difference, and missing, unknown, differing or foreign orders, by order id. A snapshot older than 5 s, or from the future, is STALE: it vetoes an order but halts nothing.
+- **The minute monitor** (`quant.risk.monitor`, C8) marks equity as cash + position × the freshest price, only on a price no older than `monitor_price_max_age_s` (120 s) and a fresh snapshot. It returns what the caller must do: flatten for the daily-loss lock, re-place a missing stop, or run the kill for a drawdown, a mismatch, or a stop missing for 5 minutes. An equity at or below 0 fires the drawdown kill. Scheduling and acting are B14's.
+- **Health triggers (C2)** fire the kill only with a position open: a heartbeat lost for 300 s, 3 starts within 600 s, or a rule-6 flatten still incomplete after 600 s. A single late bar fires nothing. While flat, a failure only alerts.
+- **The executor** (`quant.risk.kill`) takes the lock without waiting: a second copy returns BUSY and does nothing. It halts the engine and writes HALTED before any broker call, and a failed write or alert is recorded but never stops the kill. Each cancel and each exit uses a new approval. Exits start at the bid − 10 bp (the ask + 10 bp for a short) and widen 10 bp after every 30 s unfilled, up to 100 bp, rounded toward marketable. After a partial fill the next exit closes only the remainder. Broker errors are retried after a 1 s poll until a 300 s deadline, which ends the run INCOMPLETE. If the session closes first, it cancels the working exit and queues the exit for the next open. Outside regular hours it cancels every LIMIT order (entries and exits), keeps the stop and queues the exit; a flat account just drops its orders.
+- **New settings in `risk.yaml`** that the earlier docs don't fix: `widen_bp` 10, `max_collar_bp` 100, `poll_s` 1, `deadline_s` 300, `heartbeat_lost_s` 300, `crash_loop_starts` 3 within 600 s, and `monitor_price_max_age_s` 120. Every threshold is inclusive.
 
 ### 8.4 Who may do what
 

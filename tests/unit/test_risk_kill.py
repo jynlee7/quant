@@ -35,7 +35,6 @@ from tests.support.broker import Event, FakeBroker, RecordingAlerts, RecordingKi
 from tests.support.risk import CAL, DAY, HALF_DAY, NEXT_DAY, PRICE, Desk, config, desk, intent
 from tests.support.risk import order as open_order
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 REQUEST = KillRequest(KillTrigger.MANUAL, "cli", "test kill")
 STOP = open_order("stop-1", Side.SELL, OrderKind.STOP, 300, 95.0)
 ENTRY = open_order("o-1", Side.BUY, OrderKind.LIMIT, 100, 100.10)
@@ -97,7 +96,6 @@ class Rig:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "I4")
-@RED
 def test_in_regular_hours_the_executor_halts_cancels_flattens_verifies_and_alerts() -> None:
     rig = Rig(orders=(STOP, ENTRY))
     report = rig.run()
@@ -138,7 +136,6 @@ def test_in_regular_hours_the_executor_halts_cancels_flattens_verifies_and_alert
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.2", "ARCH§8.3")
-@RED
 def test_an_unfilled_kill_exit_is_cancelled_and_re_quoted_wider_every_30_s() -> None:
     rig = Rig(fill_at=99.75)  # fills only at 99.75 or lower: the third exit, at 30 bp
     report = rig.run()
@@ -165,7 +162,6 @@ def test_an_unfilled_kill_exit_is_cancelled_and_re_quoted_wider_every_30_s() -> 
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_the_kill_exit_never_widens_past_its_maximum_and_stops_at_the_deadline() -> None:
     rig = Rig(fill_at=1.0, limits=kill_config(widen_bp=40.0))  # never fills
     report = rig.run()
@@ -182,7 +178,6 @@ def test_the_kill_exit_never_widens_past_its_maximum_and_stops_at_the_deadline()
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_after_a_partial_fill_the_next_exit_closes_only_the_remainder() -> None:
     rig = Rig(partial=100)
     report = rig.run()
@@ -192,7 +187,6 @@ def test_after_a_partial_fill_the_next_exit_closes_only_the_remainder() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16")
-@RED
 def test_broker_errors_are_recorded_and_retried_until_flat() -> None:
     rig = Rig(fail={"cancel": 1, "flatten": 2, "snapshot": 1})
     report = rig.run()
@@ -204,7 +198,6 @@ def test_broker_errors_are_recorded_and_retried_until_flat() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_a_failing_halt_write_or_alert_never_stops_the_kill() -> None:
     rig = Rig(store_fails=True, alerts_fail=True)
     report = rig.run()
@@ -216,7 +209,6 @@ def test_a_failing_halt_write_or_alert_never_stops_the_kill() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_an_account_already_flat_is_verified_halted_and_alerted_without_an_exit() -> None:
     rig = Rig(position=0, orders=())
     report = rig.run()
@@ -228,7 +220,6 @@ def test_an_account_already_flat_is_verified_halted_and_alerted_without_an_exit(
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
-@RED
 def test_a_session_closing_mid_kill_queues_the_exit_for_the_next_open() -> None:
     rig = Rig(at=et(DAY, 15, 59), fill_at=1.0)
     report = rig.run()
@@ -239,7 +230,6 @@ def test_a_session_closing_mid_kill_queues_the_exit_for_the_next_open() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_a_short_position_is_closed_with_a_buy_at_the_ask_plus_the_collar() -> None:
     rig = Rig(position=-50, orders=())
     report = rig.run()
@@ -252,7 +242,6 @@ def test_a_short_position_is_closed_with_a_buy_at_the_ask_plus_the_collar() -> N
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
-@RED
 @pytest.mark.parametrize(
     ("at", "opens"),
     [
@@ -288,7 +277,6 @@ def test_outside_regular_hours_it_keeps_the_stop_and_queues_the_exit(
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_outside_regular_hours_a_flat_account_drops_its_orders_and_queues_nothing() -> None:
     rig = Rig(at=et(DAY, 18), day=None, position=0, orders=(STOP,))
     report = rig.run()
@@ -299,7 +287,6 @@ def test_outside_regular_hours_a_flat_account_drops_its_orders_and_queues_nothin
 
 
 @pytest.mark.spec("ARCH§8.3", "ARCH§5")
-@RED
 def test_regular_hours_follow_the_calendar() -> None:
     session = CAL.session(DAY)
     us = timedelta(microseconds=1)
@@ -317,7 +304,6 @@ def test_regular_hours_follow_the_calendar() -> None:
 
 
 @pytest.mark.spec("ARCH§8.3")
-@RED
 def test_a_second_copy_does_nothing_while_the_lock_is_held() -> None:
     rig = Rig()
     assert rig.lock.acquire()
@@ -334,7 +320,6 @@ def test_a_second_copy_does_nothing_while_the_lock_is_held() -> None:
 
 
 @pytest.mark.spec("ARCH§8.3")
-@RED
 def test_the_file_lock_excludes_every_other_holder(tmp_path: Path) -> None:
     path = tmp_path / "kill.lock"
     first, second = FileKillLock(path), FileKillLock(path)
@@ -352,7 +337,6 @@ def test_the_file_lock_excludes_every_other_holder(tmp_path: Path) -> None:
 
 
 @pytest.mark.spec("ARCH§8.3")
-@RED
 def test_the_memory_lock_is_held_by_one_caller_at_a_time() -> None:
     lock = MemoryKillLock()
     assert not lock.held
@@ -369,7 +353,6 @@ def test_the_memory_lock_is_held_by_one_caller_at_a_time() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.2", "ARCH§8.3")
-@RED
 def test_kill_exits_start_at_the_collar_and_widen_to_the_maximum() -> None:
     limits = config()
     quote = Quote(bid=PRICE, ask=PRICE, at=et(DAY, 11))
@@ -383,7 +366,6 @@ def test_kill_exits_start_at_the_collar_and_widen_to_the_maximum() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_kill_exit_prices_round_toward_marketable() -> None:
     limits = config()
     quote = Quote(bid=123.45, ask=123.47, at=et(DAY, 11))
@@ -401,7 +383,6 @@ def test_kill_exit_prices_round_toward_marketable() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "ARCH§8.3")
-@RED
 def test_halt_halts_keeps_the_first_reason_revokes_buys_and_publishes() -> None:
     seen = []
     d = desk(on_change=seen.append)
@@ -424,7 +405,6 @@ def test_halt_halts_keeps_the_first_reason_revokes_buys_and_publishes() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
-@RED
 def test_halt_works_before_any_session() -> None:
     d = desk(day=None)
     assert d.engine.halt("kill switch (manual, telegram): from the phone")

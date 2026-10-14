@@ -18,7 +18,6 @@ from quant.risk.triggers import KillTrigger
 from tests.support.risk import EQUITY, Desk, config, desk
 from tests.support.risk import order as open_order
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 SHARES = 1_000
 STOP = open_order("stop-1", Side.SELL, OrderKind.STOP, SHARES, 90.0)
 
@@ -63,7 +62,6 @@ class Watch:
 
 
 @pytest.mark.spec("C8", "SPEC§10")
-@RED
 def test_each_minute_marks_equity_on_the_freshest_price() -> None:
     w = Watch()
     report = w.tick(101.0)
@@ -82,7 +80,6 @@ def test_each_minute_marks_equity_on_the_freshest_price() -> None:
 
 
 @pytest.mark.spec("C8", "SPEC§10")
-@RED
 def test_a_2_percent_daily_loss_between_bars_locks_entries_and_asks_to_flatten() -> None:
     w = Watch()
     report = w.tick(98.0)  # exactly 2% of start-of-day equity
@@ -95,7 +92,6 @@ def test_a_2_percent_daily_loss_between_bars_locks_entries_and_asks_to_flatten()
 
 
 @pytest.mark.spec("C8", "SPEC§10", "ARCH§8.3")
-@RED
 def test_a_10_percent_drawdown_between_bars_fires_the_kill() -> None:
     w = Watch()
     report = w.tick(90.0)  # exactly 10% from the 100,000 peak
@@ -106,7 +102,6 @@ def test_a_10_percent_drawdown_between_bars_fires_the_kill() -> None:
 
 
 @pytest.mark.spec("C8")
-@RED
 def test_a_stale_price_marks_nothing() -> None:
     w = Watch()
     before = w.desk.engine.state
@@ -122,7 +117,6 @@ def test_a_stale_price_marks_nothing() -> None:
 
 
 @pytest.mark.spec("C8", "ARCH§8.1")
-@RED
 def test_a_stale_snapshot_marks_nothing_and_skips_the_stop() -> None:
     w = Watch()
     before = w.desk.engine.state
@@ -137,7 +131,6 @@ def test_a_stale_snapshot_marks_nothing_and_skips_the_stop() -> None:
 
 
 @pytest.mark.spec("C8")
-@RED
 def test_before_any_session_nothing_is_marked() -> None:
     w = Watch(desk(day=None))
     report = w.tick(50.0)
@@ -147,7 +140,6 @@ def test_before_any_session_nothing_is_marked() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16")
-@RED
 def test_a_reconciliation_mismatch_fires_the_kill() -> None:
     w = Watch()
     report = w.tick(100.0, book_position=900)
@@ -156,7 +148,6 @@ def test_a_reconciliation_mismatch_fires_the_kill() -> None:
 
 
 @pytest.mark.spec("C8", "ARCH§8.3")
-@RED
 def test_an_equity_wiped_out_fires_the_drawdown_kill_without_a_mark() -> None:
     w = Watch()
     report = w.tick(100.0, cash=-100_000.0)
@@ -165,7 +156,6 @@ def test_an_equity_wiped_out_fires_the_drawdown_kill_without_a_mark() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§16", "ARCH§5")
-@RED
 def test_a_missing_stop_is_re_placed_and_kills_after_5_minutes() -> None:
     w = Watch()
     start = w.desk.clock.now()
@@ -191,7 +181,6 @@ def test_a_missing_stop_is_re_placed_and_kills_after_5_minutes() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§16")
-@RED
 @pytest.mark.parametrize(
     ("position", "orders", "covered"),
     [

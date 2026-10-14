@@ -17,7 +17,6 @@ from quant.risk.triggers import (
 )
 from tests.support.risk import config
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 NOW = datetime(2018, 3, 6, 16, 0, tzinfo=UTC)
 KILL = config().kill
 
@@ -33,13 +32,11 @@ def judge(**fields: object) -> HealthVerdict:
 
 
 @pytest.mark.spec("C2", "SPEC§10")
-@RED
 def test_a_healthy_engine_fires_nothing() -> None:
     assert judge(starts=(ago(3_600),)) == HealthVerdict((), False)
 
 
 @pytest.mark.spec("C2", "SPEC§10")
-@RED
 def test_a_single_late_bar_does_not_fire_the_kill() -> None:
     # The bar due at tau is late, so rule 6 has started taking the position flat a minute ago.
     # That is rule 6's job (go flat, wait for two healthy bars): no health failure, no kill.
@@ -51,7 +48,6 @@ def test_a_single_late_bar_does_not_fire_the_kill() -> None:
 
 
 @pytest.mark.spec("C2", "SPEC§10")
-@RED
 def test_a_lost_heartbeat_fires_the_kill_while_a_position_is_open() -> None:
     assert judge(last_heartbeat=ago(299.999)) == HealthVerdict((), False)
     assert judge(last_heartbeat=ago(300)) == HealthVerdict((KillTrigger.HEARTBEAT_LOST,), True)
@@ -59,7 +55,6 @@ def test_a_lost_heartbeat_fires_the_kill_while_a_position_is_open() -> None:
 
 
 @pytest.mark.spec("C2", "SPEC§10")
-@RED
 def test_a_crash_loop_fires_the_kill_while_a_position_is_open() -> None:
     loop = (ago(600), ago(300), NOW)
     assert judge(starts=loop) == HealthVerdict((KillTrigger.CRASH_LOOP,), True)
@@ -69,7 +64,6 @@ def test_a_crash_loop_fires_the_kill_while_a_position_is_open() -> None:
 
 
 @pytest.mark.spec("C2", "SPEC§10")
-@RED
 def test_while_flat_a_health_failure_alerts_but_does_not_kill() -> None:
     verdict = judge(position=0, last_heartbeat=ago(3_600), starts=(ago(600), ago(300), NOW))
     assert verdict.failures == (KillTrigger.HEARTBEAT_LOST, KillTrigger.CRASH_LOOP)
@@ -77,7 +71,6 @@ def test_while_flat_a_health_failure_alerts_but_does_not_kill() -> None:
 
 
 @pytest.mark.spec("C2")
-@RED
 def test_every_failure_is_reported_in_order() -> None:
     verdict = judge(
         last_heartbeat=ago(900), starts=(ago(500), ago(400), ago(10)), flatten_since=ago(700)
@@ -88,7 +81,6 @@ def test_every_failure_is_reported_in_order() -> None:
 
 
 @pytest.mark.spec("ARCH§8.3", "ARCH§16", "SPEC§10")
-@RED
 def test_five_order_errors_within_10_minutes_fire_the_kill() -> None:
     five = [ago(600), ago(400), ago(300), ago(1), NOW]
     assert order_errors_fire(five, now=NOW, config=KILL)

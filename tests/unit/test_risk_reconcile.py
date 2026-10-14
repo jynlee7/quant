@@ -19,7 +19,6 @@ from quant.risk.reconcile import (
 from tests.support.risk import EQUITY, PRICE, decisions, desk, intent
 from tests.support.risk import order as open_order
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 NOW = decisions()[0].tau + timedelta(seconds=30)  # the desk's default clock
 MAX = 5.0
 STOP = open_order("i1-stop", Side.SELL, OrderKind.STOP, 100, 95.0)
@@ -46,7 +45,6 @@ def kinds(result: object) -> list[DiscrepancyKind]:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.1")
-@RED
 def test_a_broker_that_agrees_with_the_book_matches() -> None:
     result = reconcile(
         snap(orders=(STOP, ENTRY)), book(orders=(ENTRY, STOP)), now=NOW, max_age_s=MAX
@@ -59,7 +57,6 @@ def test_a_broker_that_agrees_with_the_book_matches() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.1")
-@RED
 @pytest.mark.parametrize(
     ("age", "status"),
     [
@@ -83,7 +80,6 @@ def test_a_snapshot_too_old_or_from_the_future_is_stale_and_compares_nothing(
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "D9")
-@RED
 def test_a_short_and_a_position_difference_are_mismatches() -> None:
     result = reconcile(snap(position=-10), book(position=0), now=NOW, max_age_s=MAX)
     assert result.status is ReconcileStatus.MISMATCH
@@ -100,7 +96,6 @@ def test_a_short_and_a_position_difference_are_mismatches() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "ARCH§16")
-@RED
 def test_order_differences_are_named_by_id_in_sorted_order() -> None:
     changed_stop = open_order("i1-stop", Side.SELL, OrderKind.STOP, 60, 95.0)  # part-filled
     stray = open_order("i1-a", Side.SELL, OrderKind.LIMIT, 10, 99.0)
@@ -121,14 +116,12 @@ def test_order_differences_are_named_by_id_in_sorted_order() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.1")
-@RED
 def test_a_duplicated_order_under_one_id_differs() -> None:
     result = reconcile(snap(orders=(STOP, STOP)), book(orders=(STOP,)), now=NOW, max_age_s=MAX)
     assert kinds(result) == [DiscrepancyKind.ORDER_DIFFERS]
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.2")
-@RED
 def test_an_order_from_another_instance_fails_reconciliation() -> None:
     foreign = open_order("i2-o-1", Side.BUY, OrderKind.LIMIT, 50, 100.10)
     result = reconcile(
@@ -148,7 +141,6 @@ def test_an_order_from_another_instance_fails_reconciliation() -> None:
 
 
 @pytest.mark.spec("ARCH§8.1")
-@RED
 def test_a_bad_maximum_age_is_refused() -> None:
     for bad in (0.0, -1.0, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="max_age_s"):
@@ -167,7 +159,6 @@ CASES = {
 
 
 @pytest.mark.spec("SPEC§10", "ARCH§8.1")
-@RED
 @pytest.mark.parametrize("case", list(CASES))
 def test_check_2_halts_exactly_when_reconciliation_finds_a_mismatch(case: str) -> None:
     broker, internal = CASES[case]

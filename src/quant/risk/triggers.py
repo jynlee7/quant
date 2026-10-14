@@ -27,7 +27,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+import structlog
+
+from quant.core.clock import ensure_utc
 from quant.risk.limits import KillConfig
+
+log = structlog.get_logger()
 
 
 class KillTrigger(StrEnum):
@@ -94,7 +99,26 @@ def health_verdict(health: EngineHealth, *, now: datetime, config: KillConfig) -
     A late bar fires nothing by itself (module docstring). ClockError for a naive `now` or a
     naive time in `health`; times after `now` count as at `now` (a heartbeat from the future is
     fresh, a start from the future is in the window)."""
-    raise NotImplementedError("B9b: health_verdict")
+    now = ensure_utc(now)
+    failures: list[KillTrigger] = []
+    if _elapsed(now, health.last_heartbeat) >= config.heartbeat_lost_s:
+        failures.append(KillTrigger.HEARTBEAT_LOST)
+    if _count_within(health.starts, now, config.crash_loop_window_s) >= config.crash_loop_starts:
+        failures.append(KillTrigger.CRASH_LOOP)
+    if (
+        health.flatten_since is not None
+        and _elapsed(now, health.flatten_since) >= config.flatten_incomplete_s
+    ):
+        failures.append(KillTrigger.FLATTEN_INCOMPLETE)
+    verdict = HealthVerdict(tuple(failures), bool(failures) and health.position != 0)
+    if failures:
+        log.warning(
+            "kill_health_failure",
+            failures=[f.value for f in failures],
+            position=health.position,
+            kill=verdict.kill,
+        )
+    return verdict
 
 
 def order_errors_fire(errors: Sequence[datetime], *, now: datetime, config: KillConfig) -> bool:
@@ -103,4 +127,16 @@ def order_errors_fire(errors: Sequence[datetime], *, now: datetime, config: Kill
     fire the kill, which keeps retrying while the broker-side stop protects the position).
     `errors` may be in any order and include old ones, which are ignored; an error after `now`
     counts as at `now`. ClockError for a naive time."""
-    raise NotImplementedError("B9b: order_errors_fire")
+    now = ensure_utc(now)
+    return _count_within(errors, now, config.order_error_window_s) >= config.order_errors
+
+
+def _elapsed(now: datetime, then: datetime) -> float:
+    """Seconds from `then` to `now`; a `then` after `now` counts as at `now` (0)."""
+    return max((now - ensure_utc(then)).total_seconds(), 0.0)
+
+
+def _count_within(times: Sequence[datetime], now: datetime, window_s: float) -> int:
+    """How many of `times` lie in `[now - window_s, now]`, a time after `now` counting as at
+    `now`. Every time is checked for a timezone, old ones included."""
+    return sum(1 for t in times if _elapsed(now, t) <= window_s)

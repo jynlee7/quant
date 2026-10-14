@@ -11,7 +11,8 @@ can't reuse one.
 the intent itself (RiskCheck.INTENT):
 
 1. HALTED: only risk-reducing intents pass.
-2. RECONCILIATION: a fresh broker snapshot must match the engine's book; a mismatch halts.
+2. RECONCILIATION: a fresh broker snapshot must match the engine's book (quant.risk.reconcile);
+   a mismatch halts.
 3. LIMITS: long or flat only, gross exposure, the label cap, the single-order cap, and the
    overnight cap on the last decision that can fill (A3).
 4. LOCKS: the daily-loss lock, a drift freeze and rule 6 veto entries.
@@ -51,7 +52,6 @@ logged with structlog.
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -88,6 +88,7 @@ from quant.core.orders import (
 )
 from quant.core.schedule import Timing, decision_schedule
 from quant.risk.limits import RiskConfig
+from quant.risk.reconcile import ReconcileStatus, reconcile
 
 log = structlog.get_logger()
 
@@ -586,7 +587,16 @@ class RiskEngine:
         Returns True when this call halted trading, False when it was already halted (the state
         is then unchanged and `on_change` isn't called). RiskError, changing nothing, when
         `reason` is not a non-empty string."""
-        raise NotImplementedError("B9b: RiskEngine.halt")
+        if not isinstance(reason, str) or not reason:
+            raise RiskError("a halt needs a reason")
+        if self.state.halted:
+            log.info(
+                "risk_halt_already_in_force", reason=reason, halt_reason=self.state.halt_reason
+            )
+            return False
+        with self._publishing():
+            self._halt(reason)
+        return True
 
     def mark(self, equity: float) -> MarkOutcome:
         """One equity mark from the minute monitor, on the freshest price (C8), or from a broker
@@ -661,8 +671,9 @@ class RiskEngine:
         2. **Reconciliation.** Vetoed when the snapshot is older than `snapshot_max_age_s`
            (`now - broker.taken_at > max`; exactly the maximum passes) or from the future.
            Vetoed, halting trading, when `broker.position != book.position`, when the open
-           orders differ (compared as multisets of OpenOrder), or when `broker.position < 0`.
-           Nothing is ever corrected.
+           orders differ (compared as multisets of OpenOrder), or when `broker.position < 0`:
+           exactly when `quant.risk.reconcile.reconcile` (which check 2 calls, with no instance
+           prefix) finds a MISMATCH, and its stale verdict is STALE. Nothing is ever corrected.
            In flight below means spent orders the snapshot can't show yet: those spent at or
            after `broker.taken_at`.
         3. **Limits.** Let `sellable = broker.position` minus the open SELL LIMIT orders'
@@ -975,18 +986,12 @@ class RiskEngine:
             broker, book = context.broker, context.book
             BrokerSnapshot.model_validate(broker.model_dump())
             InternalBook.model_validate(book.model_dump())
-            age = (now - broker.taken_at).total_seconds()
-            if not 0 <= age <= config.snapshot_max_age_s:
+            reconciled = reconcile(broker, book, now=now, max_age_s=config.snapshot_max_age_s)
+            if reconciled.status is ReconcileStatus.STALE:
                 return veto("broker snapshot is stale or from the future")
-            if (
-                broker.position < 0
-                or broker.position != book.position
-                or Counter(broker.open_orders) != Counter(book.open_orders)
-            ):
-                return veto(
-                    "broker and internal positions or orders disagree, or the position is short",
-                    halts=True,
-                )
+            if reconciled.mismatch:
+                details = "; ".join(d.detail for d in reconciled.discrepancies)
+                return veto(f"reconciliation mismatch: {details}", halts=True)
 
             stage = RiskCheck.LIMITS
             price = context.limit_price

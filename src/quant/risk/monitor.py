@@ -19,13 +19,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 
-from quant.core.clock import Clock
-from quant.core.orders import BrokerSnapshot, InternalBook
+import structlog
+
+from quant.core.clock import Clock, ensure_utc
+from quant.core.orders import BrokerSnapshot, InternalBook, OrderKind, Side
 from quant.risk.engine import MarkOutcome, RiskEngine
 from quant.risk.limits import RiskConfig
-from quant.risk.reconcile import ReconciliationResult
+from quant.risk.reconcile import ReconcileStatus, ReconciliationResult, reconcile
 from quant.risk.triggers import KillTrigger
+
+log = structlog.get_logger()
 
 
 @dataclass(frozen=True)
@@ -95,12 +100,16 @@ class MinuteMonitor:
         """A monitor that marks `engine`, with the limits in `config` (the engine's own),
         judging time by `clock`. `instance_prefix` goes to `reconcile`, so a broker order from
         another instance is a mismatch."""
-        raise NotImplementedError("B9b: MinuteMonitor")
+        self._engine = engine
+        self._config = config
+        self._clock = clock
+        self._instance_prefix = instance_prefix
+        self._stop_missing_since: datetime | None = None
 
     @property
     def stop_missing_since(self) -> datetime | None:
         """When the position was first seen without a covering stop, or None (MonitorReport)."""
-        raise NotImplementedError("B9b: MinuteMonitor.stop_missing_since")
+        return self._stop_missing_since
 
     def tick(self, minute: MinuteInput) -> MonitorReport:
         """One minute's checks at `now = clock.now()`, in this order:
@@ -126,4 +135,100 @@ class MinuteMonitor:
 
         RiskError only as `RiskEngine.mark` raises it, or from `on_change`.
         """
-        raise NotImplementedError("B9b: MinuteMonitor.tick")
+        now = self._clock.now()
+        config = self._config
+        snapshot = minute.snapshot
+        fired: set[KillTrigger] = set()
+
+        reconciliation = reconcile(
+            snapshot,
+            minute.book,
+            now=now,
+            max_age_s=config.snapshot_max_age_s,
+            instance_prefix=self._instance_prefix,
+        )
+        stale_snapshot = reconciliation.status is ReconcileStatus.STALE
+        if reconciliation.mismatch:
+            fired.add(KillTrigger.RECONCILIATION)
+
+        price_fresh = _fresh(minute.price, minute.price_at, now, config.monitor_price_max_age_s)
+        equity: float | None = None
+        mark: MarkOutcome | None = None
+        if price_fresh and not stale_snapshot and self._engine.state.session is not None:
+            value = minute.cash + snapshot.position * minute.price
+            if isfinite(value) and value > 0:
+                equity = float(value)
+                mark = self._engine.mark(equity)
+                if mark.kill:
+                    fired.add(KillTrigger.DRAWDOWN)
+            else:
+                log.error("monitor_equity_wiped_out", equity=value, price=minute.price)
+                fired.add(KillTrigger.DRAWDOWN)
+
+        stop_covered: bool | None = None
+        replace_stop = False
+        if not stale_snapshot:
+            stop_covered = _covered(snapshot)
+            if stop_covered:
+                self._stop_missing_since = None
+            else:
+                if self._stop_missing_since is None:
+                    self._stop_missing_since = now
+                replace_stop = True
+                missing_s = (now - self._stop_missing_since).total_seconds()
+                if missing_s >= config.kill.stop_missing_s:
+                    fired.add(KillTrigger.STOP_MISSING)
+
+        report = MonitorReport(
+            at=now,
+            equity=equity,
+            mark=mark,
+            price_stale=not price_fresh,
+            reconciliation=reconciliation,
+            stop_covered=stop_covered,
+            stop_missing_since=self._stop_missing_since,
+            replace_stop=replace_stop,
+            flatten=mark is not None and mark.flatten,
+            kill=tuple(t for t in _KILL_ORDER if t in fired),
+        )
+        if report.kill or report.flatten or report.replace_stop or reconciliation.mismatch:
+            log.warning(
+                "monitor_tick",
+                equity=equity,
+                kill=[t.value for t in report.kill],
+                flatten=report.flatten,
+                replace_stop=replace_stop,
+                reconciliation=reconciliation.status.value,
+            )
+        return report
+
+
+_KILL_ORDER: tuple[KillTrigger, ...] = (
+    KillTrigger.DRAWDOWN,
+    KillTrigger.RECONCILIATION,
+    KillTrigger.STOP_MISSING,
+)
+"""The order of `MonitorReport.kill`."""
+
+
+def _fresh(price: float, price_at: datetime, now: datetime, max_age_s: float) -> bool:
+    """True when `price` is finite and positive, and no older than `max_age_s` nor from the
+    future."""
+    if isinstance(price, bool) or not isinstance(price, (int, float)):
+        return False
+    if not isfinite(price) or price <= 0:
+        return False
+    age = (now - ensure_utc(price_at)).total_seconds()
+    return 0 <= age <= max_age_s
+
+
+def _covered(snapshot: BrokerSnapshot) -> bool:
+    """True when the position is flat or short, or its open STOP SELLs hold every share."""
+    if snapshot.position <= 0:
+        return True
+    stops = sum(
+        order.quantity
+        for order in snapshot.open_orders
+        if order.kind is OrderKind.STOP and order.side is Side.SELL
+    )
+    return stops >= snapshot.position

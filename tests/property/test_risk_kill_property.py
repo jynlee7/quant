@@ -65,7 +65,6 @@ def exact(value: float) -> Decimal:
 
 
 @pytest.mark.spec("SPEC§10", "D9", "ARCH§8.3", "I4")
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 @given(
     held_at_start=st.integers(0, 400),
     before=steps,
