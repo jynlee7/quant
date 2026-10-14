@@ -5,7 +5,8 @@ Round 2 of the B9a review found the engine's halts and counters leaking:
 - R6: an intent vetoed before check 5 was never counted, so 21 vetoed intents didn't halt;
 - C6: a halt on a pass was silent (the 21st intent as a SELL, the 60th submission);
 - C7: `spend`, `mark` and `check` changed RiskState with no way to persist it before returning;
-- C8: nothing cleared a halt or the drawdown trigger, and no contract said what a resume resets;
+- C8: nothing cleared a halt or the drawdown trigger, and no contract said what a resume resets.
+  The owner's call (2026-10-13): a resume re-bases the peak to the equity it is given;
 - C9: the 60th raw submission was refused instead of sent, so at most 59 BUYs went out;
 - C10: a later halt overwrote the reason of the first, a drawdown kill's included;
 - C11: approving a pending order re-priced it without bound;
@@ -215,29 +216,92 @@ def test_a_resume_clears_the_halt_and_keeps_the_day_s_locks_and_counts() -> None
     approved(clean.check(intent(Side.BUY, 1, leg=2)))
 
 
-@pytest.mark.spec("ARCH§8.3", "SPEC§10", "C8")
-def test_a_resume_after_the_drawdown_trigger_keeps_the_peak() -> None:
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
+@pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "SPEC§10", "C8")
+def test_a_resume_after_the_drawdown_trigger_rebases_the_peak() -> None:
+    # Owner's call (2026-10-13): your typed `quant resume` re-bases the peak to current equity.
     d = desk()
     d.engine.mark(105_000.0)
     assert d.engine.mark(94_500.0).kill
-    with pytest.raises(RiskError):
-        d.engine.resume(equity=94_500.0)  # still 10% below the peak: it would fire at once
-    assert d.engine.state.killed
-    assert d.engine.state.halted
+    before = d.engine.state
     for bad in (0.0, float("nan")):
         with pytest.raises(RiskError):
             d.engine.resume(equity=bad)
+    assert d.engine.state == before
 
-    d.engine.resume(equity=94_500.01)
+    outcome = d.engine.resume(equity=94_500.0)  # 10% below the old peak: it resumes anyway
+    assert outcome.old_peak == 105_000.0
+    assert outcome.new_peak == 94_500.0
+    assert outcome.equity == 94_500.0
     state = d.engine.state
+    assert state.peak_equity == 94_500.0
     assert not state.killed
     assert not state.halted
-    assert state.peak_equity == 105_000.0  # resetting the peak is the owner's call, not B9's
-    assert not d.engine.mark(94_500.01).kill
-    assert d.engine.mark(94_500.0).kill  # the trigger is armed again
+    assert state.halt_reason is None
+    assert state.intents == before.intents
+    assert state.submissions == before.submissions
+    assert state.daily_loss_locked == before.daily_loss_locked
+    assert not d.engine.mark(94_500.0).kill  # measured from the new peak now
 
     with pytest.raises(RiskError):
         desk(day=None).engine.resume(equity=EQUITY)  # no session yet
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
+@pytest.mark.spec("ARCH§8.1", "SPEC§10", "C8")
+def test_a_ten_percent_drop_from_the_new_peak_fires_the_trigger_again() -> None:
+    d = desk()
+    d.engine.mark(105_000.0)
+    assert d.engine.mark(94_500.0).kill
+    d.engine.resume(equity=94_500.0)
+    assert not d.engine.mark(85_050.01).kill
+    again = d.engine.mark(85_050.0)  # exactly 10% below 94,500
+    assert again.kill
+    assert again.drawdown == pytest.approx(0.1)
+    assert d.engine.state.killed
+    assert d.engine.state.halt_reason == "maximum drawdown reached"
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
+@pytest.mark.spec("ARCH§8.1", "ARCH§4.4", "C8")
+def test_on_change_sees_the_rebased_state() -> None:
+    seen: list[RiskState] = []
+    d = desk(on_change=seen.append)
+    d.engine.mark(105_000.0)
+    assert d.engine.mark(94_500.0).kill
+    published = len(seen)
+    d.engine.resume(equity=94_500.0)
+    assert len(seen) == published + 1  # once, before resume returns
+    assert seen[-1] == d.engine.state
+    assert seen[-1].peak_equity == 94_500.0
+    assert not seen[-1].killed
+    assert not seen[-1].halted
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError)
+@pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "C8")
+def test_every_resume_rebases_the_peak_and_reports_both() -> None:
+    d = desk()
+    vetoed(
+        d.check(intent(Side.SELL, 1), position=100, book_position=99, equity=98_000.0),
+        RiskCheck.RECONCILIATION,
+        halts=True,
+    )
+    outcome = d.engine.resume(equity=98_000.0)  # a reconciliation halt, 2% below the peak
+    assert (outcome.old_peak, outcome.new_peak) == (EQUITY, 98_000.0)
+    assert d.engine.state.peak_equity == 98_000.0
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
+@pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "C8")
+def test_a_resume_refuses_when_nothing_is_halted() -> None:
+    # A resume lowers the peak, so one with no halt to clear would quietly widen the drawdown.
+    d = desk()
+    d.engine.mark(95_000.0)
+    before = d.engine.state
+    with pytest.raises(RiskError):
+        d.engine.resume(equity=95_000.0)
+    assert d.engine.state == before
 
 
 # --- C10: the first halt's reason survives ---------------------------------------------------------
