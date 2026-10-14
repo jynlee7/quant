@@ -169,7 +169,9 @@ class MinuteMonitor:
            - **Bare**: otherwise. `stop_missing_since` is set to `now` when the bare run
              starts, `replace_stop` is set, and STOP_MISSING fires once the clock,
              `stop_missing_s` = the spell's earlier bare seconds + `now - stop_missing_since`,
-             reaches `limit`.
+             reaches `limit`, or once exits first covered the position in this spell `limit`
+             ago or more: a gap between two exits (a re-quote's cancel landing before the
+             next is out) never extends the exits' 5 minutes (B9c review).
 
         RiskError only as `RiskEngine.mark` raises it, or from `on_change`.
         """
@@ -237,7 +239,10 @@ class MinuteMonitor:
                     self._stop_missing_since = now
                 replace_stop = True
                 missing_s = self._bare_s + (now - self._stop_missing_since).total_seconds()
-                if missing_s >= limit_s:
+                exits_s = None if self._exit_since is None else (now - self._exit_since)
+                if missing_s >= limit_s or (
+                    exits_s is not None and exits_s.total_seconds() >= limit_s
+                ):
                     fired.add(KillTrigger.STOP_MISSING)
 
         report = MonitorReport(

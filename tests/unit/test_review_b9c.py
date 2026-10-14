@@ -67,7 +67,6 @@ def stopped_shares(broker: FakeBroker) -> int:
 # --- R1/C4: a flatten spent since the snapshot is in flight ---------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("SPEC§10", "D9", "I4", "ARCH§8.1")
 def test_a_stop_is_refused_over_shares_a_flatten_spent_since_its_snapshot() -> None:
     d = desk()
@@ -87,7 +86,6 @@ def test_a_stop_is_refused_over_shares_a_flatten_spent_since_its_snapshot() -> N
     assert stop.quantity == 300
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "D9", "I4", "ARCH§8.1")
 def test_a_sell_is_vetoed_over_shares_a_flatten_spent_since_its_snapshot() -> None:
     d = desk()
@@ -97,7 +95,6 @@ def test_a_sell_is_vetoed_over_shares_a_flatten_spent_since_its_snapshot() -> No
     assert isinstance(d.engine.check(intent(Side.SELL, 300), before), Veto)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "D9", "I4")
 def test_a_stop_approved_on_a_snapshot_from_before_a_kill_exit_never_goes_short() -> None:
     # R1's scenario through the fake broker: the exit fills, then the stop triggers.
@@ -155,7 +152,6 @@ class SlowCancelBroker(FakeBroker):
         return super().flatten(approval, limit_price=limit_price)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16")
 def test_at_the_deadline_the_stop_waits_for_the_exit_s_cancel_to_land() -> None:
     rig = Rig(fill_at=1.0, broker_type=SlowCancelBroker)  # no exit ever fills
@@ -174,7 +170,6 @@ def test_at_the_deadline_the_stop_waits_for_the_exit_s_cancel_to_land() -> None:
 # --- C2: an outside-hours kill with shares no stop covers places one ------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16", "I4")
 @pytest.mark.parametrize(
     ("orders", "placed"),
@@ -222,7 +217,6 @@ class ReservingBroker(FakeBroker):
         return result
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "D9")
 def test_the_kill_s_stop_covers_the_free_shares_when_another_approval_holds_some() -> None:
     # Outside hours, an exit for 50 that never cancels: 250 shares bare, 10 of them reserved.
@@ -235,14 +229,16 @@ def test_the_kill_s_stop_covers_the_free_shares_when_another_approval_holds_some
     )
     report = rig.run()
     assert report.status is KillStatus.INCOMPLETE
-    covered = sum(s.quantity for s in report.stops)
-    assert 240 <= covered <= 250
+    # The 240 free shares get their stop at once; the last 10 once execution's approval
+    # expires unsent, 5 s after its snapshot.
+    assert [s.quantity for s in report.stops] == [240, 10]
+    first, last = report.stops
+    assert last.placed_at - first.placed_at <= timedelta(seconds=6)
     rig.broker.trigger_stops()
     rig.broker.fill_sells()
     assert min(rig.broker.positions) >= 0
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError)
 @pytest.mark.spec("ARCH§8.1", "D9")
 def test_the_engine_says_how_many_shares_are_free_for_a_stop() -> None:
     d = desk()
@@ -275,7 +271,6 @@ class FullSpentStore:
         return True
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.1", "ARCH§8.3", "I4")
 def test_a_spent_store_that_can_t_record_doesn_t_stop_the_kill() -> None:
     rig = Rig(orders=())
@@ -287,23 +282,27 @@ def test_a_spent_store_that_can_t_record_doesn_t_stop_the_kill() -> None:
     assert "OSError: ops.db is full" in report.errors
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=OSError)
 @pytest.mark.spec("ARCH§8.1", "I4", "ARCH§4.4")
 def test_a_reducing_spend_survives_the_spent_store_but_is_still_spent_once() -> None:
     store = FullSpentStore()
+    store.full = False
     d = desk(spent=store)
+    buy = d.check(intent(Side.BUY, 100, leg=2), position=300)
+    assert isinstance(buy, RiskApprovedOrder)
+    store.full = True
+    with pytest.raises(OSError, match="is full"):
+        d.engine.spend(buy)  # a BUY still needs its record
     flatten = d.engine.approve_flatten(reason="kill")
     assert d.engine.spend(flatten) is flatten
     assert isinstance(d.engine.unsaved, OSError)
     with pytest.raises(ApprovalError):
         d.engine.spend(flatten)
+    d.clock.advance(S)  # a snapshot from now on can show what the flatten did
     sell = d.check(intent(Side.SELL, 100), position=300)
     assert isinstance(sell, RiskApprovedOrder)
     assert d.engine.spend(sell) is sell
-    buy = d.check(intent(Side.BUY, 100, leg=2), position=300)
-    assert isinstance(buy, RiskApprovedOrder)
     with pytest.raises(OSError, match="is full"):
-        d.engine.spend(buy)  # a BUY still needs its record
+        d.check(intent(Side.BUY, 100, leg=3), position=300)  # nor is one approved meanwhile
     store.full = False
     d.engine.spend(d.engine.approve_cancel("eng1-x", reason="kill"))  # the next call catches up
     assert d.engine.unsaved is None
@@ -330,7 +329,6 @@ def started(**changes: Any) -> RiskState:
     return RiskState(session=DAY, start_equity=EQUITY, peak_equity=EQUITY, **changes)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("C3", "ARCH§8.1", "SPEC§10")
 def test_the_sell_that_reaches_the_submission_limit_isn_t_sent_on_a_failed_save() -> None:
     disk = Disk()
@@ -348,7 +346,6 @@ def test_the_sell_that_reaches_the_submission_limit_isn_t_sent_on_a_failed_save(
     assert disk.saved[-1].halted
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("C3", "ARCH§8.1", "SPEC§10")
 def test_a_restart_never_lets_more_than_60_submissions_out() -> None:
     # R4's scenario: 59 saved; the 60th is a SELL while the save fails; then a restart from the
@@ -374,7 +371,6 @@ def test_a_restart_never_lets_more_than_60_submissions_out() -> None:
     assert sent == 60 or restarted.engine.state.halted
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
 @pytest.mark.spec("C3", "ARCH§8.1", "SPEC§10")
 def test_the_sell_past_the_intent_limit_isn_t_handed_out_on_a_failed_save() -> None:
     disk = Disk()
@@ -405,7 +401,6 @@ def test_without_a_halt_sells_still_go_out_while_the_save_fails() -> None:
 # --- R5: a gap between exits keeps the exits' 5 minutes ------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§16", "ARCH§8.3")
 def test_a_gap_between_exits_doesn_t_extend_their_5_minutes() -> None:
     exit_ = order("x-1", Side.SELL, OrderKind.LIMIT, SHARES, 99.9)
@@ -424,7 +419,6 @@ def test_a_gap_between_exits_doesn_t_extend_their_5_minutes() -> None:
 # --- C6: a stop approval dropped unsent can be released --------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=ApprovalError)
 @pytest.mark.spec("I4", "ARCH§8.1", "ARCH§4.4")
 def test_a_stop_approval_dropped_unsent_can_be_released() -> None:
     d = desk()
@@ -467,7 +461,6 @@ class OtherThreadBroker(FakeBroker):
         return super().flatten(approval, limit_price=limit_price)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§8.1")
 def test_a_save_failure_inside_a_failed_step_reaches_the_report() -> None:
     persist = FreshFailures()

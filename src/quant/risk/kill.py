@@ -12,13 +12,13 @@ with a lock so only one copy runs at a time. In regular hours it:
 4. verifies on a broker snapshot that the account is flat with no open orders;
 5. alerts (`KillAlerts.send`).
 
-A run that ends INCOMPLETE with shares no working SELL covers first leaves a broker-side stop
-under them (through a RiskApprovedStop, `kill.stop_distance_bp` below the bid; your call of
-2026-10-14), so a kill that can't finish never leaves the position bare.
+A run that ends INCOMPLETE or QUEUED with shares no working SELL covers first leaves a
+broker-side stop under them (through a RiskApprovedStop, `kill.stop_distance_bp` below the bid;
+your calls of 2026-10-14), so a kill that can't finish never leaves the position bare.
 
 Outside regular hours it halts, cancels the working LIMIT orders, keeps the broker-side stop,
-and queues the exit for the next open (09:30 ET), where the engine runs the executor again
-(ARCHITECTURE §5's 09:30:05 job).
+places a stop under any shares the kept stops don't cover, and queues the exit for the next open
+(09:30 ET), where the engine runs the executor again (ARCHITECTURE §5's 09:30:05 job).
 
 Every broker call goes through the BrokerPort, which spends each approval through the same
 RiskEngine before it sends (I4). The executor never calls `RiskEngine.check`: kill exits are
@@ -57,7 +57,7 @@ class KillStatus(StrEnum):
     """How one run of the executor ended."""
 
     FLAT = "flat"  # verified: the broker holds no position and no open orders
-    QUEUED = "queued"  # outside regular hours: LIMIT orders cancelled, stop kept, exit queued
+    QUEUED = "queued"  # outside regular hours: LIMITs cancelled, stops kept or placed, exit queued
     INCOMPLETE = "incomplete"  # the deadline or the session's close came before FLAT
     BUSY = "busy"  # another copy holds the lock; this run did nothing at all
 
@@ -115,8 +115,8 @@ class KillReport:
     - `queued_exit_at`: when the queued exit runs (QUEUED, or INCOMPLETE at the close), else
       None;
     - `final`: the last broker snapshot read, or None when none was read;
-    - `stops`: the protective stops placed before the run ended INCOMPLETE with a position
-      open (KillExecutor.execute, step 6);
+    - `stops`: the protective stops placed before the run ended INCOMPLETE or QUEUED with
+      shares no working SELL covered (KillExecutor.execute, step 6);
     - `errors`: every error recorded and survived, in order, as `f"{type name}: {message}"`.
     """
 
@@ -347,9 +347,10 @@ class KillExecutor:
         spend) is recorded in `errors` and the run goes on, a broker step being retried after
         the next wait. An exception outside any step ends the run INCOMPLETE, recorded the same
         way. The alert is always attempted, and the report always returned. A failing
-        `on_change` doesn't hold up a cancel, flatten or stop approval (your call of
-        2026-10-14): the engine still issues them, and the run records its `unsaved` error once
-        in `errors`, so the alert says the risk state isn't saved.
+        `on_change` or SpentApprovals store doesn't hold up a cancel, flatten or stop approval
+        (your call of 2026-10-14): the engine still issues and spends them, and the run records
+        its `unsaved` error in `errors` once per spell of failures, after any step, failed or
+        not, so the alert says the risk state isn't saved.
 
         **Lock.** `lock.acquire()` first. When it returns False the run is BUSY: it returns a
         KillReport with status BUSY, an empty `halt_reason` and nothing else done (no halt, no
@@ -367,10 +368,11 @@ class KillExecutor:
         Then `regular_hours = in_regular_hours(now, calendar)` picks the path. Throughout,
         `deadline = started_at + kill.deadline_s`. Waiting means `clock.sleep_until(min(now +
         kill.poll_s, deadline))` and then a fresh `broker.snapshot()`. When `now >= deadline`
-        before the run is done, it stops: in regular hours it reads a snapshot and cancels each
-        working LIMIT order on it once, without waiting, then protects the shares (step 6) and
-        ends INCOMPLETE; the caller runs the executor again (ARCHITECTURE §16: the kill keeps
-        retrying).
+        before the run is done, it stops: in regular hours it reads a snapshot and, within the
+        grace (step 6), cancels until gone every LIMIT order and every order it already sent a
+        cancel for, so the stop is sized on shares the exits no longer hold; then it protects
+        the shares (step 6) and ends INCOMPLETE, or FLAT if that last snapshot is flat. The
+        caller runs the executor again (ARCHITECTURE §16: the kill keeps retrying).
 
         *Cancelling* an order means `engine.approve_cancel(client_order_id, reason=halt_reason)`
         and `broker.cancel(approval)`; *cancelling until gone* means cancelling, then waiting
@@ -396,8 +398,9 @@ class KillExecutor:
         4. **Verify.** FLAT only on a snapshot read after the last exit or cancel was sent that
            shows `position == 0` and no open orders; it becomes `final`.
            If the session closes (`now >= session.close`) first, the run stops: it cancels
-           until gone the working exit (once, without waiting past the deadline), protects the
-           shares (step 6), queues the exit and is INCOMPLETE with `queued_exit_at` set.
+           until gone, within the grace, the working exit and every order it already sent a
+           cancel for, queues the exit, protects the shares (step 6) and is INCOMPLETE with
+           `queued_exit_at` set (FLAT if that last snapshot is flat).
 
         **Outside regular hours.**
 
@@ -406,18 +409,28 @@ class KillExecutor:
            (an entry filled before its cancel landed), its stops are kept. FLAT once a snapshot
            shows no position and no order.
         3. Otherwise cancel until gone every open LIMIT order (entries and exits) and keep every
-           STOP order (`kept`, by client order id), send no exit, and queue the exit: QUEUED,
-           with `queued_exit_at` set, once a snapshot shows no LIMIT order.
+           STOP order (`kept`, by client order id), send no exit, and queue the exit. Once a
+           snapshot shows no LIMIT order, protect the shares the kept stops don't cover (step
+           6; your call of 2026-10-14: a stop is placed even when none was working), and the
+           run is QUEUED with `queued_exit_at` set. If the deadline comes first, it protects
+           within the grace and is INCOMPLETE, the exit still queued.
 
-        **6. Protect.** Before any INCOMPLETE end, in or outside regular hours: read a fresh
-        snapshot; when it holds `position > 0` and the working SELL orders on it (LIMIT and
-        STOP) hold fewer shares, read a quote and place a stop for the rest, `bare = position -
-        those shares`: `engine.approve_stop(snapshot, quote, quantity=bare,
-        stop_price=kill_stop_price(quote, kill), reason=halt_reason)`, then
-        `broker.place_stop(approval)`, recorded as a KillStop in `stops`. Shares a working SELL
-        already covers get no second stop, so the stop and an exit still working can't sell a
-        share twice. A failed step is recorded and not retried: the run is ending. FLAT and
-        QUEUED runs place none (outside hours the existing stop is kept).
+        **6. Protect.** Before any INCOMPLETE end, in or outside regular hours, and before a
+        QUEUED end. *The grace*: once the run is ending (the deadline, the close, or any
+        INCOMPLETE end), only the deadline stops a wait, and it moves to `kill.requote_s` from
+        then if that is later, once per run. Then, until no share is bare or the run must stop,
+        polling between tries: read a fresh snapshot; when it holds `position > 0` and the
+        working SELL orders on it (LIMIT and STOP) hold fewer shares, `bare = position - those
+        shares`; read a quote and place a stop over `min(bare,
+        engine.free_for_stop(snapshot))` shares (an approval held elsewhere may reserve some
+        of the bare shares; the free ones are covered at once, the rest on a later try):
+        `engine.approve_stop(snapshot, quote, quantity, stop_price=kill_stop_price(quote,
+        kill), reason=halt_reason)`, then `broker.place_stop(approval)`, each recorded as a
+        KillStop in `stops`. A failed step is recorded, then tried again after a poll. Shares a
+        working SELL covers get no second stop, so a stop and an exit still working can't sell
+        a share twice; an exit whose cancel lands only after the grace leaves its shares bare
+        until the next run, or until the minute monitor re-places the stop. FLAT runs place
+        none.
 
         *Queueing the exit* is `store.queue_exit(next_open(started_at), halt_reason)`: the
         first open at or after the moment the kill started, so a run that crosses 09:30 queues
@@ -502,7 +515,8 @@ class _Run:
         self.final: BrokerSnapshot | None = None
         self.stops: list[KillStop] = []
         self.errors = errors
-        self.seen_unsaved: Exception | None = None  # the engine's save failure last recorded
+        self.seen_unsaved: Exception | None = None  # the engine's save failure last seen
+        self.graced = False  # the run is ending, with its grace (step 6)
 
     def execute(self) -> KillReport:
         log.error(
@@ -600,29 +614,29 @@ class _Run:
             self.kept = tuple(o.client_order_id for o in last.open_orders if not _limit(last, o))
             log.warning("kill_stops_kept", kept=list(self.kept))
         self.queue_exit()
-        return KillStatus.QUEUED if cleared is not None else self.incomplete()
+        if cleared is None:
+            return self.incomplete()
+        self.protect_safely()  # your call of 2026-10-14: no share waits for the open bare
+        return KillStatus.QUEUED
 
     def stopped(self) -> KillStatus:
-        """The deadline or the session's close came before FLAT. At the close the working exit
-        is cancelled once more and the exit is queued for the next open (step 4)."""
-        if self.close is None or self.clock.now() < self.close:
-            log.error("kill_deadline_passed", exits=len(self.exits))
-            snapshot = self.snapshot()
-            if snapshot is not None:  # cancel the working exits once, without waiting
-                for order_id in [
-                    o.client_order_id for o in snapshot.open_orders if _limit(snapshot, o)
-                ]:
-                    self.cancel(order_id)
-            return self.incomplete()
-        self.close = None  # from here on, only the deadline stops a wait
-        log.error("kill_session_closed", exits=len(self.exits))
+        """The deadline or the session's close came before FLAT. The working exits are
+        cancelled until gone, within the grace (step 6), so the stop is sized on shares they no
+        longer hold, and the run is FLAT if they leave the account flat. Otherwise, at the
+        close, the exit is queued for the next open (step 4)."""
+        at_close = self.close is not None and self.clock.now() >= self.close
+        log.error(
+            "kill_session_closed" if at_close else "kill_deadline_passed", exits=len(self.exits)
+        )
+        self.grace()
         snapshot = self.snapshot()
         while snapshot is None and not self.stopping():
             snapshot = self.wait()
-        cleared = self.clear(snapshot, _limit) if snapshot is not None else None
-        if cleared is not None and _flat(cleared):
+        cleared = self.clear(snapshot, self.leaving) if snapshot is not None else None
+        if cleared is not None and _flat(cleared):  # verified flat after the last cancel
             return KillStatus.FLAT
-        self.queue_exit()
+        if at_close:
+            self.queue_exit()
         return self.incomplete()
 
     # --- the steps -------------------------------------------------------------------------------
@@ -719,43 +733,78 @@ class _Run:
         return True
 
     def incomplete(self) -> KillStatus:
-        """End the run INCOMPLETE, leaving a stop under the bare shares first (step 6)."""
+        """End the run INCOMPLETE, leaving a stop under the bare shares first (step 6), within
+        the grace."""
+        self.grace()
+        self.protect_safely()
+        return KillStatus.INCOMPLETE
+
+    def grace(self) -> None:
+        """The run is ending: from now on only the deadline, moved to `kill.requote_s` from now
+        if that is later, stops a wait, once per run (step 6)."""
+        if not self.graced:
+            self.graced = True
+            self.close = None
+            grace = self.clock.now() + timedelta(seconds=self.kill.requote_s)
+            self.deadline = max(self.deadline, grace)
+
+    def leaving(self, snapshot: BrokerSnapshot, order: OpenOrder) -> bool:
+        """The orders a run that is ending waits for: every LIMIT order, and every order this
+        run already sent a cancel for (a stop whose cancel hasn't landed yet)."""
+        return _limit(snapshot, order) or order.client_order_id in self.cancelled
+
+    def protect_safely(self) -> None:
         try:
             self.protect()
         except Exception as exc:  # protecting never stops the alert
             self.record(exc, "protect")
-        return KillStatus.INCOMPLETE
 
     def protect(self) -> None:
-        """Step 6: on a fresh snapshot, place one stop-market SELL under the shares no working
-        SELL covers, `kill.stop_distance_bp` below a fresh bid, through a RiskApprovedStop. A
-        failed step is recorded and not retried: the run is ending."""
+        """Step 6: place stop-market SELLs under the shares no working SELL covers, through
+        RiskApprovedStops, until none is bare or the run must stop, polling between tries."""
+        while not self.protect_once() and not self.stopping():
+            now = self.clock.now()
+            self.clock.sleep_until(min(now + timedelta(seconds=self.kill.poll_s), self.deadline))
+
+    def protect_once(self) -> bool:
+        """One try at step 6 on a fresh snapshot: True when no share is left bare (nothing to
+        protect, or a stop placed over every bare share), False to try again."""
         snapshot = self.snapshot()
-        if snapshot is None or snapshot.position <= 0:
-            return
+        if snapshot is None:
+            return False
         covered = sum(o.quantity for o in snapshot.open_orders if o.side is Side.SELL)
         bare = snapshot.position - covered
         if bare <= 0:
-            return
+            return True
         quote = self.attempt("broker.quote", self.broker.quote)
         if isinstance(quote, _Failed):
-            return
+            return False
         price = self.attempt("kill_stop_price", lambda: kill_stop_price(quote, kill=self.kill))
         if isinstance(price, _Failed):
-            return
+            return False
+        free = self.attempt("engine.free_for_stop", lambda: self.engine.free_for_stop(snapshot))
+        if isinstance(free, _Failed):
+            return False
+        quantity = min(bare, free)
+        if quantity <= 0:
+            log.warning("kill_stop_waiting", bare=bare, free=free)
+            return False
         approval = self.attempt(
             "engine.approve_stop",
             lambda: self.engine.approve_stop(
-                snapshot, quote, quantity=bare, stop_price=price, reason=self.reason
+                snapshot, quote, quantity=quantity, stop_price=price, reason=self.reason
             ),
         )
         if isinstance(approval, _Failed):
-            return
+            return False
         order_id = self.attempt("broker.place_stop", lambda: self.broker.place_stop(approval))
         if isinstance(order_id, _Failed):
-            return
-        self.stops.append(KillStop(order_id, bare, price, self.clock.now()))
-        log.warning("kill_stop_placed", client_order_id=order_id, quantity=bare, stop_price=price)
+            return False
+        self.stops.append(KillStop(order_id, quantity, price, self.clock.now()))
+        log.warning(
+            "kill_stop_placed", client_order_id=order_id, quantity=quantity, stop_price=price
+        )
+        return quantity == bare
 
     def queue_exit(self) -> None:
         """Queue the exit for the first open at or after the start, durably; a failed write is
@@ -795,16 +844,19 @@ class _Run:
             result = call()
         except Exception as exc:
             self.record(exc, step)
-            self.seen_unsaved = self.engine.unsaved
+            self.note_unsaved(raised=exc)
             return _Failed.FAILED
         self.note_unsaved()
         return result
 
-    def note_unsaved(self) -> None:
-        """Record the engine's save failure once: a cancel, flatten or stop approval goes out
-        even when the RiskState couldn't be saved (ARCHITECTURE §8.1), and the alert says so."""
+    def note_unsaved(self, raised: Exception | None = None) -> None:
+        """Record the engine's failed save once per spell of failures (from the first failure
+        until a save succeeds): a cancel, flatten or stop approval goes out even when the
+        RiskState couldn't be saved (ARCHITECTURE §8.1), and the alert says so. A failure the
+        step itself `raised` is already recorded. Checked after every step, failed or not, so a
+        save that failed inside a step that then failed for another reason still counts."""
         unsaved = self.engine.unsaved
-        if unsaved is not None and unsaved is not self.seen_unsaved:
+        if unsaved is not None and self.seen_unsaved is None and unsaved is not raised:
             self.record(unsaved, "engine.on_change")
         self.seen_unsaved = unsaved
 

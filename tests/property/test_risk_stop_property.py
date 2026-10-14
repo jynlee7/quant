@@ -10,9 +10,10 @@ stop and a share sold twice; it refuses a SELL LIMIT beyond the free shares, as 
 (ARCHITECTURE §8.2), which is what the SELL clamp leans on for working stops. At the end every
 stop triggers and every SELL fills. Whatever was drawn, the signed position never went below 0.
 
-A second property runs the kill executor to a drawn end, with exits that may never fill and
-cancels that may never land, then lets every stop trigger and every SELL fill: never short, and
-an INCOMPLETE kill leaves every remaining share under a working SELL.
+A second property runs the kill executor to a drawn end, in regular hours or the evening, with
+exits that may never fill and cancels that may never land, then lets every stop trigger and every
+SELL fill: never short, and a kill that ends INCOMPLETE or QUEUED leaves every remaining share
+under a working SELL (B9c review, C2).
 """
 
 from __future__ import annotations
@@ -158,7 +159,7 @@ def test_no_sequence_with_stops_goes_short(
     fill_at=st.sampled_from([None, 1.0]),
     partial=st.sampled_from([None, 1, 50]),
     cancels_fail=st.sampled_from([0, 3, 10_000]),
-    minutes_to_close=st.sampled_from([2, 120]),
+    minutes_to_close=st.sampled_from([2, 120, None]),  # None: the evening, outside hours
 )
 def test_a_kill_that_cant_finish_never_leaves_shares_to_be_sold_twice(
     position: int,
@@ -166,10 +167,13 @@ def test_a_kill_that_cant_finish_never_leaves_shares_to_be_sold_twice(
     fill_at: float | None,
     partial: int | None,
     cancels_fail: int,
-    minutes_to_close: int,
+    minutes_to_close: int | None,
 ) -> None:
     close = CAL.session(DAY).close
-    d = desk(at=close - timedelta(minutes=minutes_to_close))
+    if minutes_to_close is None:  # 18:00 ET: the stop is kept and the exit queued
+        d = desk(at=close + timedelta(hours=2), day=None)
+    else:
+        d = desk(at=close - timedelta(minutes=minutes_to_close))
     orders = []
     if covered:
         orders.append(order("stop-1", Side.SELL, OrderKind.STOP, min(covered, position), 95.0))
@@ -193,8 +197,8 @@ def test_a_kill_that_cant_finish_never_leaves_shares_to_be_sold_twice(
         calendar=CAL,
     ).execute(KillRequest(KillTrigger.MANUAL, "cli", "drawn"))
 
-    assert report.status in (KillStatus.FLAT, KillStatus.INCOMPLETE)
-    if report.status is KillStatus.INCOMPLETE and broker.position > 0:
+    assert report.status in (KillStatus.FLAT, KillStatus.INCOMPLETE, KillStatus.QUEUED)
+    if report.status is not KillStatus.FLAT and broker.position > 0:
         selling = sum(o.quantity for o in broker.orders.values() if o.side is Side.SELL)
         assert selling >= broker.position  # every remaining share is under a SELL
     broker.trigger_stops()
