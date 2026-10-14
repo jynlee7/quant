@@ -29,7 +29,6 @@ from tests.support.train import (
     training_data,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B4", raises=NotImplementedError)
 TRUTHS = {"three_full": three_full, "three_diag": three_diag}
 PROVENANCE = {"code_commit": "0" * 40, "lockfile_sha256": "1" * 64}
 FORBIDDEN = ("score", "score_samples", "predict", "predict_proba", "decode", "sample")
@@ -62,7 +61,6 @@ def _thresholds() -> Any:
 # --- Config and training data ---------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "PLAN§5")
 def test_r1_trains_fifty_restarts_over_the_eight_candidates() -> None:
     from quant.hmm.train import r1_train_config
@@ -76,7 +74,6 @@ def test_r1_trains_fifty_restarts_over_the_eight_candidates() -> None:
     assert r1_train_config() is not config
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize(
     "change",
@@ -107,7 +104,6 @@ def test_a_config_out_of_range_is_refused(change: dict[str, Any]) -> None:
         TrainConfig(**(values | change))
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_training_data_hash_names_its_contents() -> None:
     data = training_data(three_full(), 700, 1)
@@ -136,7 +132,6 @@ def _data_parts(n: int = 70) -> dict[str, Any]:
     }
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize(
     "fault",
@@ -175,7 +170,6 @@ def test_training_data_is_checked(fault: str) -> None:
         TrainingData(**parts)
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_training_data_needs_aware_times() -> None:
     from quant.hmm.train import TrainingData
@@ -205,7 +199,6 @@ def _fit(truth: Truth, n: int, restarts: int, *, seed: int = 1, workers: int | N
     )
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "ARCH§7.1")
 def test_restarts_use_base_seed_plus_i_and_the_best_wins() -> None:
     from quant.hmm.filter import forward_pass
@@ -222,7 +215,6 @@ def test_restarts_use_base_seed_plus_i_and_the_best_wins() -> None:
     assert fit.trace.state_probs.tobytes() == trace.state_probs.tobytes()
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_fitted_covariances_are_exactly_symmetric_and_diag_stays_diagonal() -> None:
     _, full = _fit(three_full(), 1500, 1)
@@ -234,7 +226,6 @@ def test_fitted_covariances_are_exactly_symmetric_and_diag_stays_diagonal() -> N
         assert np.array_equal(covariance, np.diag(np.diag(covariance)))
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_one_restart_is_an_unstable_optimum_and_warns() -> None:
     with capture_logs() as logs:
@@ -243,7 +234,6 @@ def test_one_restart_is_an_unstable_optimum_and_warns() -> None:
     assert [e["event"] for e in logs if e["log_level"] == "warning"] == ["hmm optimum unstable"]
 
 
-@RED
 @pytest.mark.spec("I2")
 def test_training_calls_only_fit(monkeypatch: pytest.MonkeyPatch) -> None:
     """I2 at run time: every other GaussianHMM method raises, and fit runs once a restart."""
@@ -267,7 +257,6 @@ def test_training_calls_only_fit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.failed == ()
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize("truth_name", ["three_full", "three_diag"])
 def test_training_recovers_a_known_hmm_up_to_relabeling(truth_name: str) -> None:
@@ -280,7 +269,6 @@ def test_training_recovers_a_known_hmm_up_to_relabeling(truth_name: str) -> None
     np.testing.assert_allclose(params.transmat[np.ix_(perm, perm)], truth.transmat, atol=0.03)
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_fit_candidate_refuses_other_columns_and_bad_workers() -> None:
     from quant.hmm.train import fit_candidate
@@ -309,7 +297,6 @@ def _selected(truth_name: str, n: int = 6000) -> tuple[Any, Any, Any]:
     return data, config, result
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize("truth_name", ["three_full", "three_diag"])
 def test_selection_picks_three_states_and_the_generators_covariance_type(truth_name: str) -> None:
@@ -322,7 +309,6 @@ def test_selection_picks_three_states_and_the_generators_covariance_type(truth_n
     assert result.sanity.passed
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "ARCH§7.1")
 def test_the_chosen_model_is_its_full_window_refit() -> None:
     from quant.hmm.train import train_candidate
@@ -346,7 +332,6 @@ def test_the_chosen_model_is_its_full_window_refit() -> None:
     assert (result.model.fit_start, result.model.fit_end) == (data.fit_start, data.fit_end)
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "ARCH§7.2")
 def test_the_training_record_and_report_are_complete() -> None:
     from quant.core.epoch import to_us
@@ -447,7 +432,6 @@ def _small_run(workers: int | None, *, base_seed: int = R1_BASE_SEED) -> Any:
     ).model
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "ARCH§14")
 def test_the_same_seeds_give_the_same_artifact_hash_across_runs_and_pool_or_serial() -> None:
     serial = _small_run(1)
@@ -458,7 +442,6 @@ def test_the_same_seeds_give_the_same_artifact_hash_across_runs_and_pool_or_seri
         assert pooled.arrays()[name].tobytes() == array.tobytes(), name
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "ARCH§14")
 def test_another_base_seed_is_another_model() -> None:
     from quant.hmm.train import train_candidate
@@ -482,7 +465,6 @@ def test_another_base_seed_is_another_model() -> None:
 # --- The full run (PLAN B4's "done when") -----------------------------------------------------
 
 
-@RED
 @pytest.mark.full
 @pytest.mark.spec("SPEC§4", "PLAN§5")
 @pytest.mark.parametrize("truth_name", ["three_full", "three_diag"])

@@ -28,8 +28,6 @@ from tests.support.train import (
     ref_se,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B4", raises=NotImplementedError)
-
 
 def _candidate(k: int, covariance_type: str) -> Any:
     from quant.hmm.select import Candidate
@@ -40,7 +38,6 @@ def _candidate(k: int, covariance_type: str) -> Any:
 # --- Free parameters, simplicity and BIC ---------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize("d", [1, 2, 5])
 @pytest.mark.parametrize(("k", "covariance_type"), r1_candidates())
@@ -54,7 +51,6 @@ def test_free_parameters_count_pi_a_means_and_covariances(
     assert _candidate(k, covariance_type).n_free_params(d) == expected
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_free_parameters_of_three_states_over_two_features() -> None:
     from quant.hmm.select import n_free_params
@@ -66,7 +62,6 @@ def test_free_parameters_of_three_states_over_two_features() -> None:
         n_free_params(0, 2, "diag")
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize("d", [1, 2, 5])
 def test_simplest_means_fewest_parameters_then_fewer_states_then_diag(d: int) -> None:
@@ -82,7 +77,6 @@ def test_simplest_means_fewest_parameters_then_fewer_states_then_diag(d: int) ->
         assert simplicity_key(_candidate(3, "diag"), 1) < simplicity_key(_candidate(3, "full"), 1)
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_bic_is_minus_two_loglik_plus_p_log_n() -> None:
     from quant.hmm.select import bic
@@ -98,7 +92,6 @@ def test_bic_is_minus_two_loglik_plus_p_log_n() -> None:
 # --- Restarts: the winner, ties, and the instability warning -------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "ARCH§7.1")
 def test_restart_ties_break_to_the_lowest_index() -> None:
     from quant.hmm.select import choose_restart
@@ -110,7 +103,6 @@ def test_restart_ties_break_to_the_lowest_index() -> None:
     assert choose_restart(logliks, candidate=_candidate(2, "diag")).best == int(np.argmax(logliks))
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_the_instability_warning_fires_when_fewer_than_three_restarts_are_near_the_best() -> None:
     from quant.hmm.select import choose_restart
@@ -130,7 +122,6 @@ def test_the_instability_warning_fires_when_fewer_than_three_restarts_are_near_t
     assert (event["near_best"], event["restarts"], event["best_loglik"]) == (2, 4, -1000.0)
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_three_restarts_near_the_best_is_stable_and_silent() -> None:
     from quant.hmm.select import choose_restart
@@ -143,7 +134,6 @@ def test_three_restarts_near_the_best_is_stable_and_silent() -> None:
     assert not [e for e in logs if e["event"] == "hmm optimum unstable"]
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_a_single_restart_is_unstable() -> None:
     from quant.hmm.select import choose_restart
@@ -154,7 +144,6 @@ def test_a_single_restart_is_unstable() -> None:
     assert [e["event"] for e in logs] == ["hmm optimum unstable"]
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize("logliks", [(), (-1.0, float("nan")), (float("inf"),)])
 def test_choose_restart_refuses_empty_or_non_finite(logliks: tuple[float, ...]) -> None:
@@ -167,7 +156,6 @@ def test_choose_restart_refuses_empty_or_non_finite(logliks: tuple[float, ...]) 
 # --- The validation block -------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize(
     ("fit_end", "months", "start"),
@@ -186,7 +174,6 @@ def test_the_validation_block_is_the_last_months_of_the_window(
     assert validation_start(fit_end, months) == start
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_validation_start_refuses_naive_times_and_empty_blocks() -> None:
     from quant.hmm.select import validation_start
@@ -201,7 +188,6 @@ def _session_ids(n: int, per: int = 7) -> Any:
     return (np.arange(n, dtype=np.int64) // per + 726000).astype(np.int64)
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_validation_continues_the_training_pass_and_bootstraps_its_mean() -> None:
     from quant.hmm.filter import forward_pass
@@ -232,7 +218,6 @@ def _uneven_sessions() -> tuple[Floats, Any]:
     return rng.normal(-1.4, 0.9, size=len(sessions)), sessions
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_the_bootstrap_resamples_whole_sessions() -> None:
     from quant.hmm.select import bootstrap_means, bootstrap_se
@@ -249,7 +234,6 @@ def test_the_bootstrap_resamples_whole_sessions() -> None:
     assert again.tobytes() == means.tobytes()
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_the_bootstrap_ignores_order_inside_a_session() -> None:
     from quant.hmm.select import bootstrap_means, bootstrap_se
@@ -270,7 +254,6 @@ def test_the_bootstrap_ignores_order_inside_a_session() -> None:
     assert bootstrap_se(flat, blocks, draws=100, seed=1) == pytest.approx(0.0, abs=1e-12)
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_the_bootstrap_refuses_bad_blocks() -> None:
     from quant.hmm.select import bootstrap_means
@@ -332,7 +315,6 @@ def _check(parts: dict[str, Floats], probs: Floats) -> Any:
     return report
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_a_good_model_passes_every_sanity_check() -> None:
     parts = _good()
@@ -346,7 +328,6 @@ def test_a_good_model_passes_every_sanity_check() -> None:
     )
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_occupancy_under_two_percent_is_rejected() -> None:
     report = _check(_good(), _one_hot((60, 39, 1)))  # state 2: 1%
@@ -356,7 +337,6 @@ def test_occupancy_under_two_percent_is_rejected() -> None:
     assert _check(_good(), _one_hot((49, 49, 2))).passed  # exactly 2% passes
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_an_expected_duration_under_two_bars_is_rejected() -> None:
     parts = _good()
@@ -368,7 +348,6 @@ def test_an_expected_duration_under_two_bars_is_rejected() -> None:
     assert _check(parts, _one_hot((40, 35, 25))).passed
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_an_absorbing_state_has_infinite_duration_and_passes() -> None:
     parts = _good()
@@ -378,7 +357,6 @@ def test_an_absorbing_state_has_infinite_duration_and_passes() -> None:
     assert math.isinf(report.durations[2])
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_a_condition_number_over_a_million_is_rejected() -> None:
     parts = _good()
@@ -391,7 +369,6 @@ def test_a_condition_number_over_a_million_is_rejected() -> None:
     assert _check(parts, _one_hot((40, 35, 25))).passed
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_every_failing_check_is_reported_in_state_order() -> None:
     parts = _good()
@@ -404,7 +381,6 @@ def test_every_failing_check_is_reported_in_state_order() -> None:
     assert "condition" in report.reasons[3]
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_sanity_check_refuses_probabilities_of_the_wrong_shape() -> None:
     from quant.hmm.select import sanity_check
@@ -436,7 +412,6 @@ def _pairs(candidates: Any) -> list[tuple[int, str]]:
     return [(c.n_states, c.covariance_type) for c in candidates]
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_the_pick_is_the_simplest_candidate_close_on_both_scores() -> None:
     from quant.hmm.select import select
@@ -456,7 +431,6 @@ def test_the_pick_is_the_simplest_candidate_close_on_both_scores() -> None:
     assert result.scores == scores
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_with_none_close_on_both_the_pick_is_the_simpler_winner() -> None:
     from quant.hmm.select import select
@@ -478,7 +452,6 @@ def test_with_none_close_on_both_the_pick_is_the_simpler_winner() -> None:
     assert _pairs([select(flipped, 2).chosen]) == [(2, "diag")]
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_close_is_measured_with_the_best_candidates_standard_error() -> None:
     from quant.hmm.select import select
@@ -493,7 +466,6 @@ def test_close_is_measured_with_the_best_candidates_standard_error() -> None:
     assert _pairs([result.chosen]) == [(3, "full")]
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_ties_for_best_go_to_the_simplest() -> None:
     from quant.hmm.select import select
@@ -508,7 +480,6 @@ def test_ties_for_best_go_to_the_simplest() -> None:
     assert _pairs(result.close) == [(3, "diag"), (3, "full"), (4, "full")]
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_candidates_that_fail_a_sanity_check_take_no_part() -> None:
     from quant.hmm.select import select
@@ -524,7 +495,6 @@ def test_candidates_that_fail_a_sanity_check_take_no_part() -> None:
     assert (4, "full") not in _pairs(result.close)
 
 
-@RED
 @pytest.mark.spec("SPEC§4")
 def test_selection_fails_when_every_candidate_is_rejected_or_none_given() -> None:
     from quant.hmm.select import select

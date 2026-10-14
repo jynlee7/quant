@@ -45,12 +45,20 @@ passes.
 
 from __future__ import annotations
 
+import calendar
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final, Literal
 
+import numpy as np
+import structlog
+
+from quant.core.clock import ensure_utc
+from quant.core.errors import ModelError
 from quant.core.model import StrictModel
 from quant.data.frames import Floats, Ints
+from quant.hmm.filter import forward_pass
 from quant.hmm.labels import BARS_PER_YEAR
 from quant.hmm.model import CovarianceType, GaussianParams, ScalerParams
 
@@ -78,24 +86,34 @@ class Candidate(StrictModel):
 
     def n_free_params(self, n_features: int) -> int:
         """`n_free_params(self.n_states, n_features, self.covariance_type)`."""
-        raise NotImplementedError("red:B4")
+        return n_free_params(self.n_states, n_features, self.covariance_type)
 
 
 def n_free_params(n_states: int, n_features: int, covariance_type: CovarianceType) -> int:
     """p of the module docstring: (K-1) + K(K-1) + Kd + (Kd for "diag", Kd(d+1)/2 for "full").
     K = 3, d = 2 gives 20 for diag and 23 for full. Raises ModelError for K < 1 or d < 1."""
-    raise NotImplementedError("red:B4")
+    if n_states < 1 or n_features < 1:
+        raise ModelError("parameter counts need positive states and features")
+    k, d = n_states, n_features
+    covariance = k * d if covariance_type == "diag" else k * d * (d + 1) // 2
+    return (k - 1) + k * (k - 1) + k * d + covariance
 
 
 def simplicity_key(candidate: Candidate, n_features: int) -> tuple[int, int, int]:
     """(p, K, 0 for diag or 1 for full): sorting by it puts the simplest candidate first."""
-    raise NotImplementedError("red:B4")
+    return (
+        candidate.n_free_params(n_features),
+        candidate.n_states,
+        int(candidate.covariance_type == "full"),
+    )
 
 
 def bic(loglik: float, n_params: int, n_rows: int) -> float:
     """-2 * loglik + n_params * math.log(n_rows), exactly that expression. Raises ModelError
     when loglik isn't finite or n_rows < 1."""
-    raise NotImplementedError("red:B4")
+    if not math.isfinite(loglik) or n_rows < 1:
+        raise ModelError("BIC needs a finite log-likelihood and positive row count")
+    return -2 * loglik + n_params * math.log(n_rows)
 
 
 @dataclass(frozen=True, eq=False)
@@ -122,7 +140,22 @@ def choose_restart(logliks: tuple[float, ...], *, candidate: Candidate) -> Resta
     best_loglik. A stable result logs nothing. Raises ModelError for an empty tuple or a value
     that isn't finite.
     """
-    raise NotImplementedError("red:B4")
+    if not logliks or not np.isfinite(logliks).all():
+        raise ModelError("restarts need finite log-likelihoods")
+    best = int(np.argmax(logliks))
+    value = logliks[best]
+    near = sum(abs(ll - value) <= NEAR_BEST_RTOL * abs(value) for ll in logliks)
+    stable = near >= NEAR_BEST_MIN
+    if not stable:
+        structlog.get_logger().warning(
+            "hmm optimum unstable",
+            n_states=candidate.n_states,
+            covariance_type=candidate.covariance_type,
+            near_best=near,
+            restarts=len(logliks),
+            best_loglik=value,
+        )
+    return RestartChoice(best, near, stable)
 
 
 def validation_start(fit_end: datetime, months: int) -> datetime:
@@ -130,7 +163,16 @@ def validation_start(fit_end: datetime, months: int) -> datetime:
     same day and time of day in UTC, the day clamped to the target month's last day (2020-03-31
     back one month is 2020-02-29). Rows with available_at ≥ it are the block. A naive
     `fit_end` raises ClockError; months < 1 raises ModelError."""
-    raise NotImplementedError("red:B4")
+    end = ensure_utc(fit_end)
+    if months < 1:
+        raise ModelError("validation months must be positive")
+    year, month = divmod(end.year * 12 + end.month - 1 - months, 12)
+    month += 1
+    if year < 1:
+        raise ModelError("validation start precedes the supported calendar")
+    return end.replace(
+        year=year, month=month, day=min(end.day, calendar.monthrange(year, month)[1])
+    )
 
 
 @dataclass(frozen=True, eq=False)
@@ -165,7 +207,15 @@ def validation_score(
     last training row's log p, and bootstrap the mean (`bootstrap_se(loglik,
     validation_sessions, draws=draws, seed=seed)`). `columns` names both blocks' columns.
     Raises ModelError as forward_pass does, and as bootstrap_se does."""
-    raise NotImplementedError("red:B4")
+    train = forward_pass(params, scaler, train_rows, columns=columns)
+    trace = forward_pass(
+        params, scaler, validation_rows, columns=columns, previous=train.log_probs[-1]
+    )
+    return ValidationScore(
+        trace.loglik,
+        float(np.mean(trace.loglik)),
+        bootstrap_se(trace.loglik, validation_sessions, draws=draws, seed=seed),
+    )
 
 
 def bootstrap_means(loglik: Floats, sessions: Ints, *, draws: int, seed: int) -> Floats:
@@ -181,12 +231,33 @@ def bootstrap_means(loglik: Floats, sessions: Ints, *, draws: int, seed: int) ->
     Raises ModelError when the shapes differ, `sessions` decreases, S < 2, draws < 2, or a
     value isn't finite.
     """
-    raise NotImplementedError("red:B4")
+    if (
+        not isinstance(loglik, np.ndarray)
+        or loglik.dtype != np.float64
+        or loglik.ndim != 1
+        or not np.isfinite(loglik).all()
+        or not isinstance(sessions, np.ndarray)
+        or sessions.dtype != np.int64
+        or sessions.shape != loglik.shape
+        or len(sessions) < 2
+        or (sessions[1:] < sessions[:-1]).any()
+        or draws < 2
+        or seed < 0
+    ):
+        raise ModelError("bootstrap needs finite log-likelihoods and ordered session blocks")
+    starts = np.r_[0, np.flatnonzero(sessions[1:] != sessions[:-1]) + 1]
+    if len(starts) < 2:
+        raise ModelError("bootstrap needs at least two sessions")
+    totals = np.add.reduceat(loglik, starts)
+    counts = np.diff(np.r_[starts, len(loglik)])
+    picks = np.random.default_rng(seed).integers(0, len(starts), size=(draws, len(starts)))
+    result: Floats = totals[picks].sum(axis=1) / counts[picks].sum(axis=1)
+    return result
 
 
 def bootstrap_se(loglik: Floats, sessions: Ints, *, draws: int, seed: int) -> float:
     """float(numpy.std(bootstrap_means(...), ddof=1)): the standard error of mean(loglik)."""
-    raise NotImplementedError("red:B4")
+    return float(np.std(bootstrap_means(loglik, sessions, draws=draws, seed=seed), ddof=1))
 
 
 @dataclass(frozen=True, eq=False)
@@ -219,7 +290,28 @@ def sanity_check(params: GaussianParams, state_probs: Floats) -> SanityReport:
     OCCUPANCY_MIN, duration < DURATION_MIN or condition > CONDITION_MAX; a value exactly at a
     threshold passes. Raises ModelError when `state_probs` isn't a finite float64 (n, K) array
     with n ≥ 1."""
-    raise NotImplementedError("red:B4")
+    if (
+        not isinstance(state_probs, np.ndarray)
+        or state_probs.dtype != np.float64
+        or state_probs.ndim != 2
+        or state_probs.shape[1] != params.n_states
+        or len(state_probs) < 1
+        or not np.isfinite(state_probs).all()
+    ):
+        raise ModelError("sanity checks need finite float64 probabilities of shape (n, K)")
+    occupancy = state_probs.mean(axis=0)
+    with np.errstate(divide="ignore"):
+        durations = 1 / (1 - np.diag(params.transmat))
+    condition = np.array([np.linalg.cond(c) for c in params.covars], dtype=np.float64)
+    reasons = []
+    for k in range(params.n_states):
+        if occupancy[k] < OCCUPANCY_MIN:
+            reasons.append(f"state {k}: occupancy {occupancy[k]} < 0.02")
+        if durations[k] < DURATION_MIN:
+            reasons.append(f"state {k}: duration {durations[k]} < 2 bars")
+        if condition[k] > CONDITION_MAX:
+            reasons.append(f"state {k}: condition number {condition[k]} > 1e6")
+    return SanityReport(occupancy, durations, condition, tuple(reasons))
 
 
 @dataclass(frozen=True, eq=False)
@@ -267,4 +359,40 @@ def select(scores: tuple[CandidateScore, ...], n_features: int) -> Selection:
     Candidates whose sanity check failed take no part. Raises ModelError when `scores` is empty
     or every candidate failed its sanity check, or two scores share a
     candidate."""
-    raise NotImplementedError("red:B4")
+    if len({s.candidate for s in scores}) != len(scores):
+        raise ModelError("selection candidates must be distinct")
+    passing = [s for s in scores if s.sanity.passed]
+    if not passing:
+        raise ModelError("selection needs a candidate that passes sanity checks")
+    best_bic = min(passing, key=lambda s: (s.bic, simplicity_key(s.candidate, n_features)))
+    best_val = min(
+        passing, key=lambda s: (-s.validation.mean, simplicity_key(s.candidate, n_features))
+    )
+    se = best_val.validation.se
+    close = tuple(
+        sorted(
+            (
+                s.candidate
+                for s in passing
+                if s.bic <= best_bic.bic + BIC_CLOSE
+                and s.validation.mean >= best_val.validation.mean - se
+            ),
+            key=lambda c: simplicity_key(c, n_features),
+        )
+    )
+    chosen = (
+        close[0]
+        if close
+        else min(
+            (best_bic.candidate, best_val.candidate), key=lambda c: simplicity_key(c, n_features)
+        )
+    )
+    return Selection(
+        scores,
+        best_bic.candidate,
+        best_val.candidate,
+        se,
+        close,
+        chosen,
+        "close_on_both" if close else "simpler_winner",
+    )

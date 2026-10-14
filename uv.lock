@@ -927,6 +927,7 @@ dependencies = [
     { name = "scipy" },
     { name = "statsmodels" },
     { name = "structlog" },
+    { name = "threadpoolctl" },
     { name = "typer" },
     { name = "uvicorn" },
 ]
@@ -960,6 +961,7 @@ requires-dist = [
     { name = "scipy" },
     { name = "statsmodels" },
     { name = "structlog" },
+    { name = "threadpoolctl", specifier = ">=3.7" },
     { name = "typer" },
     { name = "uvicorn" },
 ]
