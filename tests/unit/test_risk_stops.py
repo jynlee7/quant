@@ -22,12 +22,10 @@ from quant.core.orders import OrderKind, Side
 from quant.risk.engine import RiskApprovedOrder, RiskApprovedStop, Veto
 from tests.support.risk import STOP, desk, intent, order
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 S = timedelta(seconds=1)
 US = timedelta(microseconds=1)
 
 
-@RED
 @pytest.mark.spec("I4", "K5", "ARCH§4.4")
 def test_a_stop_carries_what_was_approved_and_is_sealed_like_the_others() -> None:
     d = desk()
@@ -55,7 +53,7 @@ def test_a_stop_carries_what_was_approved_and_is_sealed_like_the_others() -> Non
             expires_at=now,
         )
     with pytest.raises(AttributeError):
-        stop.quantity = 3_000  # type: ignore[misc]
+        stop.quantity = 3_000
     with pytest.raises(TypeError):
         copy.copy(stop)
     with pytest.raises(TypeError):
@@ -64,7 +62,6 @@ def test_a_stop_carries_what_was_approved_and_is_sealed_like_the_others() -> Non
     assert d.engine.spend(stop) is stop
 
 
-@RED
 @pytest.mark.spec("I4", "ARCH§4.4", "ARCH§14")
 def test_a_stop_from_before_a_restart_is_refused() -> None:
     before = desk()
@@ -104,7 +101,6 @@ REFUSED: dict[str, dict[str, Any]] = {
 }
 
 
-@RED
 @pytest.mark.spec("I4", "D9", "SPEC§10")
 @pytest.mark.parametrize("kwargs", REFUSED.values(), ids=REFUSED.keys())
 def test_a_stop_is_refused_unless_it_sits_below_the_bid_over_shares_no_sell_covers(
@@ -118,7 +114,6 @@ def test_a_stop_is_refused_unless_it_sits_below_the_bid_over_shares_no_sell_cove
     assert d.engine.spend(d.stop(300)) is not None  # the shares are still free
 
 
-@RED
 @pytest.mark.spec("I4", "D9", "SPEC§10")
 def test_the_boundaries_pass() -> None:
     d = desk()
@@ -128,7 +123,6 @@ def test_the_boundaries_pass() -> None:
     assert d2.stop(1, stop_price=99.99, snapshot_age=5 * S, quote_age=5 * S).stop_price == 99.99
 
 
-@RED
 @pytest.mark.spec("I4", "D9", "ARCH§8.1")
 def test_sells_and_stops_reserve_shares_from_one_another_until_a_snapshot_shows_them() -> None:
     d = desk()
@@ -155,7 +149,6 @@ def test_sells_and_stops_reserve_shares_from_one_another_until_a_snapshot_shows_
     assert d.stop(100, position=400, open_orders=shown).quantity == 100
 
 
-@RED
 @pytest.mark.spec("I4", "ARCH§4.4")
 def test_a_stop_expires_with_its_snapshot_and_frees_its_shares() -> None:
     d = desk()
@@ -166,7 +159,6 @@ def test_a_stop_expires_with_its_snapshot_and_frees_its_shares() -> None:
     assert d.stop(300).quantity == 300
 
 
-@RED
 @pytest.mark.spec("I4", "D9", "ARCH§8.1", "ARCH§8.3")
 @pytest.mark.parametrize("revoke", ["a spent flatten", "a kill", "fewer shares"])
 def test_an_outstanding_stop_is_revoked_when_its_shares_may_be_gone(revoke: str) -> None:
@@ -182,7 +174,6 @@ def test_an_outstanding_stop_is_revoked_when_its_shares_may_be_gone(revoke: str)
         d.engine.spend(stop)
 
 
-@RED
 @pytest.mark.spec("I4", "C3", "SPEC§10")
 def test_a_stop_is_issued_and_spent_while_halted_and_is_never_a_submission() -> None:
     d = desk()

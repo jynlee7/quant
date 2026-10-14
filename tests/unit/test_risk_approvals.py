@@ -32,8 +32,6 @@ from quant.risk.engine import (
 from tests.support.risk import Desk, desk, intent
 
 Approved = RiskApprovedOrder | RiskApprovedCancel | RiskApprovedFlatten | RiskApprovedStop
-# B9c red: the engine doesn't issue stops yet.
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 Issue = Callable[[Desk], Approved]
 
 
@@ -56,11 +54,6 @@ def _stop(d: Desk) -> RiskApprovedStop:
 
 
 KINDS: dict[str, Issue] = {"order": _order, "cancel": _cancel, "flatten": _flatten, "stop": _stop}
-# Every kind as a parameter; the stop is red until the engine issues one (B9c).
-KIND_PARAMS = [
-    pytest.param(issue, id=name, marks=[RED] if name == "stop" else [])
-    for name, issue in KINDS.items()
-]
 # One field per kind that a forger would widen after issue.
 WIDENED: dict[type, tuple[str, object]] = {
     RiskApprovedOrder: ("quantity", 1_000_000),
@@ -132,7 +125,7 @@ FORGERIES: dict[str, Forgery] = {
 
 
 @pytest.mark.spec("I4", "K5", "ARCH§4.4")
-@pytest.mark.parametrize("issue", KIND_PARAMS)
+@pytest.mark.parametrize("issue", KINDS.values(), ids=KINDS.keys())
 @pytest.mark.parametrize("forge", FORGERIES.values(), ids=FORGERIES.keys())
 def test_i4_approvals_built_outside_the_engine_are_refused(issue: Issue, forge: Forgery) -> None:
     d = desk()
@@ -177,7 +170,7 @@ def test_approved_types_demand_the_token_and_are_immutable_and_uncopyable() -> N
 
 
 @pytest.mark.spec("I4", "ARCH§4.4")
-@pytest.mark.parametrize("issue", KIND_PARAMS)
+@pytest.mark.parametrize("issue", KINDS.values(), ids=KINDS.keys())
 def test_each_approval_is_spendable_once(issue: Issue) -> None:
     d = desk()
     approval = issue(d)

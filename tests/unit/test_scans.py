@@ -85,7 +85,6 @@ K5_STOPS = {
 }
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("K5", "I4")
 @pytest.mark.parametrize("source", K5_STOPS.values(), ids=K5_STOPS.keys())
 def test_k5_catches_a_stop_approval_built_outside_the_engine(source: str) -> None:

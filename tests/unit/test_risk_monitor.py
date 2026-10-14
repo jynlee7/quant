@@ -212,10 +212,8 @@ def test_a_stop_covers_the_position_only_with_stop_sells_for_every_share(
 # --- B9c: a working exit counts as cover, for 5 minutes (C5, your call of 2026-10-14) -----------
 
 EXIT = open_order("x-1", Side.SELL, OrderKind.LIMIT, SHARES, 99.9)
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "ARCH§16")
 def test_a_limit_is_no_stop_but_a_working_exit_for_every_share_covers() -> None:
     # Before B9c this case read "a limit is no stop" and asked to re-place the stop; the
@@ -228,7 +226,6 @@ def test_a_limit_is_no_stop_but_a_working_exit_for_every_share_covers() -> None:
     assert report.kill == ()
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "ARCH§16")
 def test_an_exit_with_a_stop_covering_the_rest_covers() -> None:
     orders = (
@@ -260,7 +257,6 @@ def test_an_exit_the_engine_doesnt_know_is_no_cover() -> None:
     assert KillTrigger.RECONCILIATION in report.kill
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "ARCH§16", "ARCH§8.3")
 def test_an_exit_still_working_after_5_minutes_fires_the_stop_missing_kill() -> None:
     w = Watch()
@@ -283,7 +279,6 @@ def test_an_exit_still_working_after_5_minutes_fires_the_stop_missing_kill() -> 
     assert (covered.exit_since, covered.stop_missing_s, covered.kill) == (None, None, ())
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "ARCH§16")
 def test_the_stop_missing_clock_pauses_while_an_exit_works() -> None:
     w = Watch()

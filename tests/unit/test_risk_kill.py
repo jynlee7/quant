@@ -676,10 +676,6 @@ def test_outside_hours_a_position_that_appears_keeps_its_new_stop() -> None:
 
 # --- B9c: a kill that can't finish leaves a stop; risk-reducing approvals need no save ----------
 
-# No stop is placed yet, so `report.stops` is empty; the price helper is a stub.
-RED_STOP = pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
-RED_PRICE = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
-
 
 def the_stop(rig: Rig, report: KillReport) -> KillStop:
     """The one stop the run left, checked against the broker and the engine."""
@@ -694,7 +690,6 @@ def the_stop(rig: Rig, report: KillReport) -> KillStop:
     return stop
 
 
-@RED_STOP
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16", "I4")
 def test_a_kill_that_reaches_its_deadline_leaves_a_stop_on_the_remaining_shares() -> None:
     rig = Rig(fill_at=1.0)  # no exit ever fills
@@ -709,7 +704,6 @@ def test_a_kill_that_reaches_its_deadline_leaves_a_stop_on_the_remaining_shares(
     assert min(rig.broker.positions) >= 0
 
 
-@RED_STOP
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
 def test_a_kill_stopped_by_the_close_leaves_a_stop_and_queues_the_exit() -> None:
     rig = Rig(at=et(DAY, 15, 59), fill_at=1.0)
@@ -720,7 +714,6 @@ def test_a_kill_stopped_by_the_close_leaves_a_stop_and_queues_the_exit() -> None
     assert (stop.quantity, stop.stop_price) == (300, 99.00)
 
 
-@RED_STOP
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "D9")
 def test_the_stop_covers_only_the_shares_no_working_sell_covers() -> None:
     # The old stop covers 100 of the 300 shares and no cancel ever lands, so no exit can go out.
@@ -745,7 +738,6 @@ def test_shares_a_stop_already_covers_get_no_second_stop() -> None:
     assert list(rig.broker.orders) == ["stop-1"]
 
 
-@RED_STOP
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
 def test_outside_hours_an_incomplete_kill_leaves_a_stop_on_the_bare_shares() -> None:
     # No stop and an exit for 50 that never cancels: 250 shares are bare overnight.
@@ -768,7 +760,6 @@ def test_a_kill_that_ends_flat_or_queued_places_no_stop() -> None:
         assert "place_stop" not in rig.kinds()
 
 
-@RED_PRICE
 @pytest.mark.spec("SPEC§10", "ARCH§8.3")
 def test_the_stop_price_sits_its_distance_below_the_bid_rounded_down() -> None:
     kill = config().kill
@@ -778,7 +769,6 @@ def test_the_stop_price_sits_its_distance_below_the_bid_rounded_down() -> None:
     assert kill_stop_price(Quote(bid=271.18, ask=271.2, at=at), kill=kill) == 268.46
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§8.1")
 def test_a_lasting_save_failure_still_takes_the_account_flat() -> None:
     # Your call of 2026-10-14: cancel and flatten approvals don't wait for a save.

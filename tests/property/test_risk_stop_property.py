@@ -2,8 +2,8 @@
 2026-10-14).
 
 Hypothesis draws an account (a position and the SELL orders already working against it), then
-a run of steps in any order: stop approvals and SELL checks against fresh snapshots, spent at
-once or later, time passing (so approvals expire), entries filling, every working SELL LIMIT
+a run of steps in any order: stop approvals and SELL checks, judged on a fresh snapshot or on
+one read a few steps before (so orders spent since are in flight), spent at once or later, time passing (so approvals expire), entries filling, every working SELL LIMIT
 filling, and the price falling through every stop. The FakeBroker places a stop without asking
 whether other SELLs already reserve its shares, so only the engine's own bound stands between a
 stop and a share sold twice; it refuses a SELL LIMIT beyond the free shares, as Alpaca does
@@ -20,39 +20,37 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from quant.core.errors import ApprovalError, BrokerError
-from quant.core.orders import InternalBook, OrderKind, Quote, Side, TradingMode
+from quant.core.orders import BrokerSnapshot, InternalBook, OrderKind, Quote, Side, TradingMode
 from quant.risk.engine import RiskApprovedOrder, RiskApprovedStop, RiskContext
 from quant.risk.kill import KillExecutor, KillRequest, KillStatus, MemoryKillLock
 from quant.risk.triggers import KillTrigger
 from tests.support.broker import FakeBroker, RecordingAlerts, RecordingKillStore
 from tests.support.risk import CAL, DAY, PRICE, config, decisions, desk, intent, order
 
-RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
-RED_KILL = pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)  # no stop yet
-
-steps = st.lists(
-    st.one_of(
-        st.tuples(st.just("stop"), st.integers(1, 450), st.booleans()),
-        st.tuples(st.just("sell"), st.integers(1, 450), st.booleans()),
-        st.tuples(st.just("spend"), st.just(0), st.just(False)),
-        st.tuples(st.just("advance"), st.sampled_from([1, 3, 6]), st.just(False)),
-        st.tuples(st.just("entry fills"), st.integers(1, 100), st.just(False)),
-        st.tuples(st.just("sells fill"), st.just(0), st.just(False)),
-        st.tuples(st.just("stops trigger"), st.just(0), st.just(False)),
-    ),
-    max_size=16,
+# Few distinct sizes, so stops and SELLs often claim the same shares.
+SHARES = st.sampled_from([1, 100, 200, 300, 301])
+# Stops and SELLs come often, so they meet; the repeats weight the draw.
+KINDS = st.sampled_from(
+    ["stop"] * 4
+    + ["sell"] * 2
+    + ["spend"] * 2
+    + ["look"] * 3
+    + ["advance", "entry fills", "sells fill", "stops trigger"]
 )
+steps = st.lists(st.tuples(KINDS, SHARES, st.booleans()), min_size=2, max_size=14)
 
 
-@RED
 @pytest.mark.spec("SPEC§10", "D9", "I4")
+# Each run is cheap and the shorts it hunts need a few steps in the right order, so it takes
+# more examples than the fast profile's 50 (at least 300, and the full tier's 500 there).
+@settings(max_examples=max(300, settings().max_examples))
 @given(
-    position=st.integers(0, 400),
-    working=st.lists(st.tuples(st.sampled_from(OrderKind), st.integers(1, 200)), max_size=3),
+    position=st.sampled_from([0, 100, 300, 400]),
+    working=st.lists(st.tuples(st.sampled_from(OrderKind), SHARES), max_size=2),
     run=steps,
 )
 def test_no_sequence_with_stops_goes_short(
@@ -62,13 +60,14 @@ def test_no_sequence_with_stops_goes_short(
     tau = decisions()[0].tau
     orders = []
     reserved = 0
-    for n, (kind, quantity) in enumerate(working):  # what Alpaca would have let stand
+    for n, (order_kind, quantity) in enumerate(working):  # what Alpaca would have let stand
         if reserved + quantity <= position:
-            orders.append(order(f"w-{n}", Side.SELL, kind, quantity, 99.9))
+            orders.append(order(f"w-{n}", Side.SELL, order_kind, quantity, 99.9))
             reserved += quantity
     broker = FakeBroker(d.engine, d.clock, position=position, orders=orders)
     unspent: list[RiskApprovedOrder | RiskApprovedStop] = []
     legs = 0
+    seen = None  # the snapshot "look" read last; stops and SELLs are judged on it while fresh
 
     def send(approval: RiskApprovedOrder | RiskApprovedStop) -> None:
         try:
@@ -79,22 +78,30 @@ def test_no_sequence_with_stops_goes_short(
         except (ApprovalError, BrokerError):
             pass  # refused: expired, revoked, or no free shares at the broker
 
+    def snapshot() -> BrokerSnapshot:
+        return seen if seen is not None else broker.snapshot()
+
     for kind, number, spend_now in run:
+        if kind == "look":
+            seen = broker.snapshot()
+            continue
         if kind == "stop":
             try:
                 approval: RiskApprovedOrder | RiskApprovedStop = d.engine.approve_stop(
-                    broker.snapshot(), broker.quote(), quantity=number, stop_price=95.0, reason="p"
+                    snapshot(), broker.quote(), quantity=number, stop_price=95.0, reason="p"
                 )
             except ApprovalError:
                 continue
         elif kind == "sell":
             legs += 1
-            snapshot = broker.snapshot()
+            snapshot_ = snapshot()
             verdict = d.engine.check(
                 intent(Side.SELL, number, tau=tau, leg=legs),
                 RiskContext(
-                    broker=snapshot,
-                    book=InternalBook(position=snapshot.position, open_orders=snapshot.open_orders),
+                    broker=snapshot_,
+                    book=InternalBook(
+                        position=snapshot_.position, open_orders=snapshot_.open_orders
+                    ),
                     quote=Quote(bid=PRICE, ask=PRICE, at=d.clock.now()),
                     limit_price=PRICE,
                 ),
@@ -107,7 +114,7 @@ def test_no_sequence_with_stops_goes_short(
                 send(unspent.pop(0))
             continue
         elif kind == "advance":
-            d.clock.advance(timedelta(seconds=number))
+            d.clock.advance(timedelta(seconds=3))  # two of them outlive a 5 s snapshot
             continue
         elif kind == "entry fills":
             broker.move(number)
@@ -130,7 +137,6 @@ def test_no_sequence_with_stops_goes_short(
     assert min(broker.positions) >= 0, broker.positions
 
 
-@RED_KILL
 @pytest.mark.spec("SPEC§10", "D9", "ARCH§8.3", "I4")
 @given(
     position=st.integers(1, 400),

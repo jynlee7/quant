@@ -199,7 +199,6 @@ class Disk:
         self.saved.append(state)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=OSError)
 @pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "I4", "C3")
 def test_risk_reducing_approvals_are_issued_and_spent_while_the_save_fails() -> None:
     disk = Disk()
@@ -218,7 +217,6 @@ def test_risk_reducing_approvals_are_issued_and_spent_while_the_save_fails() -> 
     assert disk.saved[-1].issued == 0
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
 @pytest.mark.spec("ARCH§8.1", "ARCH§4.4", "C3")
 def test_a_buy_still_needs_its_save_and_the_next_save_catches_up() -> None:
     disk = Disk()

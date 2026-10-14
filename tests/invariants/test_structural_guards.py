@@ -93,7 +93,6 @@ def test_k5_risk_approved_order_built_outside_risk_engine_is_caught(planted: Pla
     assert result.caught("K5", "src/quant/decide/forge.py:3"), result.explain()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
 @pytest.mark.spec("K5", "I4", "P3")
 def test_k5_risk_approved_stop_built_outside_risk_engine_is_caught(planted: PlantedRepo) -> None:
     # B9c: the fourth approved type (your call of 2026-10-14).

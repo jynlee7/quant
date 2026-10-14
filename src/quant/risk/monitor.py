@@ -8,7 +8,9 @@ collar and this monitor, never a feature (C8). Each tick:
 - marks equity on that price through `RiskEngine.mark`, which sets the daily-loss lock and fires
   the drawdown trigger;
 - reconciles the broker with the engine's book (quant.risk.reconcile);
-- checks that a broker-side stop covers the position (ARCHITECTURE §16).
+- checks that a broker-side stop covers the position (ARCHITECTURE §16), or for at most
+  `kill.stop_missing_s`, a risk-approved exit working at the broker (C5, your call of
+  2026-10-14).
 
 It returns what the caller must do: flatten for the daily-loss lock, re-place a missing stop, or
 run the kill executor for the triggers in `MonitorReport.kill`. It sends nothing, cancels
@@ -65,8 +67,8 @@ class MonitorReport:
       nothing was marked;
     - `reconciliation`: the comparison of `snapshot` with `book`;
     - `stop_covered`: a broker-side stop covers the position; None when the snapshot is stale;
-    - `stop_missing_since`: when the position was first seen uncovered, in the run of ticks
-      that ends with this one; None while covered;
+    - `stop_missing_since`: when the current bare run began (tick 3), the position seen with
+      neither a stop nor an exit over it; None while covered or exit-covered;
     - `replace_stop`: the caller must re-place the protective stop now;
     - `flatten`: this tick's mark set the daily-loss lock (`MarkOutcome.flatten`): the caller
       must take the position flat now, with entries locked until the next session;
@@ -103,8 +105,8 @@ class MonitorReport:
 
 
 class MinuteMonitor:
-    """The per-minute checks for one engine (C8). It remembers only when the stop went
-    missing, so a restarted monitor starts that count again."""
+    """The per-minute checks for one engine (C8). It remembers only the stop-missing clock and
+    when exits began covering, so a restarted monitor starts both counts again."""
 
     def __init__(
         self,
@@ -122,6 +124,8 @@ class MinuteMonitor:
         self._clock = clock
         self._instance_prefix = instance_prefix
         self._stop_missing_since: datetime | None = None
+        self._bare_s = 0.0  # bare seconds before the current bare run, in this spell
+        self._exit_since: datetime | None = None
 
     @property
     def stop_missing_since(self) -> datetime | None:
@@ -147,12 +151,25 @@ class MinuteMonitor:
            marked and adds DRAWDOWN: the account has lost everything the drawdown limit
            protects. Otherwise nothing is marked and the engine is untouched; `price_stale`
            says whether the price was the reason.
-        3. **Stop.** Skipped (`stop_covered=None`, `stop_missing_since` unchanged, no
-           `replace_stop`) when the snapshot is STALE. Otherwise the position is covered when
-           `snapshot.position <= 0`, or the snapshot's open STOP SELL orders hold at least
-           `snapshot.position` shares together. Covered clears `stop_missing_since`. Uncovered
-           sets it to `now` if it was None, sets `replace_stop`, and adds STOP_MISSING to `kill`
-           once `now - stop_missing_since >= kill.stop_missing_s`.
+        3. **Stop.** Skipped (nothing reported or changed, no `replace_stop`) when the
+           snapshot is STALE. Otherwise, with `limit = kill.stop_missing_s`, a *spell* runs from
+           the first tick the position isn't covered by stops until one where it is:
+
+           - **Covered** (`stop_covered`): `snapshot.position <= 0`, or the snapshot's open STOP
+             SELL orders hold at least `snapshot.position` shares together. The spell ends:
+             the clock, `stop_missing_since` and `exit_since` clear.
+           - **Exit-covered** (`exit_covered`; C5, your call of 2026-10-14): not covered, but
+             the open STOP SELLs and the SELL LIMIT exits the engine's book also holds (so
+             risk-approved; an exit the book lacks is a reconciliation mismatch) hold every
+             share together. The stop isn't reported missing (no `replace_stop`,
+             `stop_missing_since` None) and the clock pauses. `exit_since` is set to `now` the
+             first time in the spell, and stays through re-quotes (each a new order) and gaps;
+             STOP_MISSING fires once `now - exit_since >= limit`, so an exit still unfilled
+             after 5 minutes kills, and the kill's exits widen.
+           - **Bare**: otherwise. `stop_missing_since` is set to `now` when the bare run
+             starts, `replace_stop` is set, and STOP_MISSING fires once the clock,
+             `stop_missing_s` = the spell's earlier bare seconds + `now - stop_missing_since`,
+             reaches `limit`.
 
         RiskError only as `RiskEngine.mark` raises it, or from `on_change`.
         """
@@ -196,16 +213,31 @@ class MinuteMonitor:
 
         stop_covered: bool | None = None
         replace_stop = False
+        exit_covered = False
+        missing_s: float | None = None
         if not stale_snapshot:
             stop_covered = _covered(snapshot)
-            if stop_covered:
+            limit_s = config.kill.stop_missing_s
+            if stop_covered:  # the spell ends
                 self._stop_missing_since = None
+                self._bare_s = 0.0
+                self._exit_since = None
+            elif _exit_covered(snapshot, minute.book):  # C5: the clock pauses
+                exit_covered = True
+                if self._stop_missing_since is not None:
+                    self._bare_s += (now - self._stop_missing_since).total_seconds()
+                    self._stop_missing_since = None
+                if self._exit_since is None:
+                    self._exit_since = now
+                missing_s = self._bare_s
+                if (now - self._exit_since).total_seconds() >= limit_s:
+                    fired.add(KillTrigger.STOP_MISSING)
             else:
                 if self._stop_missing_since is None:
                     self._stop_missing_since = now
                 replace_stop = True
-                missing_s = (now - self._stop_missing_since).total_seconds()
-                if missing_s >= config.kill.stop_missing_s:
+                missing_s = self._bare_s + (now - self._stop_missing_since).total_seconds()
+                if missing_s >= limit_s:
                     fired.add(KillTrigger.STOP_MISSING)
 
         report = MonitorReport(
@@ -220,6 +252,9 @@ class MinuteMonitor:
             flatten=mark is not None and mark.flatten,
             kill=tuple(t for t in _KILL_ORDER if t in fired),
             data_fault=data_fault,
+            exit_covered=exit_covered,
+            exit_since=self._exit_since if exit_covered else None,
+            stop_missing_s=missing_s,
         )
         if report.kill or report.flatten or report.replace_stop or reconciliation.mismatch:
             log.warning(
@@ -281,3 +316,20 @@ def _covered(snapshot: BrokerSnapshot) -> bool:
         if order.kind is OrderKind.STOP and order.side is Side.SELL
     )
     return stops >= snapshot.position
+
+
+def _exit_covered(snapshot: BrokerSnapshot, book: InternalBook) -> bool:
+    """True when the snapshot's open STOP SELLs and the SELL LIMIT exits the engine's book also
+    holds (so risk-approved) hold every share together (C5, your call of 2026-10-14)."""
+    known = {
+        o.client_order_id
+        for o in book.open_orders
+        if o.side is Side.SELL and o.kind is OrderKind.LIMIT
+    }
+    selling = sum(
+        o.quantity
+        for o in snapshot.open_orders
+        if o.side is Side.SELL
+        and (o.kind is OrderKind.STOP or (o.kind is OrderKind.LIMIT and o.client_order_id in known))
+    )
+    return selling >= snapshot.position

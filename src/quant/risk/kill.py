@@ -12,6 +12,10 @@ with a lock so only one copy runs at a time. In regular hours it:
 4. verifies on a broker snapshot that the account is flat with no open orders;
 5. alerts (`KillAlerts.send`).
 
+A run that ends INCOMPLETE with shares no working SELL covers first leaves a broker-side stop
+under them (through a RiskApprovedStop, `kill.stop_distance_bp` below the bid; your call of
+2026-10-14), so a kill that can't finish never leaves the position bare.
+
 Outside regular hours it halts, cancels the working LIMIT orders, keeps the broker-side stop,
 and queues the exit for the next open (09:30 ET), where the engine runs the executor again
 (ARCHITECTURE §5's 09:30:05 job).
@@ -40,7 +44,7 @@ import structlog
 from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.clock import Clock, ensure_utc
 from quant.core.errors import RiskError
-from quant.core.orders import BrokerSnapshot, OpenOrder, OrderKind, Quote
+from quant.core.orders import BrokerSnapshot, OpenOrder, OrderKind, Quote, Side
 from quant.risk.broker import BrokerPort
 from quant.risk.engine import RiskEngine
 from quant.risk.limits import KillConfig, RiskConfig
@@ -302,7 +306,8 @@ def kill_stop_price(quote: Quote, *, kill: KillConfig) -> float:
     """The trigger price of the protective stop a kill leaves: `quote.bid * (1 -
     kill.stop_distance_bp / 10_000)` in decimal values, rounded *down* to the cent, so it always
     sits below the bid. A bid of 100.00 with 100 bp gives 99.00."""
-    raise NotImplementedError("B9c: kill_stop_price")
+    width = _exact(kill.stop_distance_bp) / 10_000
+    return float((_exact(quote.bid) * (1 - width)).quantize(_CENT, rounding=ROUND_FLOOR))
 
 
 class KillExecutor:
@@ -342,8 +347,9 @@ class KillExecutor:
         spend) is recorded in `errors` and the run goes on, a broker step being retried after
         the next wait. An exception outside any step ends the run INCOMPLETE, recorded the same
         way. The alert is always attempted, and the report always returned. A failing
-        `on_change` means the engine issues no approval, so under a lasting failure the run
-        sends nothing and ends INCOMPLETE at the deadline, still halted and alerted.
+        `on_change` doesn't hold up a cancel, flatten or stop approval (your call of
+        2026-10-14): the engine still issues them, and the run records its `unsaved` error once
+        in `errors`, so the alert says the risk state isn't saved.
 
         **Lock.** `lock.acquire()` first. When it returns False the run is BUSY: it returns a
         KillReport with status BUSY, an empty `halt_reason` and nothing else done (no halt, no
@@ -361,8 +367,9 @@ class KillExecutor:
         Then `regular_hours = in_regular_hours(now, calendar)` picks the path. Throughout,
         `deadline = started_at + kill.deadline_s`. Waiting means `clock.sleep_until(min(now +
         kill.poll_s, deadline))` and then a fresh `broker.snapshot()`. When `now >= deadline`
-        before the run is done, it stops where it is, leaving any working exit at the broker:
-        INCOMPLETE, and the caller runs the executor again (ARCHITECTURE §16: the kill keeps
+        before the run is done, it stops: in regular hours it reads a snapshot and cancels each
+        working LIMIT order on it once, without waiting, then protects the shares (step 6) and
+        ends INCOMPLETE; the caller runs the executor again (ARCHITECTURE §16: the kill keeps
         retrying).
 
         *Cancelling* an order means `engine.approve_cancel(client_order_id, reason=halt_reason)`
@@ -389,9 +396,8 @@ class KillExecutor:
         4. **Verify.** FLAT only on a snapshot read after the last exit or cancel was sent that
            shows `position == 0` and no open orders; it becomes `final`.
            If the session closes (`now >= session.close`) first, the run stops: it cancels
-           until gone the working exit (once, without waiting past the deadline), queues the
-           exit and is INCOMPLETE with `queued_exit_at` set. Re-placing a protective stop over
-           the night is execution's (B13), not the executor's.
+           until gone the working exit (once, without waiting past the deadline), protects the
+           shares (step 6), queues the exit and is INCOMPLETE with `queued_exit_at` set.
 
         **Outside regular hours.**
 
@@ -402,6 +408,16 @@ class KillExecutor:
         3. Otherwise cancel until gone every open LIMIT order (entries and exits) and keep every
            STOP order (`kept`, by client order id), send no exit, and queue the exit: QUEUED,
            with `queued_exit_at` set, once a snapshot shows no LIMIT order.
+
+        **6. Protect.** Before any INCOMPLETE end, in or outside regular hours: read a fresh
+        snapshot; when it holds `position > 0` and the working SELL orders on it (LIMIT and
+        STOP) hold fewer shares, read a quote and place a stop for the rest, `bare = position -
+        those shares`: `engine.approve_stop(snapshot, quote, quantity=bare,
+        stop_price=kill_stop_price(quote, kill), reason=halt_reason)`, then
+        `broker.place_stop(approval)`, recorded as a KillStop in `stops`. Shares a working SELL
+        already covers get no second stop, so the stop and an exit still working can't sell a
+        share twice. A failed step is recorded and not retried: the run is ending. FLAT and
+        QUEUED runs place none (outside hours the existing stop is kept).
 
         *Queueing the exit* is `store.queue_exit(next_open(started_at), halt_reason)`: the
         first open at or after the moment the kill started, so a run that crosses 09:30 queues
@@ -484,7 +500,9 @@ class _Run:
         self.exits: list[KillExit] = []
         self.queued_exit_at: datetime | None = None
         self.final: BrokerSnapshot | None = None
+        self.stops: list[KillStop] = []
         self.errors = errors
+        self.seen_unsaved: Exception | None = None  # the engine's save failure last recorded
 
     def execute(self) -> KillReport:
         log.error(
@@ -499,7 +517,7 @@ class _Run:
             status = self.regular() if self.regular_hours else self.outside()
         except Exception as exc:  # outside any step: the run ends, and still alerts
             self.record(exc, "run")
-            status = KillStatus.INCOMPLETE
+            status = self.incomplete()
         report = KillReport(
             request=self.request,
             status=status,
@@ -513,6 +531,7 @@ class _Run:
             queued_exit_at=self.queued_exit_at,
             final=self.final,
             errors=tuple(self.errors),
+            stops=tuple(self.stops),
         )
         log.error(
             "kill_finished",
@@ -521,6 +540,7 @@ class _Run:
             cancelled=len(self.cancelled),
             errors=len(self.errors),
             queued_exit_at=self.queued_exit_at,
+            stops=len(self.stops),
         )
         return report
 
@@ -565,12 +585,12 @@ class _Run:
         snapshot = self.snapshot()
         while snapshot is None:
             if self.stopping():
-                return KillStatus.INCOMPLETE
+                return self.incomplete()
             snapshot = self.wait()
         if snapshot.position == 0:
             cleared = self.clear(snapshot, _every_while_flat)
             if cleared is None:
-                return KillStatus.INCOMPLETE
+                return self.incomplete()
             if _flat(cleared):
                 return KillStatus.FLAT
             snapshot = cleared  # a position appeared meanwhile: keep its stop, queue its exit
@@ -580,14 +600,20 @@ class _Run:
             self.kept = tuple(o.client_order_id for o in last.open_orders if not _limit(last, o))
             log.warning("kill_stops_kept", kept=list(self.kept))
         self.queue_exit()
-        return KillStatus.QUEUED if cleared is not None else KillStatus.INCOMPLETE
+        return KillStatus.QUEUED if cleared is not None else self.incomplete()
 
     def stopped(self) -> KillStatus:
         """The deadline or the session's close came before FLAT. At the close the working exit
         is cancelled once more and the exit is queued for the next open (step 4)."""
         if self.close is None or self.clock.now() < self.close:
             log.error("kill_deadline_passed", exits=len(self.exits))
-            return KillStatus.INCOMPLETE
+            snapshot = self.snapshot()
+            if snapshot is not None:  # cancel the working exits once, without waiting
+                for order_id in [
+                    o.client_order_id for o in snapshot.open_orders if _limit(snapshot, o)
+                ]:
+                    self.cancel(order_id)
+            return self.incomplete()
         self.close = None  # from here on, only the deadline stops a wait
         log.error("kill_session_closed", exits=len(self.exits))
         snapshot = self.snapshot()
@@ -597,7 +623,7 @@ class _Run:
         if cleared is not None and _flat(cleared):
             return KillStatus.FLAT
         self.queue_exit()
-        return KillStatus.INCOMPLETE
+        return self.incomplete()
 
     # --- the steps -------------------------------------------------------------------------------
 
@@ -692,6 +718,45 @@ class _Run:
         log.info("kill_order_cancelled", client_order_id=order_id)
         return True
 
+    def incomplete(self) -> KillStatus:
+        """End the run INCOMPLETE, leaving a stop under the bare shares first (step 6)."""
+        try:
+            self.protect()
+        except Exception as exc:  # protecting never stops the alert
+            self.record(exc, "protect")
+        return KillStatus.INCOMPLETE
+
+    def protect(self) -> None:
+        """Step 6: on a fresh snapshot, place one stop-market SELL under the shares no working
+        SELL covers, `kill.stop_distance_bp` below a fresh bid, through a RiskApprovedStop. A
+        failed step is recorded and not retried: the run is ending."""
+        snapshot = self.snapshot()
+        if snapshot is None or snapshot.position <= 0:
+            return
+        covered = sum(o.quantity for o in snapshot.open_orders if o.side is Side.SELL)
+        bare = snapshot.position - covered
+        if bare <= 0:
+            return
+        quote = self.attempt("broker.quote", self.broker.quote)
+        if isinstance(quote, _Failed):
+            return
+        price = self.attempt("kill_stop_price", lambda: kill_stop_price(quote, kill=self.kill))
+        if isinstance(price, _Failed):
+            return
+        approval = self.attempt(
+            "engine.approve_stop",
+            lambda: self.engine.approve_stop(
+                snapshot, quote, quantity=bare, stop_price=price, reason=self.reason
+            ),
+        )
+        if isinstance(approval, _Failed):
+            return
+        order_id = self.attempt("broker.place_stop", lambda: self.broker.place_stop(approval))
+        if isinstance(order_id, _Failed):
+            return
+        self.stops.append(KillStop(order_id, bare, price, self.clock.now()))
+        log.warning("kill_stop_placed", client_order_id=order_id, quantity=bare, stop_price=price)
+
     def queue_exit(self) -> None:
         """Queue the exit for the first open at or after the start, durably; a failed write is
         recorded only."""
@@ -727,10 +792,21 @@ class _Run:
         """Run one step: what it returns, or FAILED with its exception recorded (the policy in
         KillExecutor.execute)."""
         try:
-            return call()
+            result = call()
         except Exception as exc:
             self.record(exc, step)
+            self.seen_unsaved = self.engine.unsaved
             return _Failed.FAILED
+        self.note_unsaved()
+        return result
+
+    def note_unsaved(self) -> None:
+        """Record the engine's save failure once: a cancel, flatten or stop approval goes out
+        even when the RiskState couldn't be saved (ARCHITECTURE §8.1), and the alert says so."""
+        unsaved = self.engine.unsaved
+        if unsaved is not None and unsaved is not self.seen_unsaved:
+            self.record(unsaved, "engine.on_change")
+        self.seen_unsaved = unsaved
 
     def record(self, exc: Exception, step: str) -> None:
         self.errors.append(_error(exc))
