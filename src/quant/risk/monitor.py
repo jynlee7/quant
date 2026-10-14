@@ -1,0 +1,129 @@
+"""The minute monitor's logic (C8, spec §10, ARCHITECTURE §5 and §16).
+
+Daily loss and drawdown can be breached between bars, so every minute of regular hours the live
+engine (B14) and the backtest call `MinuteMonitor.tick` with the freshest price: the IEX
+real-time trade live, the SIP 1-minute close in the backtest. That price feeds only the order
+collar and this monitor, never a feature (C8). Each tick:
+
+- marks equity on that price through `RiskEngine.mark`, which sets the daily-loss lock and fires
+  the drawdown trigger;
+- reconciles the broker with the engine's book (quant.risk.reconcile);
+- checks that a broker-side stop covers the position (ARCHITECTURE §16).
+
+It returns what the caller must do: flatten for the daily-loss lock, re-place a missing stop, or
+run the kill executor for the triggers in `MonitorReport.kill`. It sends nothing, cancels
+nothing and alerts no one itself; scheduling and acting are B14's. "Now" is the monitor's Clock.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from quant.core.clock import Clock
+from quant.core.orders import BrokerSnapshot, InternalBook
+from quant.risk.engine import MarkOutcome, RiskEngine
+from quant.risk.limits import RiskConfig
+from quant.risk.reconcile import ReconciliationResult
+from quant.risk.triggers import KillTrigger
+
+
+@dataclass(frozen=True)
+class MinuteInput:
+    """What one tick reads.
+
+    - `price`: the freshest SPY price (C8), dollars;
+    - `price_at`: that price's own time, UTC;
+    - `cash`: the account's cash balance at the broker, dollars (B13's adapter reports it; the
+      simulated broker in a backtest). Finite; it may be negative;
+    - `snapshot`: the broker's position and working orders, read for this tick;
+    - `book`: the engine's position and working orders.
+    """
+
+    price: float
+    price_at: datetime
+    cash: float
+    snapshot: BrokerSnapshot
+    book: InternalBook
+
+
+@dataclass(frozen=True)
+class MonitorReport:
+    """What one tick found and what the caller must do.
+
+    - `at`: the clock's time at the tick;
+    - `equity`: `cash + snapshot.position * price`, or None when nothing was marked;
+    - `mark`: what `RiskEngine.mark(equity)` returned, or None when nothing was marked;
+    - `price_stale`: the price was too old, from the future, or not finite and positive, so
+      nothing was marked;
+    - `reconciliation`: the comparison of `snapshot` with `book`;
+    - `stop_covered`: a broker-side stop covers the position; None when the snapshot is stale;
+    - `stop_missing_since`: when the position was first seen uncovered, in the run of ticks
+      that ends with this one; None while covered;
+    - `replace_stop`: the caller must re-place the protective stop now;
+    - `flatten`: this tick's mark set the daily-loss lock (`MarkOutcome.flatten`): the caller
+      must take the position flat now, with entries locked until the next session;
+    - `kill`: the triggers that fire on this tick, in the order DRAWDOWN, RECONCILIATION,
+      STOP_MISSING; the caller runs the kill executor when it is not empty, unless one has
+      already run for the halt in force.
+    """
+
+    at: datetime
+    equity: float | None
+    mark: MarkOutcome | None
+    price_stale: bool
+    reconciliation: ReconciliationResult
+    stop_covered: bool | None
+    stop_missing_since: datetime | None
+    replace_stop: bool
+    flatten: bool
+    kill: tuple[KillTrigger, ...]
+
+
+class MinuteMonitor:
+    """The per-minute checks for one engine (C8). It remembers only when the stop went
+    missing, so a restarted monitor starts that count again."""
+
+    def __init__(
+        self,
+        engine: RiskEngine,
+        config: RiskConfig,
+        *,
+        clock: Clock,
+        instance_prefix: str | None = None,
+    ) -> None:
+        """A monitor that marks `engine`, with the limits in `config` (the engine's own),
+        judging time by `clock`. `instance_prefix` goes to `reconcile`, so a broker order from
+        another instance is a mismatch."""
+        raise NotImplementedError("B9b: MinuteMonitor")
+
+    @property
+    def stop_missing_since(self) -> datetime | None:
+        """When the position was first seen without a covering stop, or None (MonitorReport)."""
+        raise NotImplementedError("B9b: MinuteMonitor.stop_missing_since")
+
+    def tick(self, minute: MinuteInput) -> MonitorReport:
+        """One minute's checks at `now = clock.now()`, in this order:
+
+        1. **Reconcile** `minute.snapshot` with `minute.book`
+           (`reconcile(..., now=now, max_age_s=config.snapshot_max_age_s, instance_prefix)`).
+           A MISMATCH adds RECONCILIATION to `kill`; STALE adds nothing.
+        2. **Mark.** The price is fresh when it is finite and positive and
+           `0 <= now - minute.price_at <= monitor_price_max_age_s` seconds (exactly the maximum
+           is fresh). When the price is fresh, the snapshot isn't STALE and the engine has
+           started a session, `equity = minute.cash + minute.snapshot.position * minute.price`
+           and the engine is marked with it (`RiskEngine.mark`, which publishes through
+           `on_change`). `flatten` is the mark's `flatten`, and the mark's `kill` adds DRAWDOWN.
+           An equity that isn't finite and positive is not marked and adds DRAWDOWN: the
+           account has lost everything the drawdown limit protects. Otherwise nothing is marked
+           and the engine is untouched; `price_stale` says whether the price was the reason.
+        3. **Stop.** Skipped (`stop_covered=None`, `stop_missing_since` unchanged, no
+           `replace_stop`) when the snapshot is STALE. Otherwise the position is covered when
+           `snapshot.position <= 0`, or the snapshot's open STOP SELL orders hold at least
+           `snapshot.position` shares together. Covered clears `stop_missing_since`. Uncovered
+           sets it to `now` if it was None, sets `replace_stop`, and adds STOP_MISSING to `kill`
+           once `now - stop_missing_since >= kill.stop_missing_s`.
+
+        RiskError only as `RiskEngine.mark` raises it, or from `on_change`.
+        """
+        raise NotImplementedError("B9b: MinuteMonitor.tick")

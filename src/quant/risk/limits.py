@@ -37,6 +37,58 @@ class LabelCaps(StrictModel):
         return float(getattr(self, label.value))
 
 
+class KillConfig(StrictModel):
+    """The kill switch's settings: `risk.yaml`'s `kill` mapping (spec §10, ARCHITECTURE §8.3 and
+    §16, C2). Frozen, like its parent. Every key is required and no other key is allowed.
+
+    The executor (quant.risk.kill):
+
+    - `requote_s`: seconds a kill exit may stay unfilled before it is cancelled and re-quoted
+      wider (spec §10: 30);
+    - `widen_bp`: basis points each re-quote adds to the last one's distance from the quote
+      (10, so 10, 20, 30 bp ...);
+    - `max_collar_bp`: the furthest, in basis points, a kill exit ever sits from the quote (100);
+    - `poll_s`: seconds between the executor's broker reads while it waits (1);
+    - `deadline_s`: seconds after the executor starts by which the account must be flat and
+      clean; past it the executor stops, reports INCOMPLETE and alerts (300).
+
+    The automatic triggers (quant.risk.triggers):
+
+    - `order_errors`, `order_error_window_s`: that many broker order errors within that many
+      seconds fire the kill (ARCHITECTURE §8.3: 5 within 600);
+    - `heartbeat_lost_s`: seconds without an engine heartbeat that count as a lost heartbeat
+      (C2: 300, longer than the 90 s watchdog's kill-and-restart, ARCHITECTURE §16);
+    - `crash_loop_starts`, `crash_loop_window_s`: that many engine starts within that many
+      seconds are a crash loop (C2: 3 within 600);
+    - `flatten_incomplete_s`: seconds a rule-6 flatten may stay incomplete (C2: 600);
+    - `stop_missing_s`: seconds a position may go without a covering broker-side stop
+      (ARCHITECTURE §16: 300).
+
+    Every threshold is inclusive: an elapsed time or count equal to it fires.
+    """
+
+    requote_s: float = Field(gt=0.0)
+    widen_bp: float = Field(ge=0.0, le=100.0)
+    max_collar_bp: float = Field(gt=0.0, le=500.0)
+    poll_s: float = Field(gt=0.0)
+    deadline_s: float = Field(gt=0.0)
+    order_errors: int = Field(ge=1)
+    order_error_window_s: float = Field(gt=0.0)
+    heartbeat_lost_s: float = Field(gt=0.0)
+    crash_loop_starts: int = Field(ge=2)
+    crash_loop_window_s: float = Field(gt=0.0)
+    flatten_incomplete_s: float = Field(gt=0.0)
+    stop_missing_s: float = Field(gt=0.0)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> KillConfig:
+        """ValueError (so a ValidationError) unless `poll_s < requote_s < deadline_s`: the
+        executor must read the broker inside each attempt, and get more than one attempt."""
+        if not self.poll_s < self.requote_s < self.deadline_s:
+            raise ValueError("kill timings must satisfy poll_s < requote_s < deadline_s")
+        return self
+
+
 class RiskConfig(StrictModel):
     """The limits in config/risk.yaml. Every key is required and no other key is allowed.
 
@@ -55,7 +107,11 @@ class RiskConfig(StrictModel):
     - `submission_halt_at`: the raw submission that halts trading (C3, the 60th);
     - `collar_bp`: how far, in basis points, a limit may sit from its side of the quote (10);
     - `quote_max_age_s`, `snapshot_max_age_s`: seconds; the oldest quote (check 6) and broker
-      snapshot (check 2) a check accepts (5 each).
+      snapshot (check 2) a check accepts (5 each). Reconciliation (quant.risk.reconcile) uses
+      `snapshot_max_age_s` too;
+    - `monitor_price_max_age_s`: seconds; the oldest price the minute monitor marks equity on
+      (C8, 120). An older price marks nothing;
+    - `kill`: the kill switch's settings (KillConfig).
     """
 
     max_gross_exposure: float = Field(gt=0.0, le=1.0)
@@ -71,17 +127,22 @@ class RiskConfig(StrictModel):
     collar_bp: float = Field(gt=0.0, le=100.0)
     quote_max_age_s: float = Field(gt=0.0)
     snapshot_max_age_s: float = Field(gt=0.0)
+    monitor_price_max_age_s: float = Field(gt=0.0)
+    kill: KillConfig
 
     @model_validator(mode="after")
     def _consistent(self) -> RiskConfig:
         """ValueError (so a ValidationError) unless the limits hang together: no label cap and
         neither the overnight nor the uncertain cap above `max_gross_exposure`, CRASH's cap is 0
-        (spec §7: no playbook can trade it), and `uncertain_cap` is 0 (spec §10)."""
+        (spec §7: no playbook can trade it), `uncertain_cap` is 0 (spec §10), and a kill exit's
+        widest distance `kill.max_collar_bp` is at least `collar_bp`, where it starts."""
         caps = [self.label_caps.cap(label) for label in Label]
         if max(*caps, self.overnight_cap, self.uncertain_cap) > self.max_gross_exposure:
             raise ValueError("label, overnight and uncertain caps must not exceed gross exposure")
         if self.label_caps.CRASH != 0.0 or self.uncertain_cap != 0.0:
             raise ValueError("CRASH and uncertainty must cap exposure at zero")
+        if self.kill.max_collar_bp < self.collar_bp:
+            raise ValueError("a kill exit's widest collar must be at least the collar")
         return self
 
 

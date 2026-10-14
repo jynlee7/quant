@@ -72,3 +72,9 @@ class SubmissionLimitError(ApprovalError):
     """A genuine BUY approval refused at spend because the session has already reached C3's raw
     submission limit (spec §10). Unlike the other ApprovalErrors it says nothing is wrong with
     the approval itself; the refusal halts trading."""
+
+
+class BrokerError(QuantError):
+    """The broker failed or refused a request: a network error, an HTTP error, a timeout or a
+    rejected order (ARCHITECTURE §16). The broker port (quant.risk.broker) raises it; the kill
+    executor counts it and retries until its deadline."""

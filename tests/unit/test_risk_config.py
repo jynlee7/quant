@@ -65,6 +65,21 @@ def test_the_committed_file_holds_the_spec_section_10_limits() -> None:
     assert limits.snapshot_max_age_s == 5.0
 
 
+@pytest.mark.spec("SPEC§10", "C2", "C8", "ARCH§8.3", "ARCH§16")
+def test_the_committed_file_holds_the_kill_settings() -> None:
+    """B9b: the kill switch's settings that B9a left out (judgment call 8)."""
+    limits = load_risk_config(COMMITTED_FILE, committed=COMMITTED_FILE.read_bytes())
+    assert limits.monitor_price_max_age_s == 120.0
+    kill = limits.kill
+    assert (kill.requote_s, kill.widen_bp, kill.max_collar_bp) == (30.0, 10.0, 100.0)
+    assert (kill.poll_s, kill.deadline_s) == (1.0, 300.0)
+    assert (kill.order_errors, kill.order_error_window_s) == (5, 600.0)
+    assert kill.heartbeat_lost_s == 300.0
+    assert (kill.crash_loop_starts, kill.crash_loop_window_s) == (3, 600.0)
+    assert kill.flatten_incomplete_s == 600.0
+    assert kill.stop_missing_s == 300.0
+
+
 @pytest.mark.spec("ARCH§8.1", "ARCH§9.3", "SPEC§10")
 @pytest.mark.parametrize(
     "edit",
@@ -119,6 +134,12 @@ def test_committed_bytes_reads_head_and_the_loader_refuses_local_edits(tmp_path:
         lambda text: text.replace("daily_loss_fraction: 0.02", "daily_loss_fraction: .nan"),
         lambda text: "- a list\n",
         lambda text: "key: [unclosed\n",
+        lambda text: text.replace("  poll_s: 1.0", "  poll_s: 30.0"),
+        lambda text: text.replace("  deadline_s: 300.0", "  deadline_s: 30.0"),
+        lambda text: text.replace("  max_collar_bp: 100.0", "  max_collar_bp: 5.0"),
+        lambda text: text.replace("  order_errors: 5", "  order_errors: 0"),
+        lambda text: text.replace("  stop_missing_s: 300.0", "  stop_missing_s: 300.0\n  extra: 1"),
+        lambda text: text.replace("monitor_price_max_age_s: 120.0", ""),
     ],
     ids=[
         "an unknown key",
@@ -131,6 +152,12 @@ def test_committed_bytes_reads_head_and_the_loader_refuses_local_edits(tmp_path:
         "NaN",
         "not a mapping",
         "not YAML",
+        "a poll as slow as a re-quote",
+        "a deadline no longer than a re-quote",
+        "a kill exit's widest collar inside the collar",
+        "no order errors",
+        "an unknown kill key",
+        "no monitor price age",
     ],
 )
 def test_the_parser_refuses_malformed_or_inconsistent_limits(edit: object) -> None:

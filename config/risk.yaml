@@ -29,3 +29,19 @@ submission_halt_at: 60        # the 60th raw broker submission in a session halt
 collar_bp: 10.0               # a limit within +-10 bp of the quote
 quote_max_age_s: 5.0
 snapshot_max_age_s: 5.0       # the broker snapshot behind reconciliation
+monitor_price_max_age_s: 120.0  # the minute monitor marks equity only on a price this fresh (C8)
+
+# Kill switch (SPEC §10, ARCHITECTURE §8.3 and §16, C2). Every threshold is inclusive.
+kill:
+  requote_s: 30.0             # an unfilled kill exit is cancelled and re-quoted wider after this
+  widen_bp: 10.0              # each re-quote sits this much further from the quote: 10, 20, 30 bp ...
+  max_collar_bp: 100.0        # ... but never further than this
+  poll_s: 1.0                 # how often the executor reads the broker while it waits
+  deadline_s: 300.0           # not flat and clean by then: stop, report incomplete, alert
+  order_errors: 5             # this many broker order errors ...
+  order_error_window_s: 600.0 # ... within this many seconds fire the kill
+  heartbeat_lost_s: 300.0     # no engine heartbeat for this long is a lost heartbeat (C2)
+  crash_loop_starts: 3        # this many engine starts ...
+  crash_loop_window_s: 600.0  # ... within this many seconds are a crash loop (C2)
+  flatten_incomplete_s: 600.0 # a rule-6 flatten still incomplete after this (C2)
+  stop_missing_s: 300.0       # a position with no covering broker-side stop for this long

@@ -43,8 +43,10 @@ every change reaches the engine's `on_change` before the call that made it retur
 persist it first. Every halt is signalled where it happens: `Veto.halts`,
 `RiskApprovedOrder.halts`, `MarkOutcome.kill`, SubmissionLimitError, and the published state.
 A halt keeps its first reason, and only `resume` (B14's `quant resume`) clears it.
-The kill executor, reconciliation snapshots, the minute monitor itself and the broker port are
-B9b's. "Now" comes from the engine's Clock. Every veto and halt is logged with structlog.
+The kill executor (quant.risk.kill), reconciliation (quant.risk.reconcile), the minute monitor
+(quant.risk.monitor), the kill triggers (quant.risk.triggers) and the broker port
+(quant.risk.broker) are B9b's. "Now" comes from the engine's Clock. Every veto and halt is
+logged with structlog.
 """
 
 from __future__ import annotations
@@ -468,8 +470,8 @@ class RiskEngine:
     expires or is approved, and of a cancel or flatten once it is spent.
 
     **Persisting (C7).** Every public method that changes RiskState calls `on_change` with the
-    new state once, before it returns or raises: `start_session`, `mark`, `resume`, `check`,
-    `approve_pending`, `approve_cancel`, `approve_flatten` and `spend`. The live engine (B14)
+    new state once, before it returns or raises: `start_session`, `mark`, `resume`, `halt`,
+    `check`, `approve_pending`, `approve_cancel`, `approve_flatten` and `spend`. The live engine (B14)
     persists the state there, so a crash after a call never restores a state from before it;
     `spend` persists the submission before the adapter sends. An exception from `on_change`
     propagates out of the method (`check` included), so nothing is sent on a state that wasn't
@@ -570,6 +572,21 @@ class RiskEngine:
             new_peak=outcome.new_peak,
         )
         return outcome
+
+    def halt(self, reason: str) -> bool:
+        """Halt trading for `reason`: the kill executor's first step (ARCHITECTURE §8.3), for
+        every trigger, manual or automatic (quant.risk.triggers.KillTrigger).
+
+        Sets `halted`; `halt_reason` becomes `reason` unless trading is already halted, when the
+        first reason stays (C10). Revokes every outstanding BUY approval, as any halt does, and
+        leaves SELLs, cancels and flattens alone. `killed` (the drawdown trigger) is unchanged.
+        Works with or without a started session. The new state reaches `on_change` before
+        `halt` returns (C7), and the halt is logged like every other.
+
+        Returns True when this call halted trading, False when it was already halted (the state
+        is then unchanged and `on_change` isn't called). RiskError, changing nothing, when
+        `reason` is not a non-empty string."""
+        raise NotImplementedError("B9b: RiskEngine.halt")
 
     def mark(self, equity: float) -> MarkOutcome:
         """One equity mark from the minute monitor, on the freshest price (C8), or from a broker
