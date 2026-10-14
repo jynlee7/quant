@@ -1,7 +1,7 @@
 # PLAN — SPY Regime Trader
 
-**Status:** APPROVED v1.2 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does. v1.2 adds step B20, Jev as a shadow advisor (SPEC v1.4 §12a, ARCHITECTURE v1.6), which you approved on 2026-10-13 (§0, §0.3, §1, §4).
-**Builds on:** [SPEC.md](SPEC.md) v1.4 (v1.1 plus this plan's C11–C17, B3's reading of §3 and the Jev shadow advisor) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.6 (v1.0 aligned with this plan, notes from B0, B2 and B10, and the Jev shadow advisor), approved 2026-10-05 and amended since; the shadow advisor was approved 2026-10-13
+**Status:** APPROVED v1.3 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does. v1.2 adds step B20, Jev as a shadow advisor (SPEC v1.4 §12a, ARCHITECTURE v1.6), which you approved on 2026-10-13 (§0, §0.3, §1, §4). v1.3 records two calls of yours: B9 may merge before B5–B8, which you decided on 2026-10-13 (§4 B9), and every step merges through a pull request on the private GitHub repo, decided on 2026-10-14 (§2 rule 7).
+**Builds on:** [SPEC.md](SPEC.md) v1.6 (v1.1 plus this plan's C11–C17, B3's reading of §3, the Jev shadow advisor, B9's resume and kill calls, and B4's reading of §4–§6) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.8 (v1.0 aligned with this plan, notes from B0, B2, B4, B9 and B10, and the Jev shadow advisor), approved 2026-10-05 and amended since; the shadow advisor was approved 2026-10-13
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The build started 2026-10-05 with B0. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -114,7 +114,7 @@ If something isn't ready when I reach the step that needs it, I continue with th
 4. **Truncation harness:** a step that touches the decision path adds its layer to T-NL1 before it counts as done.
 5. **Review:** an independent code review of the step's diff, checked against the step's IDs. Every finding is either fixed or written down in the build log with a reason.
 6. **No silent deviations:** if the code must differ from SPEC, ARCHITECTURE or this plan, the document changes in the same merge, with a minor version and a build-log note. If the change touches an approved decision, I stop and ask first.
-7. **Done:** merge to `main`, tag `bNN-done`, and add an entry to `docs/BUILD_LOG.md`: what was built, tests added, run times, deviations and open items.
+7. **Done:** merge to `main`, tag `bNN-done`, and add an entry to `docs/BUILD_LOG.md`: what was built, tests added, run times, deviations and open items. The merge goes through a pull request on the private GitHub repo: push the branch and open the PR, merge locally with `--no-ff` so the merge hook runs the full gate, then push `main` and the tag. GitHub records the PR as merged (v1.3).
 8. **Resuming:** every session starts from CLAUDE.md, BUILD_LOG.md and `git status`, then continues the open step. Nothing depends on chat memory.
 
 `quant-check --trace` prints a matrix of spec IDs against tests. A step can't merge while an ID it claims to cover has no test.
@@ -312,6 +312,7 @@ If r1 fails the gates at CP2, as spec §0 expects, the build continues as planne
 
 #### B9 · Risk engine and choke points (M)
 
+- **Order (v1.3):** B9 depends only on `core` and `store`, so it was built beside B4 and merged before B5–B8. You agreed on 2026-10-13. B8's sizing and B13's execution call into the engine as specified here.
 - **Builds:**
   - `RiskApprovedOrder`, `RiskApprovedCancel` and `RiskApprovedFlatten`, each guarded by a private token, with every issued id registered and spendable once;
   - `RiskEngine.check`, running ARCHITECTURE §8.1's seven checks in order, and the risk-reducing clamp;

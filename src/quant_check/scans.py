@@ -31,6 +31,7 @@ CONSTRUCTED_ONLY_IN = {
     "RiskApprovedOrder": "quant.risk.engine",
     "RiskApprovedCancel": "quant.risk.engine",
     "RiskApprovedFlatten": "quant.risk.engine",
+    "RiskApprovedStop": "quant.risk.engine",
     "TrialTicket": "quant.research.ledger",
 }
 # Ways to get an instance without calling the class: object protocol and pydantic.

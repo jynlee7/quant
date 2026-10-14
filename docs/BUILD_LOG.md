@@ -2,6 +2,170 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B9 · Risk engine and choke points (done 2026-10-14, tag `b09-done`)
+
+B9 was built in three parts on `b09-risk`, beside B4, and merged before B5–B8 (you agreed on 2026-10-13; PLAN v1.3):
+
+- **B9a:** the approved types, `RiskEngine.check`, `risk.yaml` and the counters.
+- **B9b:** the broker port, reconciliation, the minute monitor, the C2 triggers and the kill executor.
+- **B9c:** your calls of 2026-10-14.
+
+Claude agents wrote the reds and the fixes. Codex wrote B9a's green, and a Claude agent wrote B9b's while Codex was at its limit.
+
+**Built**
+
+- **`core.orders`:** what B8's `decide()` emits and what the checks read: `OrderIntent`, `Side`, `Quote`, `OpenOrder`, `BrokerSnapshot`, `InternalBook` and `TradingMode`. They live in core because K1 lets `risk` import only `core` and `store`. The labels are B4's `core.regime.Label`.
+- **The four approved types** (K5, I4): `RiskApprovedOrder`, `RiskApprovedCancel`, `RiskApprovedFlatten` and, from B9c, `RiskApprovedStop`.
+  - Each is built only in `risk.engine` with its private token, registered when issued, and spendable once through the `SpentApprovals` hook.
+  - Ids are `"{O|C|F|P|S}{n}-{µs}"`, and the counter is saved in the risk state.
+  - The intent's canonical hash is taken at issue and checked at spend.
+  - The K5 scan lists all four, and a planted copy of each is caught.
+- **`RiskEngine.check`:** an INTENT precondition, then ARCHITECTURE §8.1's seven checks in order. The first failing check decides.
+  - **The precondition:** the engine looks τ up in the schedule, enforces the bar window, and needs a started session.
+  - **The price:** the caller proposes the limit price and check 6 bounds it. Exposure is valued at that price.
+  - **Reservations:** an approval is outstanding until it is spent, released, revoked or expired. Outstanding BUYs count in the gross, label and overnight caps, and outstanding SELLs and stops reserve their shares. A spent order or flatten counts as in flight until a snapshot taken after the spend can show it.
+  - **Revocation:** halts, a drift freeze, rule 6 and the daily-loss lock revoke BUYs. A snapshot short of the reserved shares revokes SELLs, a spent flatten revokes every order, and a SELL that takes a working or in-flight stop's shares revokes the stop approvals.
+  - **Exact limits:** `mark`, the caps, the single-order cap and the collar compare decimal values, so the exact 2%, 10%, a cap or 10 bp lands on the inclusive side.
+  - **PendingApproval (D7):** raised only when live above $25,000, and re-checked against everything outstanding.
+- **C3's counters:** every intent checked after the session starts counts, vetoed or not. The 21st halts, and is vetoed only if it is a BUY. The 60th submission is sent, BUY or SELL, and then trading halts.
+  - Every halt is signalled: `RiskApprovedOrder.halts`, `Veto.halts`, and `SubmissionLimitError` for a BUY past the limit.
+  - A later halt keeps the first halt's reason.
+- **Saving:** `RiskEngine(on_change=...)` gets every new RiskState before the call returns.
+  - BUYs need a successful save.
+  - Cancels, flattens, stops and SELLs still go out when a save or a spent-id write fails, kept as `RiskEngine.unsaved` and retried on the next call (your call 3).
+  - Exception: while a halt is held only in memory, a SELL needs its save too, so a restart never finds more sent than it counted.
+- **`resume(equity)`:** clears the halt and `killed`, and re-bases peak equity to the equity at the resume (your call of 2026-10-13). It keeps the counts and the daily-loss lock, refuses when nothing is halted, and returns `ResumeOutcome` for B14 to log.
+- **`risk.limits`:** loads `config/risk.yaml`, refuses a file whose bytes differ from the committed version, and freezes the result. It holds SPEC §10's limits, plus the kill settings below.
+- **`risk.broker.BrokerPort`:** `snapshot`, `quote`, `submit`, `cancel`, `flatten` and `place_stop`. Each changing call spends its approval before it sends. The port lives in `risk`, because K1 forbids `risk → execution`; B13's Alpaca adapter implements it in `execution` by shape.
+- **`risk.reconcile`:** compares broker positions and orders with the engine's book: SHORT, POSITION, MISSING_AT_BROKER, UNKNOWN_TO_ENGINE, ORDER_DIFFERS or FOREIGN, else STALE or MATCH. Check 2 calls it and halts exactly on MISMATCH.
+- **`risk.monitor.MinuteMonitor` (C8):** marks daily loss and drawdown each minute, on a fresh price and a fresh snapshot only, summing equity in decimals.
+  - A non-finite cash or a bad price is a `data_fault`, with no mark and no kill. An equity ≤ 0 fires DRAWDOWN.
+  - STOP_MISSING fires after 5 minutes without a broker-side stop. A working exit for the whole position counts as cover for at most 5 minutes in total, with no gap between exits extending it (your call 4).
+- **`risk.triggers` (C2):** a lost heartbeat, a crash loop, a rule-6 flatten incomplete after 10 minutes, and 5 order errors in 10 minutes. A single late bar fires nothing, and starts or errors stamped after now aren't counted.
+- **`risk.kill.KillExecutor`:** in regular hours it takes the lock, halts, writes the halt to control.db, revokes every order approval, cancels every open order, then flattens through fresh `RiskApprovedFlatten`s.
+  - **The exit:** the collar widens 10 bp every 30 s, up to 100 bp, until the account is flat or the 300 s deadline or the close.
+  - **Before an INCOMPLETE end:** it gets one 30 s grace to let its cancels land, then places a `RiskApprovedStop` 100 bp under the bid for the shares no working sell covers (`free_for_stop`).
+  - **Outside regular hours:** it keeps the existing stop, queues the exit for `next_open`, and places a stop under any shares no stop covers (your call 2).
+  - **Failures:** any exception in a step is recorded and the run goes on. The report and the alert are always attempted, and a failed save is reported once per run.
+  - **The lock:** `FileKillLock` (flock, thread-aware) or `MemoryKillLock`. A lock that can't be taken is recorded and the kill runs unlocked; a second copy's exit is refused while the first's reserves the shares.
+
+**New `risk.yaml` values the docs don't fix** (approved with the kill settings on 2026-10-14):
+
+| Setting | Value |
+|---|---|
+| `kill.widen_bp` / `max_collar_bp` | 10 / 100 |
+| `poll_s` / `deadline_s` | 1 / 300 |
+| `heartbeat_lost_s` | 300 |
+| `crash_loop_starts` | 3 in 600 s |
+| `monitor_price_max_age_s` | 120 |
+| `kill.stop_distance_bp` | 100 |
+
+From the docs: `requote_s` 30, 5 order errors in 600 s, `flatten_incomplete_s` 600 and `stop_missing_s` 300.
+
+**Tests:** 317 new, for 869 fast and 877 in all. Highlights:
+
+- K5 and I4: runtime forgeries (a stolen token, a copy, a subclass, a reused, expired or revoked id) are refused for all four types. The static scan catches a planted copy.
+- Each check vetoes at its boundary and passes just inside it.
+- The counters halt at 21 and 60, every halt is signalled, and a resume re-bases the peak.
+- Reconciliation flags every kind of mismatch, and check 2 agrees with it.
+- The monitor and triggers fire at their exact thresholds, a single late bar fires nothing, and a gap between exits doesn't extend the 5 minutes.
+- The kill executor halts, cancels, flattens, verifies and alerts in order. It widens the collar, and outside hours it keeps the stop and queues the exit (evening, pre-open, weekend across DST, half day). It closes only the remainder after a partial fill, survives broker, store, alert and save failures, and leaves a stop under shares it couldn't sell.
+- **Three hypothesis properties:**
+  - no sequence of intents and fills goes short or breaches a cap;
+  - no kill goes short or sells at above the bid, with partial fills, a stop that fired first, and evening kills;
+  - no stop approval or SELL lets the position go short.
+
+  Throwaway mutants (never cancelling, an exit priced at the ask, a broker that oversells by one share, a no-op revoke) each fail them.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| Fast gate | about 63 s (869 tests in 62 s) |
+| Full gate on the branch before the merge | 45.5 s (678 tests) |
+| Kill property test | about 0.7 s |
+
+**Review:** six rounds, each with the code-review skill and, where it was available, Codex, run in parallel. Each candidate was probed, then fixed as a red test and a green commit.
+
+- **B9a, round 1** (20ced5d, 9a8db28): unreserved approvals, spends that didn't re-check, intent tampering, and inexact limit edges.
+- **B9a, round 2** (665cbee, e85faef):
+  - R6: intents vetoed before check 5 weren't counted;
+  - C6: silent halts;
+  - C7: unsaved state;
+  - C8: no resume;
+  - C9: 59 BUYs, not 60;
+  - C10: a later halt overwrote the first reason;
+  - C11: an unbounded re-price;
+  - lists that only grew.
+- **Your calls of 2026-10-13** (12915fa, 806c5c2): discretionary exits keep the ±10 bp collar and only kill exits widen; a resume re-bases the peak.
+- **B9b** (b744497, c3ac1a2):
+  - R1: no revoke after a kill;
+  - R2/C1/C2: one failed step ended the kill;
+  - R3: the queued exit's time;
+  - R4: an exit after the deadline;
+  - R5: inexact equity;
+  - R6: future events counted;
+  - R7/C6: a property that couldn't see shorts;
+  - C4: data faults;
+  - C7 and C8: locks;
+  - C9: the first reason in control.db;
+  - C10: stops cancelled outside hours.
+- **B9c's own fixes** (25793e4, 7bb5475): the full tier's stop property found two ways to go short, a SELL taking a working or in-flight stop's shares.
+- **B9c review** (10d3743, 89e882d):
+  - R1/C4: a stop sized on a snapshot from before a flatten;
+  - R2/C1: a pending-cancel exit counted as cover at the deadline;
+  - C2: no stop on an outside-hours kill;
+  - C3/C9: protect asked for more than was free;
+  - R3: the spent store's failures blocked the bypass;
+  - R4/C5: a halt lost through an unsaved SELL;
+  - R5: the stop-missing clock;
+  - C6: stop approvals couldn't be released;
+  - C7: unreported save failures;
+  - C10: one revoke helper.
+
+Not fixed, with reasons:
+
+- **`RiskContext` stays a dataclass, not a StrictModel.** A StrictModel would turn a bad context from a recorded Veto into an exception in the caller.
+- **`committed_bytes` keeps its own git-variable scrub.** `quant` doesn't import the gate tooling, and its scrub is a superset of `scrubbed_env`.
+- **B9c review C8 is not a defect.** A stop re-placed after a SELL also goes through `approve_stop`, which counts the stops already approved. In the reviewer's case it grants 40, not 60, so no share is covered twice. A guard test keeps this, and it relies on B13 placing every stop through `approve_stop`.
+
+The B9c review's fixes weren't reviewed again. Each has its test, and the full gate passes.
+
+**Deviations** (documents updated in this merge)
+
+- **SPEC v1.5, §10:**
+  - a resume re-bases peak equity (2026-10-13);
+  - a kill that can't finish leaves a stop under the unsold shares;
+  - an outside-hours kill places one under shares no stop covers;
+  - a working exit for the whole position stands in for the stop for at most 5 minutes (2026-10-14).
+- **ARCHITECTURE v1.7:**
+  - §3: the broker port is in `risk/`;
+  - §3 and §4.4: K5 names four types;
+  - §8.1: the precondition, reservations, counting, halts, saving and resume;
+  - §8.2: the discretionary collar;
+  - §8.3: the kill executor, the kill settings and how the stop is sized;
+  - §16: the stop-missing row.
+- **PLAN v1.3:** B9 merges before B5–B8, and every step merges through a pull request (§2 rule 7, your request of 2026-10-14).
+- **CLAUDE.md:** the K5 line names `RiskApprovedStop`. Rule 7 says how a step merges through a PR, and the doc versions are SPEC v1.6, ARCHITECTURE v1.8 and PLAN v1.3.
+- **The judgment calls of B9a and B9b** are recorded in ARCHITECTURE §8.1 and §8.3 (the price check, the INTENT precondition, inclusive thresholds, marketable rounding of kill exits, a BUSY lock, health kills only with a position). None changes an approved decision.
+
+**Open items**
+
+- **B13:**
+  - give `SpentApprovals` an ops.db table, written in one transaction with the submission count, or rebuild the count from it, since SELLs sent unsaved before any halt lose their counts in a crash;
+  - call `release` on any approval it drops, and spend the old approval before re-checking a re-quote;
+  - handle `SubmissionLimitError` apart from forgeries;
+  - place every protective stop through `approve_stop` and `place_stop`.
+- **B14:**
+  - persist the RiskState through `on_change` with EngineState, and alert when `halted` turns on and on `unsaved`, which now also means spent ids not written ("risk state or spent ids not saved");
+  - run a queued exit whose time has passed at once, and run `execute` again after INCOMPLETE;
+  - wire the monitor's flatten, replace_stop and kill outputs, and treat `data_fault` as unhealthy (rule 6);
+  - don't act on `replace_stop` while a kill runs;
+  - `quant resume` does a typed confirmation and a clean reconciliation, then calls `resume` and logs the `ResumeOutcome`.
+- **B5 and after:** T-NL1 through the risk verdicts.
+- **B8:** emit `core.orders.OrderIntent` as the engine reads it (whole shares, a stop below the limit on every BUY, never `reduce_only` on a BUY).
+- **Kill timing:** a kill can run up to `deadline_s` + 30 s, because the grace reuses `requote_s`. On the QUEUED path, `protect()` can wait until the deadline while another approval reserves the bare shares.
+
 ## B4 · HMM: train, select, filter, label (done 2026-10-14, tag `b04-done`)
 
 B4 was built in two halves on `b04-hmm`, in the worktree beside B9: B4a (the artifact, the filter, labels and the smoother) and B4b (training, selection and the sanity rejects). Claude agents wrote the reds and the review fixes, Codex wrote B4a's green, and B4b's green is Codex's work committed by the orchestrator after Codex hit its usage limit.
@@ -122,7 +286,7 @@ B4b's fixes weren't reviewed again. Each has its test, and the full gate passes.
 
 **Open items**
 
-- **B9's merge** adopts `core.regime.Label` in place of its own `core.orders.Label`, and takes SPEC v1.5 and ARCHITECTURE v1.7 as reserved.
+- **B9's merge** adopts `core.regime.Label` in place of its own `core.orders.Label`, and takes SPEC v1.5 and ARCHITECTURE v1.7 as reserved. (Done in B9's merge.)
 - **B5:** T-NL1 covers B3's features and scaler, and B4's filter (CLAUDE.md rule 4).
 - **B7:** live drift computes rolling means as training does (full windows, each mean an fsum). ARCHITECTURE §7.1's "one restart starts from the previous model" is B7's.
 - **Cost:** a refit now runs 2 × 50 restarts, and one full selection takes about 9 minutes.

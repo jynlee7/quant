@@ -78,6 +78,21 @@ def test_k5_catches(source: str) -> None:
     assert [line for line, _ in scans.k5_violations(source, "quant.decide.x")] == [2]
 
 
+K5_STOPS = {
+    "direct": "from quant.risk.engine import RiskApprovedStop\nRiskApprovedStop(quantity=1)\n",
+    "module alias": "import quant.risk.engine as e\ne.RiskApprovedStop()\n",
+    "__new__": "from quant.risk.engine import RiskApprovedStop\nobject.__new__(RiskApprovedStop)\n",
+}
+
+
+@pytest.mark.spec("K5", "I4")
+@pytest.mark.parametrize("source", K5_STOPS.values(), ids=K5_STOPS.keys())
+def test_k5_catches_a_stop_approval_built_outside_the_engine(source: str) -> None:
+    # B9c: RiskApprovedStop is the fourth approved type (your call of 2026-10-14).
+    assert [line for line, _ in scans.k5_violations(source, "quant.execution.x")] == [2]
+    assert scans.k5_violations(source, "quant.risk.engine") == []
+
+
 @pytest.mark.spec("K5", "I4")
 @pytest.mark.parametrize("source", K5_ALLOWED.values(), ids=K5_ALLOWED.keys())
 def test_k5_allows(source: str) -> None:

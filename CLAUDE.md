@@ -1,6 +1,6 @@
 # CLAUDE.md: SPY Regime Trader
 
-This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.6, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.8 and [docs/PLAN.md](docs/PLAN.md) v1.2. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
+This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.6, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.8 and [docs/PLAN.md](docs/PLAN.md) v1.3. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
 
 ## Start every session here
 
@@ -30,7 +30,7 @@ Hooks and services call `.venv/bin/...` directly, never `uv run`, because uv liv
 4. A step that touches the decision path adds its layer to the T-NL1 truncation harness before it is done.
 5. **Review:** an independent code review of the step's diff (the code-review skill), checked against the step's ids. Fix every finding, or write it down in BUILD_LOG.md with a reason.
 6. **No silent deviations:** if code must differ from SPEC, ARCHITECTURE or PLAN, change the doc in the same merge, with a minor version and a BUILD_LOG note. Changing an approved decision needs the user first.
-7. **Done:** `git merge --no-ff` to `main`, tag `bNN-done`, and add a BUILD_LOG.md entry: built, tests, run times, deviations, open items.
+7. **Done:** push the branch and open a PR to `main` on `origin` (private, github.com/jynlee7/quant), `git merge --no-ff` locally (the hook runs the full gate), push `main` (GitHub marks the PR merged), tag `bNN-done` and push the tag, and add a BUILD_LOG.md entry: built, tests, run times, deviations, open items.
 
 ## When to stop for the user (P6)
 
@@ -48,7 +48,7 @@ If a step is blocked on them, continue with the steps that aren't, and come back
 - Any secret read from a file (`.env`, `.env.test`) goes through `quant.core.logs.register_secret` before anything can log, so the redactor knows it (I6).
 - Log with `structlog.get_logger()`. Timestamps come from the Clock passed to `configure_logging`, so backtests and replays log simulated time.
 - Only `quant.hmm.train` imports hmmlearn, and it calls only `fit`. `predict`, `predict_proba`, `decode` and `score_samples` never appear outside `eval/` (I2).
-- `RiskApprovedOrder`, `RiskApprovedCancel` and `RiskApprovedFlatten` are built only in `quant.risk.engine`, and `TrialTicket` only in `quant.research.ledger` (K5).
+- `RiskApprovedOrder`, `RiskApprovedCancel`, `RiskApprovedFlatten` and `RiskApprovedStop` are built only in `quant.risk.engine`, and `TrialTicket` only in `quant.research.ledger` (K5).
 - The import rules (K1–K4, P11) live in `.importlinter`. A new subpackage must be placed in K1, K2 and K4, or quant-check fails.
 - Every test names the ids it enforces, for example `@pytest.mark.spec("A1")`. Ids are the first cells of table rows in the three docs (A1, K5, C11), or numbered sections for requirements written as prose (`SPEC§2`, `ARCH§4.3`, `PLAN§5`).
 - The fast tier is offline and must stay under 2 minutes. Mark slow tests `full` and tests that need the Alpaca test account `integration`.

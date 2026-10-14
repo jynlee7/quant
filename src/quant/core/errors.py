@@ -54,3 +54,27 @@ class TicketError(PolicyError):
 class LedgerError(QuantError):
     """The trial ledger can't do what was asked: a broken chain, a run settled twice, a hash
     that isn't SHA-256 hex, or no ledger at the path given (A2)."""
+
+
+class RiskError(QuantError):
+    """The risk engine was misused: a session started out of order, an equity mark that isn't
+    finite and positive, or state that can't be restored (spec §10)."""
+
+
+class ApprovalError(RiskError):
+    """An approval the risk engine won't honour: not exactly one of its approved types, built
+    without its token, never issued by this engine (copies, other engines' approvals), changed
+    since it was issued, expired, already spent, or risk-increasing while trading is halted (I4,
+    K5, ARCHITECTURE §4.4)."""
+
+
+class SubmissionLimitError(ApprovalError):
+    """A genuine BUY approval refused at spend because the session has already reached C3's raw
+    submission limit (spec §10). Unlike the other ApprovalErrors it says nothing is wrong with
+    the approval itself; the refusal halts trading."""
+
+
+class BrokerError(QuantError):
+    """The broker failed or refused a request: a network error, an HTTP error, a timeout or a
+    rejected order (ARCHITECTURE §16). The broker port (quant.risk.broker) raises it; the kill
+    executor counts it and retries until its deadline."""

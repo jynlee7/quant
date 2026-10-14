@@ -1,1 +1,1623 @@
-"""RiskEngine.check and the approved-order types; the only place they are constructed (K5). Built in B9."""
+"""RiskEngine.check and the approved types; the only place an approval is built (K5, I4).
+
+ARCHITECTURE §4.4 and §8.1, spec §10. Every order, cancel, kill-switch close and protective
+stop reaches the broker only as a RiskApprovedOrder, RiskApprovedCancel, RiskApprovedFlatten or
+RiskApprovedStop (the fourth, your call of 2026-10-14). Each constructor demands this module's private token, so only the engine can build one. The engine registers every
+approval it issues and `spend` honours each exactly once: the broker adapter (B13) calls it right
+before it sends anything, and persists spent ids through a SpentApprovals store so a restart
+can't reuse one.
+
+`check` runs ARCHITECTURE §8.1's seven checks in order, cheapest first, after a precondition on
+the intent itself (RiskCheck.INTENT):
+
+1. HALTED: only risk-reducing intents pass.
+2. RECONCILIATION: a fresh broker snapshot must match the engine's book (quant.risk.reconcile);
+   a mismatch halts.
+3. LIMITS: long or flat only, gross exposure, the label cap, the single-order cap, and the
+   overnight cap on the last decision that can fill (A3).
+4. LOCKS: the daily-loss lock, a drift freeze and rule 6 veto entries.
+5. RATE: more than `max_intents_per_day` intents in a session halts trading (C3). Every
+   intent counts, vetoed or not, and the one past the limit halts whichever check decides it.
+6. PRICE: the limit sits inside the collar of a fresh quote, and every entry carries a stop.
+7. APPROVAL (D7): a live BUY above the notional threshold waits for you; paper flags it.
+
+In a long-or-flat system a SELL is exactly a risk-reducing intent. It skips the caps in 3, the
+locks in 4 and the approval in 7, and is clamped so it can never take the position short.
+
+An approved order is still risk until it is sent, so the engine keeps every one it issued as
+outstanding until it is spent, released, revoked or expired. Outstanding BUYs count as held in
+check 3's caps, and outstanding SELLs reserve their shares, so approvals issued together can
+never add up to a breach or a short. A spent order counts the same way until a broker snapshot
+taken after the spend can show it. The engine revokes outstanding approvals when what it learns
+makes them unsafe: a re-check of the same decision and leg replaces the earlier approval, a
+block on entries (HALTED, the daily-loss lock, a drift freeze, rule 6) revokes the BUYs, a
+snapshot holding fewer shares than the SELLs reserve revokes the SELLs, and a spent flatten
+revokes everything. `spend` refuses a revoked approval. A stop approval reserves its shares as
+an outstanding SELL does, and is revoked with the SELLs (B9c).
+
+Monetary limits are compared on the decimal values of the floats (`Decimal(repr(x))`), so an
+inclusive boundary such as exactly 2%, 10%, a cap or 10 bp holds however the float arithmetic
+would round.
+
+The engine also keeps C3's counters, the daily-loss lock and the drawdown trigger (`mark`, fed
+by the minute monitor, C8). Its state is a RiskState the live engine persists with EngineState;
+every change reaches the engine's `on_change` before the call that made it returns, so B14 can
+persist it first. A risk-reducing approval goes out even when that save fails; a BUY never does,
+nor a SELL while a halt waits for its save (RiskEngine, "Persisting"). Every halt is signalled
+where it happens: `Veto.halts`, `RiskApprovedOrder.halts`, `MarkOutcome.kill`,
+SubmissionLimitError, and the published state.
+A halt keeps its first reason, and only `resume` (B14's `quant resume`) clears it.
+The kill executor (quant.risk.kill), reconciliation (quant.risk.reconcile), the minute monitor
+(quant.risk.monitor), the kill triggers (quant.risk.triggers) and the broker port
+(quant.risk.broker) are B9b's. "Now" comes from the engine's Clock. Every veto and halt is
+logged with structlog.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from enum import StrEnum
+from math import isfinite
+from typing import Any, Final, Protocol, cast, final
+
+import structlog
+from pydantic import Field
+
+from quant.core.calendar import NEW_YORK, TradingCalendar
+from quant.core.canonical import sha256_hex
+from quant.core.clock import Clock
+from quant.core.epoch import to_us
+from quant.core.errors import (
+    ApprovalError,
+    CalendarError,
+    QuantError,
+    RiskError,
+    SubmissionLimitError,
+)
+from quant.core.model import StrictModel
+from quant.core.orders import (
+    SYMBOL,
+    BrokerSnapshot,
+    InternalBook,
+    OrderIntent,
+    OrderKind,
+    Quote,
+    Side,
+    TradingMode,
+)
+from quant.core.schedule import Timing, decision_schedule
+from quant.risk.limits import RiskConfig
+from quant.risk.reconcile import ReconcileStatus, reconcile
+
+log = structlog.get_logger()
+
+_TOKEN: Final = object()
+"""The private token every approved type's constructor demands. It never leaves this module."""
+
+INTENT_LIMIT: Final = "daily intent limit exceeded"
+SUBMISSION_LIMIT: Final = "raw submission limit reached"
+DRAWDOWN: Final = "maximum drawdown reached"
+"""The halt reasons the engine's own counters and trigger give (`RiskState.halt_reason`)."""
+
+
+class RiskCheck(StrEnum):
+    """Where a verdict was decided, in the order `check` runs them."""
+
+    INTENT = "intent"  # the precondition: a scheduled decision, inside its window, this session
+    HALTED = "halted"  # 1
+    RECONCILIATION = "reconciliation"  # 2
+    LIMITS = "limits"  # 3
+    LOCKS = "locks"  # 4
+    RATE = "rate"  # 5
+    PRICE = "price"  # 6
+    APPROVAL = "approval"  # 7
+
+
+CHECK_ORDER: Final = tuple(RiskCheck)
+
+
+# --- the approved types (K5, I4) ------------------------------------------------------------------
+
+
+class _Approved:
+    """What the four approved types share. Each instance is immutable: setting or deleting an
+    attribute raises AttributeError, and `copy.copy` and `copy.deepcopy` raise TypeError (so does
+    pickling, which the project never does). Equality and hashing are by identity. A repr never
+    shows the token.
+
+    - `approval_id`: unique among the approvals one engine issues (see `RiskEngine`);
+    - `issued_at`: the engine's clock when it issued the approval.
+    """
+
+    __slots__ = ("_token", "approval_id", "issued_at")
+
+    approval_id: str
+    issued_at: datetime
+    _token: object
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("approvals are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("approvals are immutable")
+
+    def __copy__(self) -> _Approved:
+        raise TypeError("approvals cannot be copied")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _Approved:
+        raise TypeError("approvals cannot be copied")
+
+    def __reduce_ex__(self, protocol: object) -> tuple[object, ...]:
+        raise TypeError("approvals cannot be pickled")
+
+
+@final
+class RiskApprovedOrder(_Approved):
+    """An order the risk engine approved: the only order the broker adapter sends (I4).
+
+    The constructor raises ApprovalError unless `token` is this module's private token.
+
+    - `intent`: the intent as checked;
+    - `quantity`: shares to send: the intent's, or for a SELL clamped to what may be sold;
+    - `limit_price`: the collared limit that check 6 accepted;
+    - `notional`: `quantity * limit_price`, dollars;
+    - `expires_at`: the end of the bar in which the decision executes; `spend` refuses it from
+      then on;
+    - `flagged`: a BUY above D7's threshold, approved because the engine trades paper, or one
+      you approved (`approve_pending`). The engine alerts on it;
+    - `halts`: this check halted trading (a risk-reducing intent past C3's intent limit). The
+      caller persists HALTED and alerts, as for a Veto with `halts`.
+    """
+
+    __slots__ = ("expires_at", "flagged", "halts", "intent", "limit_price", "notional", "quantity")
+
+    intent: OrderIntent
+    quantity: int
+    limit_price: float
+    notional: float
+    expires_at: datetime
+    flagged: bool
+    halts: bool
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        approval_id: str,
+        intent: OrderIntent,
+        quantity: int,
+        limit_price: float,
+        notional: float,
+        issued_at: datetime,
+        expires_at: datetime,
+        flagged: bool,
+        halts: bool,
+    ) -> None:
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "intent": intent,
+                "quantity": quantity,
+                "limit_price": limit_price,
+                "notional": notional,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+                "flagged": flagged,
+                "halts": halts,
+            },
+        )
+
+    def __repr__(self) -> str:
+        """`RiskApprovedOrder(<approval_id>, <side> <quantity> @ <limit_price>, until <expires_at>)`."""
+        return (
+            f"RiskApprovedOrder({self.approval_id}, {self.intent.side} {self.quantity} "
+            f"@ {self.limit_price}, until {self.expires_at})"
+        )
+
+
+@final
+class RiskApprovedCancel(_Approved):
+    """Leave to cancel one working order. Cancels only reduce risk, so the engine always issues
+    them, halted or not. They don't expire; each is spendable once.
+
+    The constructor raises ApprovalError unless `token` is this module's private token.
+    """
+
+    __slots__ = ("client_order_id", "reason")
+
+    client_order_id: str
+    reason: str
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        approval_id: str,
+        client_order_id: str,
+        reason: str,
+        issued_at: datetime,
+    ) -> None:
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "client_order_id": client_order_id,
+                "reason": reason,
+                "issued_at": issued_at,
+            },
+        )
+
+    def __repr__(self) -> str:
+        """`RiskApprovedCancel(<approval_id>, <client_order_id>)`."""
+        return f"RiskApprovedCancel({self.approval_id}, {self.client_order_id})"
+
+
+@final
+class RiskApprovedFlatten(_Approved):
+    """Leave for the kill switch to close the whole position in `symbol` (ARCHITECTURE §8.3).
+    It only reduces risk, so the engine always issues it, halted or not. It doesn't expire; it is
+    spendable once.
+
+    The constructor raises ApprovalError unless `token` is this module's private token.
+    """
+
+    __slots__ = ("reason", "symbol")
+
+    symbol: str
+    reason: str
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        approval_id: str,
+        symbol: str,
+        reason: str,
+        issued_at: datetime,
+    ) -> None:
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "symbol": symbol,
+                "reason": reason,
+                "issued_at": issued_at,
+            },
+        )
+
+    def __repr__(self) -> str:
+        """`RiskApprovedFlatten(<approval_id>, <symbol>)`."""
+        return f"RiskApprovedFlatten({self.approval_id}, {self.symbol})"
+
+
+@final
+class RiskApprovedStop(_Approved):
+    """Leave to place one broker-side stop-market SELL of `quantity` shares of `symbol` at
+    `stop_price` (spec §10's protective stop; your call of 2026-10-14). It only reduces risk,
+    so the engine issues it halted or not, but only for shares no other SELL already covers, so
+    it can never take the position short, and only below the current bid.
+
+    - `quantity`: shares the stop sells when it triggers;
+    - `stop_price`: the trigger price, below the bid the engine was shown;
+    - `expires_at`: the snapshot behind it goes stale then (`snapshot_max_age_s` after it was
+      taken), and `spend` refuses it from then on;
+    - `reason`: why it was asked for, in plain words.
+
+    The constructor raises ApprovalError unless `token` is this module's private token.
+    """
+
+    __slots__ = ("expires_at", "quantity", "reason", "stop_price", "symbol")
+
+    symbol: str
+    quantity: int
+    stop_price: float
+    expires_at: datetime
+    reason: str
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        approval_id: str,
+        symbol: str,
+        quantity: int,
+        stop_price: float,
+        reason: str,
+        issued_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "symbol": symbol,
+                "quantity": quantity,
+                "stop_price": stop_price,
+                "reason": reason,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+            },
+        )
+
+    def __repr__(self) -> str:
+        """`RiskApprovedStop(<approval_id>, SELL <quantity> stop <stop_price>, until <expires_at>)`."""
+        return (
+            f"RiskApprovedStop({self.approval_id}, SELL {self.quantity} stop {self.stop_price}, "
+            f"until {self.expires_at})"
+        )
+
+
+Approval = RiskApprovedOrder | RiskApprovedCancel | RiskApprovedFlatten | RiskApprovedStop
+
+
+# --- verdicts and context -------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, eq=False)
+class PendingApproval:
+    """A live BUY above D7's threshold, waiting for you (ARCHITECTURE §8.4: CLI or dashboard).
+    It is not an approval: the adapter refuses it. `RiskEngine.approve_pending` turns it into
+    one, once, before `expires_at` (the end of the bar). Equality is by identity.
+
+    `quantity`, `limit_price` and `notional` are as check 7 saw them; `pending_id` is unique
+    among the ids the engine issues.
+    """
+
+    pending_id: str
+    intent: OrderIntent
+    quantity: int
+    limit_price: float
+    notional: float
+    issued_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class Veto:
+    """An intent the engine refused. `check` names the first check that failed and `reason`
+    says why in plain words. `halts` is True when this verdict halted trading (a reconciliation
+    mismatch, a short position, or the intent past C3's limit, whichever check refused it); the
+    caller then persists HALTED and alerts."""
+
+    intent: OrderIntent
+    check: RiskCheck
+    reason: str
+    halts: bool = False
+
+
+RiskVerdict = RiskApprovedOrder | PendingApproval | Veto
+
+
+@dataclass(frozen=True)
+class RiskContext:
+    """What one check reads besides the intent (ARCHITECTURE §4.2 step 11: pure, given a fresh
+    broker snapshot).
+
+    - `broker`: the broker's answer, no older than `snapshot_max_age_s`;
+    - `book`: what the engine believes it holds;
+    - `quote`: the freshest quote, no older than `quote_max_age_s`;
+    - `limit_price`: the limit execution would send (ARCHITECTURE §8.2: ask + 10 bp to buy,
+      bid - 10 bp to sell); also the price every exposure is valued at;
+    - `healthy`: False while rule 6 holds (spec §8);
+    - `drift_frozen`: entries frozen after a failed drift check (C5);
+    - `halted`: the HALTED flag in control.db, as the engine last read it.
+    """
+
+    broker: BrokerSnapshot
+    book: InternalBook
+    quote: Quote
+    limit_price: float
+    healthy: bool = True
+    drift_frozen: bool = False
+    halted: bool = False
+
+
+class RiskState(StrictModel):
+    """The risk engine's state, persisted with EngineState (ARCHITECTURE §4.3) and restored by
+    passing it to RiskEngine.
+
+    - `session`: the session started last (`start_session`), or None before the first;
+    - `start_equity`: that session's start-of-day equity;
+    - `peak_equity`: the highest equity seen across sessions since the last resume, which
+      re-bases it to the equity it is given;
+    - `intents`: every intent checked this session, vetoed or not, as `"<decision_id>#<leg>"`
+      in the order first seen;
+    - `submissions`: raw broker submissions this session: RiskApprovedOrders spent;
+    - `daily_loss_locked`: entries locked until the next session (spec §10);
+    - `halted`, `halt_reason`: trading halted by this engine, and the first reason it halted
+      for (a later halt keeps it). Only `RiskEngine.resume` clears them;
+    - `killed`: the drawdown trigger has fired. Only `RiskEngine.resume` clears it;
+    - `issued`: approvals and pending approvals issued so far, which numbers the next id.
+    """
+
+    session: date | None = None
+    start_equity: float | None = Field(default=None, gt=0.0)
+    peak_equity: float | None = Field(default=None, gt=0.0)
+    intents: tuple[str, ...] = ()
+    submissions: int = Field(default=0, ge=0)
+    daily_loss_locked: bool = False
+    halted: bool = False
+    halt_reason: str | None = None
+    killed: bool = False
+    issued: int = Field(default=0, ge=0)
+
+
+@dataclass(frozen=True)
+class MarkOutcome:
+    """What one equity mark found (`RiskEngine.mark`).
+
+    - `day_loss`: `(start_equity - equity) / start_equity` (negative on a gain);
+    - `drawdown`: `(peak_equity - equity) / peak_equity`, after the mark raised the peak;
+    - `locked`: the daily-loss lock holds after this mark;
+    - `flatten`: this mark set the lock, so the monitor must flatten now;
+    - `kill`: this mark fired the drawdown trigger, so the kill switch must run now. It fires
+      once; the engine is halted from then on, until a resume.
+    """
+
+    equity: float
+    day_loss: float
+    drawdown: float
+    locked: bool
+    flatten: bool
+    kill: bool
+
+
+@dataclass(frozen=True)
+class ResumeOutcome:
+    """What one resume did (`RiskEngine.resume`), so B14 can log and alert the re-base.
+
+    - `equity`: the equity the resume was given;
+    - `old_peak`: the peak the drawdown was measured from before the resume;
+    - `new_peak`: the peak it is measured from now, which is `equity`.
+    """
+
+    equity: float
+    old_peak: float
+    new_peak: float
+
+
+class SpentApprovals(Protocol):
+    """Where spent approval ids are kept. The adapter (B13) uses one backed by ops.db, so a
+    restart can't spend an id twice (ARCHITECTURE §4.4)."""
+
+    def is_spent(self, approval_id: str) -> bool:
+        """True once `approval_id` has been spent."""
+        ...
+
+    def spend(self, approval_id: str, at: datetime) -> bool:
+        """Record `approval_id` as spent at `at`, durably, before returning. True if it was not
+        spent before; False, changing nothing, if it was."""
+        ...
+
+
+class MemorySpentApprovals:
+    """SpentApprovals in memory, for the backtest and tests."""
+
+    def __init__(self) -> None:
+        self._spent: dict[str, datetime] = {}
+
+    def is_spent(self, approval_id: str) -> bool:
+        return approval_id in self._spent
+
+    def spend(self, approval_id: str, at: datetime) -> bool:
+        if self.is_spent(approval_id):
+            return False
+        self._spent[approval_id] = at
+        return True
+
+
+# --- the engine -----------------------------------------------------------------------------------
+
+
+class RiskEngine:
+    """The single choke point (spec §10, I4).
+
+    Approval ids are `f"{prefix}{n}-{to_us(issued_at)}"` (quant.core.epoch.to_us), where the
+    prefix is O for an order, C a cancel, F a flatten, S a stop and P a pending approval, and n is
+    `state.issued` after counting this one. Ids are therefore deterministic in a replay, and
+    unique across restarts as long as the engine restarts from its persisted RiskState.
+
+    Outstanding approvals (see the module docstring) live in the engine object, not in
+    RiskState: a restarted engine never honours an earlier object's approvals, so it has none.
+    The engine lets go of an order or stop approval once it expires, of a pending approval once
+    it expires or is approved, and of a cancel or flatten once it is spent.
+
+    **Persisting (C7).** Every public method that changes RiskState calls `on_change` with the
+    new state once, before it returns or raises: `start_session`, `mark`, `resume`, `halt`,
+    `check`, `approve_pending`, `approve_cancel`, `approve_flatten`, `approve_stop` and `spend`.
+    The live engine (B14) persists the state there, so a crash after a call never restores a
+    state from before it; `spend` persists the submission before the adapter sends.
+
+    When `on_change` raises, the change stays in the engine's memory, the exception is kept as
+    `unsaved` and logged at error level (the kill executor puts it in its report, so its alert
+    carries it; B14 alerts on it otherwise), and every later call that publishes hands
+    `on_change` the latest state again, changed or not, until a save succeeds. A SpentApprovals
+    store that can't record a risk-reducing spend fails the same way: the id is kept in memory
+    and written again at every later call that publishes (B9c review, R3). Then:
+
+    - a call that issues or spends only risk-reducing approvals returns normally (your call of
+      2026-10-14): `approve_cancel`, `approve_flatten`, `approve_stop`, a `check` that approves
+      a SELL, and `spend` of a cancel, flatten, stop or SELL. Taking risk off must not wait on
+      a disk;
+    - except that while trading is halted in memory but the last state saved isn't (a halt
+      waiting for its save), a SELL order needs the save too: its `check` and its `spend`
+      raise. So the SELL that trips a halt (the 21st intent, the 60th submission) goes out
+      only once that halt is saved, and a restart from the last saved state can never have
+      sent more than it counts (B9c review, R4/C5). Cancels, flattens and stops still go out,
+      so the kill switch is never held up;
+    - every other call raises the exception: `check` with any other verdict (a BUY approval,
+      a PendingApproval or a Veto), `approve_pending`, `spend` of a BUY, `start_session`,
+      `mark`, `resume` and `halt`. So no BUY goes out on a state that wasn't saved.
+
+    When `check` or `approve_pending` raises, the approval it would have returned is revoked.
+
+    Ids stay unique across a restart from an older saved state, since each carries its
+    microsecond.
+    """
+
+    def __init__(
+        self,
+        config: RiskConfig,
+        *,
+        clock: Clock,
+        mode: TradingMode,
+        calendar: TradingCalendar | None = None,
+        timing: Timing | None = None,
+        spent: SpentApprovals | None = None,
+        state: RiskState | None = None,
+        on_change: Callable[[RiskState], None] | None = None,
+    ) -> None:
+        """An engine with `config`'s limits, trading in `mode`.
+
+        `calendar` defaults to `TradingCalendar.xnys()`, `timing` to `Timing()`, `spent` to a new
+        MemorySpentApprovals, and `state` to `RiskState()`. `on_change` receives every new state
+        (see the class docstring); None persists nothing. The engine starts with no approvals
+        issued: approvals from an earlier engine object are never honoured, even with the same
+        `spent` store and state."""
+        self._config = config
+        self._clock = clock
+        self._mode = mode
+        self._calendar = TradingCalendar.xnys() if calendar is None else calendar
+        self._timing = Timing() if timing is None else timing
+        self._spent = MemorySpentApprovals() if spent is None else spent
+        self._state = RiskState() if state is None else state
+        self._issued: dict[Approval, _Issued] = {}
+        self._pending: dict[PendingApproval, tuple[object, ...]] = {}
+        self._outstanding: dict[str, _Hold] = {}  # by "<decision_id>#<leg>"
+        self._in_flight: list[_InFlight] = []
+        self._revoked: dict[Approval, str] = {}
+        self._on_change = on_change
+        self._unsaved: Exception | None = None
+        self._unrecorded: dict[str, datetime] = {}  # spent here, not yet in the spent store
+        self._saved_halted = self._state.halted  # what the last saved state says
+
+    @property
+    def state(self) -> RiskState:
+        """The current state, as an immutable snapshot."""
+        return self._state
+
+    @property
+    def unsaved(self) -> Exception | None:
+        """The exception from the latest failed write, `on_change` or the SpentApprovals store,
+        while the state in memory or a spent id is newer than what was saved; None once every
+        write has caught up (class docstring, C7)."""
+        return self._unsaved
+
+    def start_session(self, day: date, *, equity: float) -> None:
+        """Begin session `day` with start-of-day equity `equity`: the peak becomes the larger of
+        the old peak and `equity`, the intent and submission counters go to zero, and the
+        daily-loss lock clears. HALTED and the drawdown trigger stay as they are.
+
+        RiskError unless `day` is a session of the calendar later than `state.session`, and
+        `equity` is finite and positive."""
+        _check_equity(equity)
+        try:
+            self._calendar.session(day)
+        except CalendarError as exc:
+            raise RiskError(str(exc)) from exc
+        if self.state.session is not None and day <= self.state.session:
+            raise RiskError("a new session must be later than the current session")
+        with self._publishing():
+            self._forget_expired(self._clock.now())
+            self._update(
+                session=day,
+                start_equity=float(equity),
+                peak_equity=max(self.state.peak_equity or equity, equity),
+                intents=(),
+                submissions=0,
+                daily_loss_locked=False,
+            )
+
+    def resume(self, *, equity: float) -> ResumeOutcome:
+        """Clear the engine's halt and the drawdown trigger, and re-base the peak (C8). Only
+        B14's `quant resume` calls it, after your typed confirmation and a clean reconciliation
+        (ARCHITECTURE §8.3); B14 logs and alerts the outcome.
+
+        `halted`, `halt_reason` and `killed` clear, and the peak becomes `equity`, higher or
+        lower than before (your call, 2026-10-13): after a drawdown kill the account is flat and
+        equity can't recover, so the next 10% drawdown is measured from where you resumed.
+        Nothing else changes: the session's intent and submission counts and the daily-loss lock
+        (until the next session) stay, so a counter already past its limit halts again at the
+        next new intent or submission. Approvals revoked by the halt stay revoked.
+
+        RiskError, changing nothing, when no session has started, `equity` isn't finite and
+        positive, or trading isn't halted (a resume with nothing to clear would only lower the
+        peak)."""
+        _check_equity(equity)
+        old_peak = self.state.peak_equity
+        if self.state.session is None or old_peak is None:
+            raise RiskError("a resume needs a started session")
+        if not self.state.halted:
+            raise RiskError("nothing to resume: trading isn't halted")
+        outcome = ResumeOutcome(float(equity), old_peak, float(equity))
+        with self._publishing():
+            self._update(peak_equity=outcome.new_peak, halted=False, halt_reason=None, killed=False)
+        log.warning(
+            "risk_resumed",
+            equity=outcome.equity,
+            old_peak=outcome.old_peak,
+            new_peak=outcome.new_peak,
+        )
+        return outcome
+
+    def halt(self, reason: str) -> bool:
+        """Halt trading for `reason`: the kill executor's first step (ARCHITECTURE §8.3), for
+        every trigger, manual or automatic (quant.risk.triggers.KillTrigger).
+
+        Sets `halted`; `halt_reason` becomes `reason` unless trading is already halted, when the
+        first reason stays (C10). Revokes every outstanding BUY approval, as any halt does, and
+        leaves SELLs, stops, cancels and flattens alone. `killed` (the drawdown trigger) is unchanged.
+        Works with or without a started session. The new state reaches `on_change` before
+        `halt` returns (C7), and the halt is logged like every other.
+
+        Returns True when this call halted trading, False when it was already halted (the state
+        is then unchanged and `on_change` isn't called). RiskError, changing nothing, when
+        `reason` is not a non-empty string."""
+        if not isinstance(reason, str) or not reason:
+            raise RiskError("a halt needs a reason")
+        if self.state.halted:
+            log.info(
+                "risk_halt_already_in_force", reason=reason, halt_reason=self.state.halt_reason
+            )
+            return False
+        with self._publishing():
+            self._halt(reason)
+        return True
+
+    def revoke_orders(self, reason: str) -> None:
+        """Revoke every outstanding order and stop approval, BUY and SELL, for `reason`: the
+        kill executor's step after `halt`, since its own exits replace every order (ARCHITECTURE
+        §8.3). A SELL or stop approved against shares the stop has since sold would otherwise
+        open a short. Cancels, flattens and pending approvals are left alone. RiskState doesn't change,
+        so `on_change` isn't called."""
+        self._revoke_where(lambda hold: True, reason)
+
+    def mark(self, equity: float) -> MarkOutcome:
+        """One equity mark from the minute monitor, on the freshest price (C8), or from a broker
+        snapshot. The peak rises to `equity` if it is higher.
+
+        - Daily loss: when `start_equity - equity >= daily_loss_fraction * start_equity`, the
+          daily-loss lock is set until the next session (exactly 2% locks), and the outstanding
+          BUY approvals are revoked.
+        - Drawdown: when `peak_equity - equity >= max_drawdown_fraction * peak_equity`, the
+          engine halts (`halt_reason` names the drawdown) and the trigger fires (exactly 10%
+          fires).
+
+        Both compare decimal values (module docstring), so exactly 2% or 10% of any equity in
+        cents locks or fires.
+
+        RiskError when no session has started, or `equity` isn't finite and positive."""
+        _check_equity(equity)
+        start = self.state.start_equity
+        if self.state.session is None or start is None:
+            raise RiskError("an equity mark needs a started session")
+        peak = max(self.state.peak_equity or equity, equity)
+        daily_breach = _fell_by(start, equity, self._config.daily_loss_fraction)
+        drawdown_breach = _fell_by(peak, equity, self._config.max_drawdown_fraction)
+        flatten = daily_breach and not self.state.daily_loss_locked
+        kill = drawdown_breach and not self.state.killed
+        with self._publishing():
+            self._update(
+                peak_equity=float(peak),
+                daily_loss_locked=self.state.daily_loss_locked or daily_breach,
+                killed=self.state.killed or kill,
+            )
+            if flatten:
+                log.warning("risk_daily_loss_lock", equity=equity, start_equity=start)
+                self._revoke_where(_buys, "the daily-loss lock set")
+            if kill:
+                self._halt(DRAWDOWN)
+        return MarkOutcome(
+            float(equity),
+            (start - equity) / start,
+            (peak - equity) / peak,
+            self.state.daily_loss_locked,
+            flatten,
+            kill,
+        )
+
+    def check(self, intent: OrderIntent, context: RiskContext) -> RiskVerdict:
+        """The verdict on `intent`: RiskApprovedOrder, Veto or PendingApproval. The first check
+        that fails decides; nothing after it runs. "now" is the engine's clock. Exposure is
+        always `shares * context.limit_price / context.broker.equity`.
+
+        **Intent** (RiskCheck.INTENT). `intent.tau` must be the tau of a decision in
+        `decision_schedule(calendar, <tau's New York date>, timing)`; call it `d`. Its window
+        runs from `d.executes_at` to `expires_at`, the `t_close` of the bar of `d.executes_at`'s
+        session with `t_open <= d.executes_at < t_close`. So an intent at 10:46 ET expires at
+        11:30, one at the last fillable decision at the close, and a closing-bar intent at the
+        end of the next session's first bar. Vetoed unless `d.executes_at <= now < expires_at`
+        (an intent is never sent late, ARCHITECTURE §8.2) and `state.session` is the session of
+        `d.executes_at`.
+
+        Before the precondition, outstanding approvals that have expired are dropped, a
+        re-check revokes the earlier approval of the same `"<decision_id>#<leg>"` whatever its
+        verdict, and a context with `halted`, `drift_frozen` or not `healthy` revokes every
+        outstanding BUY. Then, once a session has started, the intent's key is counted toward
+        C3's limit the first time the engine sees it, whatever the verdict turns out to be;
+        re-checks of a counted key (re-quotes) don't count again. The key that makes
+        `len(state.intents)` exceed `max_intents_per_day` while the engine isn't halted is
+        *over the limit*: its verdict halts trading, whichever check decides it. A Veto then has
+        `halts=True` (the first check that fails still names it), and check 5 below decides
+        only when nothing before it fails.
+
+        1. **HALTED.** When `state.halted` or `context.halted`, a BUY is vetoed.
+        2. **Reconciliation.** Vetoed when the snapshot is older than `snapshot_max_age_s`
+           (`now - broker.taken_at > max`; exactly the maximum passes) or from the future.
+           Vetoed, halting trading, when `broker.position != book.position`, when the open
+           orders differ (compared as multisets of OpenOrder), or when `broker.position < 0`:
+           exactly when `quant.risk.reconcile.reconcile` (which check 2 calls, with no instance
+           prefix) finds a MISMATCH, and its stale verdict is STALE. Nothing is ever corrected.
+           In flight below means spent orders the snapshot can't show yet: those spent at or
+           after `broker.taken_at`.
+        3. **Limits.** Let `sellable = broker.position` minus the open SELL LIMIT orders'
+           quantity and the in-flight SELLs' (stops don't count: execution cancels the stop
+           before it sells, ARCHITECTURE §8.2). When the outstanding SELLs reserve more than
+           `sellable`, they are all revoked.
+           - SELL: clamped to `sellable` minus the outstanding SELLs' quantity (stop approvals
+             included). Vetoed when nothing is left to sell. No cap applies. A SELL approved
+             for shares that stops cover (more than the clamp minus the working STOP orders'
+             quantity and the in-flight stops') revokes every outstanding stop approval when
+             it is issued: each was approved counting those stops as covering their shares,
+             so placing it after this SELL could sell a share twice (B9c).
+           - BUY: vetoed on a decision that can only reduce (`d.reduce_only`). Otherwise let
+             `held = broker.position + open BUY LIMIT quantity + in-flight BUYs + outstanding
+             BUYs + intent.quantity`; vetoed unless `held * limit_price <= cap * equity`, where
+             cap is the smallest of
+             `max_gross_exposure`, the label's cap (`uncertain_cap` when `intent.uncertain` or
+             `intent.label is None`) and, on the last fillable decision (`d.last_fillable`),
+             `overnight_cap`; and vetoed unless
+             `intent.quantity * limit_price <= single_order_cap * equity`. Equality passes, in
+             decimal values.
+        4. **Locks.** A BUY is vetoed while `state.daily_loss_locked`, `context.drift_frozen`,
+           or not `context.healthy` (rule 6).
+        5. **Rate.** An intent over the limit halts trading: a BUY is vetoed (`halts=True`),
+           and a SELL goes on as it would under HALTED, its approval carrying `halts=True`.
+        6. **Price.** Vetoed when the quote is older than `quote_max_age_s` (exactly the maximum
+           passes) or from the future, when it is crossed (`bid > ask`), or unless
+           `abs(limit_price - ref) <= ref * collar_bp / 10_000` in decimal values, with `ref`
+           the ask for a BUY and the bid for a SELL. The collar binds SELLs too: spec §10 gives
+           discretionary exits the same ±10 bp, and only the kill switch's exits widen, through
+           a RiskApprovedFlatten that no collar checks. A BUY is vetoed unless
+           `intent.stop_price` is set and below `limit_price`.
+        7. **Approval (D7).** A BUY whose notional `intent.quantity * limit_price` exceeds
+           `manual_approval_notional` (exactly the threshold doesn't) returns a registered
+           PendingApproval when `mode` is LIVE, and a RiskApprovedOrder with `flagged=True`
+           when it is PAPER. Approving a PendingApproval vetoes a price moved more than the
+           collar above the one you were asked about (`approve_pending`).
+
+        A pass returns a registered RiskApprovedOrder, expiring at the window's end, and
+        outstanding from then on. Checking never raises for a bad intent or context: every
+        refusal is a Veto. Only a failed save can make it raise (class docstring), and then the
+        approval it would have returned is revoked, so it holds nothing.
+        """
+        verdict: RiskVerdict | None = None
+        try:
+            with self._publishing() as publish:
+                verdict = self._check(intent, context, pending=None)
+                publish.reducing = _reduces(verdict) and not self._halt_unsaved()
+        except BaseException:
+            self._withdraw(verdict)
+            raise
+        return verdict
+
+    def approve_pending(self, pending: PendingApproval, context: RiskContext) -> RiskVerdict:
+        """Your approval of `pending` (D7, ARCHITECTURE §8.4): checks 1–6 run again on its intent
+        with `context`, and a pass returns a RiskApprovedOrder with `flagged=True`. A Veto is
+        returned as from `check`. The intent is not counted again. A PendingApproval holds no
+        exposure, so approving it counts every approval outstanding by then.
+
+        You approved the order at `pending.limit_price`, so check 7 vetoes it when
+        `context.limit_price` is more than `collar_bp` above that price, in decimal values
+        (exactly the collar passes; a lower price always does). The pending approval stays
+        approvable until it expires, at a price that passes.
+
+        ApprovalError when this engine object didn't issue `pending` (judged by identity), it
+        was already approved, or `now >= pending.expires_at`."""
+        if type(pending) is not PendingApproval:
+            raise ApprovalError("pending must be exactly a PendingApproval")
+        issued = self._pending.get(pending)
+        if issued is None or not _unchanged(_pending_fields(pending), issued):
+            raise ApprovalError("pending approval was not issued here or has changed")
+        if self._clock.now() >= pending.expires_at:
+            raise ApprovalError("pending approval has expired")
+        verdict: RiskVerdict | None = None
+        try:
+            with self._publishing():
+                verdict = self._check(pending.intent, context, pending=pending)
+        except BaseException:
+            self._withdraw(verdict)
+            raise
+        if isinstance(verdict, RiskApprovedOrder):
+            del self._pending[pending]
+        return verdict
+
+    def approve_cancel(self, client_order_id: str, *, reason: str) -> RiskApprovedCancel:
+        """A registered approval to cancel `client_order_id`, issued whatever the state, and
+        even when the state can't be saved (class docstring)."""
+        now = self._clock.now()
+        with self._publishing() as publish:
+            publish.reducing = True
+            approval = RiskApprovedCancel(
+                token=_TOKEN,
+                approval_id=self._next_id("C", now),
+                client_order_id=client_order_id,
+                reason=reason,
+                issued_at=now,
+            )
+            self._issued[approval] = _Issued(_approval_fields(approval))
+        return approval
+
+    def approve_flatten(self, *, reason: str) -> RiskApprovedFlatten:
+        """A registered approval for the kill switch to close the whole SPY position, issued
+        whatever the state, and even when the state can't be saved (class docstring)."""
+        now = self._clock.now()
+        with self._publishing() as publish:
+            publish.reducing = True
+            approval = RiskApprovedFlatten(
+                token=_TOKEN,
+                approval_id=self._next_id("F", now),
+                symbol=SYMBOL,
+                reason=reason,
+                issued_at=now,
+            )
+            self._issued[approval] = _Issued(_approval_fields(approval))
+        return approval
+
+    def approve_stop(
+        self,
+        snapshot: BrokerSnapshot,
+        quote: Quote,
+        *,
+        quantity: int,
+        stop_price: float,
+        reason: str,
+    ) -> RiskApprovedStop:
+        """A registered approval to place one broker-side stop-market SELL of `quantity` shares
+        at `stop_price` (your call of 2026-10-14), issued halted or not, since a stop only
+        reduces risk. The kill executor leaves one when it can't finish (quant.risk.kill), and
+        execution (B13) places the protective stop with one.
+
+        ApprovalError, changing nothing, unless:
+
+        - `snapshot` is no older than `snapshot_max_age_s` and not from the future, and `quote`
+          no older than `quote_max_age_s`, not from the future and not crossed;
+        - `quantity` is a whole number of at least 1, and `stop_price` is finite, positive and
+          below `quote.bid` (in decimal values; exactly the bid is refused);
+        - `quantity` is at most `free_for_stop(snapshot)`, the shares no other SELL covers.
+          So a stop never sells a share another SELL may also sell, and never takes the
+          position short.
+
+        The approval expires `snapshot_max_age_s` after `snapshot.taken_at`, when the snapshot
+        behind it would no longer pass check 2. Until it is spent, revoked or expires it
+        reserves its shares like an outstanding SELL; once spent it counts as in flight until
+        a snapshot taken after the spend can show it. A stop never counts as a submission."""
+        now = self._clock.now()
+        config = self._config
+
+        def refuse(reason: str) -> ApprovalError:
+            log.warning("risk_stop_refused", reason=reason, quantity=quantity)
+            return ApprovalError(f"stop refused: {reason}")
+
+        try:
+            BrokerSnapshot.model_validate(snapshot.model_dump())
+            Quote.model_validate(quote.model_dump())
+            snapshot_age = (now - snapshot.taken_at).total_seconds()
+            quote_age = (now - quote.at).total_seconds()
+        except (QuantError, ValueError, TypeError, AttributeError) as exc:
+            raise refuse(f"invalid snapshot or quote: {exc}") from exc
+        if not isinstance(reason, str) or not reason:
+            raise refuse("a stop needs a reason")
+        if not 0 <= snapshot_age <= config.snapshot_max_age_s:
+            raise refuse("broker snapshot is stale or from the future")
+        if not 0 <= quote_age <= config.quote_max_age_s:
+            raise refuse("quote is stale or from the future")
+        if quote.bid > quote.ask:
+            raise refuse("quote is crossed")
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+            raise refuse("a stop needs a whole number of shares, at least 1")
+        if (
+            isinstance(stop_price, bool)
+            or not isinstance(stop_price, (int, float))
+            or not isfinite(stop_price)
+            or stop_price <= 0
+            or _exact(stop_price) >= _exact(quote.bid)
+        ):
+            raise refuse("the stop price must be finite, positive and below the bid")
+        free = self.free_for_stop(snapshot)
+        if quantity > free:
+            raise refuse(f"only {max(free, 0)} shares are free of other SELLs")
+        expires = snapshot.taken_at + timedelta(seconds=config.snapshot_max_age_s)
+        with self._publishing() as publish:
+            publish.reducing = True
+            approval = RiskApprovedStop(
+                token=_TOKEN,
+                approval_id=self._next_id("S", now),
+                symbol=SYMBOL,
+                quantity=quantity,
+                stop_price=float(stop_price),
+                reason=reason,
+                issued_at=now,
+                expires_at=expires,
+            )
+            key = approval.approval_id
+            self._issued[approval] = _Issued(_approval_fields(approval), key, None, expires)
+            self._outstanding[key] = _Hold(approval, Side.SELL, quantity, expires)
+        log.info(
+            "risk_stop_approved",
+            approval_id=approval.approval_id,
+            quantity=quantity,
+            stop_price=approval.stop_price,
+        )
+        return approval
+
+    def free_for_stop(self, snapshot: BrokerSnapshot) -> int:
+        """The shares a new stop may cover on `snapshot`, never below 0: `snapshot.position`,
+        minus every working SELL order on it (LIMIT and STOP), minus the SELLs and stops spent at
+        or after `snapshot.taken_at` (the snapshot can't show them yet), minus every outstanding
+        SELL and stop approval. A flatten spent at or after `snapshot.taken_at` may sell every
+        share the snapshot shows, so none is free until a later snapshot shows what it did
+        (B9c review). `approve_stop` grants at most this; the kill executor asks for no more.
+        Changes no RiskState."""
+        self._forget_expired(self._clock.now())
+        since = [f for f in self._in_flight if f.spent_at >= snapshot.taken_at]
+        if any(f.flatten for f in since):
+            return 0
+        free = (
+            snapshot.position
+            - sum(o.quantity for o in snapshot.open_orders if o.side is Side.SELL)
+            - sum(f.quantity for f in since if f.side is Side.SELL)
+            - self._outstanding_quantity(Side.SELL)
+        )
+        return max(free, 0)
+
+    def release(self, approval: RiskApprovedOrder | RiskApprovedStop) -> None:
+        """Give up `approval` unsent: execution calls this when it drops an approved order or
+        stop without sending it. The approval stops holding exposure or shares, and `spend`
+        refuses it from then on. Releasing one already spent, released, revoked or expired
+        changes nothing; an expired one isn't even looked up, since the engine lets go of it.
+
+        ApprovalError, as in `spend` cases 1–3, when `approval` is not exactly a
+        RiskApprovedOrder or RiskApprovedStop this engine object issued."""
+        if type(approval) not in (RiskApprovedOrder, RiskApprovedStop):
+            raise ApprovalError("only an approved order or stop can be released")
+        if getattr(approval, "_token", None) is not _TOKEN:
+            raise ApprovalError("approval is missing the risk engine's private token")
+        if self._clock.now() >= approval.expires_at:
+            return
+        issued = self._registered(approval)
+        hold = self._outstanding.get(issued.key)
+        if hold is not None and hold.approval is approval:
+            self._revoke(issued.key, "released")
+
+    def spend(self, approval: object) -> Approval:
+        """Spend `approval` once; the broker adapter calls this right before it sends anything,
+        and sends nothing unless it returns.
+
+        ApprovalError, in this order, for:
+        1. anything whose type is not exactly RiskApprovedOrder, RiskApprovedCancel,
+           RiskApprovedFlatten or RiskApprovedStop (plain objects, subclasses);
+        2. a missing token, or one that isn't this module's;
+        3. an approval this engine object never issued (judged by identity: copies, one built
+           with the token by anyone else, another engine's), one any of whose fields is not
+           the very object issued, or a RiskApprovedOrder whose intent's canonical hash differs
+           from the one taken at issue (an intent changed in place);
+        4. a RiskApprovedOrder or RiskApprovedStop at or after its `expires_at`;
+        5. an id the SpentApprovals store already holds (reused);
+        6. a RiskApprovedOrder that was released or revoked, or a RiskApprovedStop that was
+           revoked, so no longer outstanding;
+        7. SubmissionLimitError, halting trading, for a BUY when the session already has
+           `submission_halt_at` submissions (reachable only after a resume, since reaching the
+           number halts); ApprovalError for a BUY while `state.halted`, `state.killed` or
+           `state.daily_loss_locked`. A SELL is never refused here.
+
+        Then the id is recorded in the store (`spend` returning False is case 5). A
+        RiskApprovedOrder counts as one raw submission (C3) and is in flight from now on; the
+        submission that brings the count to `submission_halt_at` or past it is sent and halts
+        trading (C3 halts *at* 60, so the 60th goes out, BUY or SELL). A RiskApprovedFlatten
+        revokes every outstanding order and stop approval, and is in flight from now on: no
+        share of a snapshot taken before it is free for a stop or a SELL (`free_for_stop`). A
+        RiskApprovedStop is in flight from now on, for `approve_stop`. Cancels, flattens and
+        stops never count as submissions, and the engine lets go of a cancel or flatten once
+        spent. Every change is published through `on_change` before `spend` returns or
+        raises, a failed save raising only for a BUY, or a SELL while a halt waits for its
+        save (class docstring). A store that can't record a cancel, flatten, stop or SELL is a
+        failed save too: the id is kept in memory, so this engine never spends it twice, and
+        written at the next call that publishes.
+        """
+        if type(approval) not in _APPROVED_TYPES:
+            raise ApprovalError("expected exactly an approved order, cancel, flatten or stop")
+        approved = cast(Approval, approval)
+        issued = self._registered(approved)
+        now = self._clock.now()
+        if isinstance(approved, (RiskApprovedOrder, RiskApprovedStop)) and (
+            now >= approved.expires_at
+        ):
+            raise ApprovalError("approval has expired")
+        buy = isinstance(approved, RiskApprovedOrder) and approved.intent.side is Side.BUY
+        if approved.approval_id in self._unrecorded or self._is_spent(
+            approved.approval_id, strict=buy
+        ):
+            raise ApprovalError("approval has already been spent")
+        with self._publishing() as publish:
+            publish.reducing = not buy
+            limit = self._config.submission_halt_at
+            if isinstance(approved, (RiskApprovedOrder, RiskApprovedStop)):
+                hold = self._outstanding.get(issued.key)
+                if hold is None or hold.approval is not approved:
+                    reason = self._revoked.get(approved, "it is no longer outstanding")
+                    raise ApprovalError(f"approval was revoked: {reason}")
+                if hold.side is Side.BUY:
+                    if self.state.submissions >= limit:
+                        self._halt(SUBMISSION_LIMIT)
+                        raise SubmissionLimitError(SUBMISSION_LIMIT)
+                    if self.state.halted or self.state.killed or self.state.daily_loss_locked:
+                        raise ApprovalError("entries are halted or locked")
+            self._record_spent(approved.approval_id, now, strict=buy)
+            if isinstance(approved, RiskApprovedOrder):
+                hold = self._outstanding.pop(issued.key)
+                self._in_flight.append(_InFlight(hold.side, hold.quantity, now))
+                self._update(submissions=self.state.submissions + 1)
+                if self.state.submissions >= limit:
+                    self._halt(SUBMISSION_LIMIT)
+                if not buy:  # a SELL carrying a halt not yet saved needs its save (R4)
+                    publish.reducing = not self._halt_unsaved()
+            elif isinstance(approved, RiskApprovedStop):
+                hold = self._outstanding.pop(issued.key)
+                self._in_flight.append(_InFlight(Side.SELL, hold.quantity, now, stop=True))
+            else:
+                del self._issued[approved]
+                if isinstance(approved, RiskApprovedFlatten):
+                    self._in_flight.append(_InFlight(Side.SELL, 0, now, flatten=True))
+                    self._revoke_where(lambda hold: True, "a flatten was sent")
+        return approved
+
+    def _is_spent(self, approval_id: str, *, strict: bool) -> bool:
+        """The spent store's answer. Unless `strict`, a store that can't be read is logged and
+        read as "not spent": this engine object spends each approval it issued once anyway,
+        by identity, so the store only guards across restarts."""
+        try:
+            return self._spent.is_spent(approval_id)
+        except Exception as exc:
+            if strict:
+                raise
+            log.error("risk_spent_store_unreadable", error=str(exc), error_type=type(exc).__name__)
+            return False
+
+    def _record_spent(self, approval_id: str, at: datetime, *, strict: bool) -> None:
+        """Record `approval_id` in the spent store; ApprovalError when it was already there.
+        Unless `strict`, a store that fails keeps the id in `_unrecorded`, for `_publishing` to
+        write at the next call and report as unsaved meanwhile."""
+        try:
+            recorded = self._spent.spend(approval_id, at)
+        except Exception as exc:
+            if strict:
+                raise
+            self._unrecorded[approval_id] = at
+            log.error(
+                "risk_spend_unrecorded",
+                approval_id=approval_id,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+            return
+        if not recorded:
+            raise ApprovalError("approval has already been spent")
+
+    def _write_unrecorded(self) -> Exception | None:
+        """Write the spent ids the store missed, in order; the first failure, or None."""
+        for approval_id, at in list(self._unrecorded.items()):
+            try:
+                self._spent.spend(approval_id, at)
+            except Exception as exc:
+                return exc
+            del self._unrecorded[approval_id]
+        return None
+
+    def _halt_unsaved(self) -> bool:
+        """True while trading is halted in memory but the last saved state isn't (R4/C5)."""
+        return self._on_change is not None and self.state.halted and not self._saved_halted
+
+    def _withdraw(self, verdict: RiskVerdict | None) -> None:
+        """Revoke `verdict` if it is an approval still outstanding: its call raised, so the
+        caller never got it."""
+        if not isinstance(verdict, RiskApprovedOrder):
+            return
+        issued = self._issued.get(verdict)
+        hold = None if issued is None else self._outstanding.get(issued.key)
+        if issued is not None and hold is not None and hold.approval is verdict:
+            self._revoke(issued.key, "its call failed to save, so it was never handed out")
+
+    def _registered(self, approved: Approval) -> _Issued:
+        """The registration of `approved`, or ApprovalError for `spend` cases 2 and 3."""
+        if getattr(approved, "_token", None) is not _TOKEN:
+            raise ApprovalError("approval is missing the risk engine's private token")
+        issued = self._issued.get(approved)
+        if issued is None or not _unchanged(_approval_fields(approved), issued.fields):
+            raise ApprovalError("approval was not issued here or has changed")
+        if isinstance(approved, RiskApprovedOrder) and _intent_hash(approved.intent) != (
+            issued.intent_hash
+        ):
+            raise ApprovalError("the approved intent has changed")
+        return issued
+
+    def _revoke(self, key: str, reason: str) -> None:
+        hold = self._outstanding.pop(key, None)
+        if hold is not None:
+            self._revoked[hold.approval] = reason
+            log.info("risk_approval_revoked", approval_id=hold.approval.approval_id, reason=reason)
+
+    def _revoke_where(self, picks: Callable[[_Hold], bool], reason: str) -> None:
+        """Revoke every outstanding approval whose hold `picks` selects."""
+        for key, hold in list(self._outstanding.items()):
+            if picks(hold):
+                self._revoke(key, reason)
+
+    def _forget_expired(self, now: datetime) -> None:
+        """Let go of approvals that have expired (outstanding, issued, revoked and pending), and
+        of in-flight orders every acceptable snapshot must already show."""
+        for key, hold in list(self._outstanding.items()):
+            if now >= hold.expires_at:
+                del self._outstanding[key]
+        for approval, issued in list(self._issued.items()):
+            if issued.expires_at is not None and now >= issued.expires_at:
+                del self._issued[approval]
+                self._revoked.pop(approval, None)
+        for pending in [p for p in self._pending if now >= p.expires_at]:
+            del self._pending[pending]
+        horizon = now - timedelta(seconds=self._config.snapshot_max_age_s)
+        self._in_flight = [f for f in self._in_flight if f.spent_at >= horizon]
+
+    @contextmanager
+    def _publishing(self) -> Iterator[_Publish]:
+        """Run the body, then write the spent ids the store missed, and hand `on_change` the
+        state if the body changed it or an earlier write failed, even when the body raises
+        (class docstring). A failed write is recorded in `unsaved` and logged; it propagates
+        unless the body marked its result risk-reducing."""
+        publish = _Publish()
+        before = self._state
+        try:
+            yield publish
+        finally:
+            failure = self._write_unrecorded() if self._unrecorded else None
+            if self._on_change is not None and (self._state != before or self._unsaved is not None):
+                try:
+                    self._on_change(self._state)
+                except Exception as exc:
+                    failure = exc
+                else:
+                    self._saved_halted = self._state.halted
+            if failure is not None:
+                self._unsaved = failure
+                log.error(
+                    "risk_state_save_failed",
+                    error=str(failure),
+                    error_type=type(failure).__name__,
+                    risk_reducing=publish.reducing,
+                )
+                if not publish.reducing:
+                    raise failure
+            elif self._unsaved is not None:
+                log.warning("risk_state_saved_after_failure")
+                self._unsaved = None
+
+    def _update(self, **changes: Any) -> None:
+        self._state = self.state.model_copy(update=changes)
+
+    def _halt(self, reason: str) -> None:
+        """Halt trading. A halt already in force keeps its first reason (C10)."""
+        first = self.state.halt_reason if self.state.halted else None
+        self._update(halted=True, halt_reason=first or reason)
+        log.error("risk_halted", reason=reason, halt_reason=self.state.halt_reason)
+        self._revoke_where(_buys, f"trading halted: {reason}")
+
+    def _next_id(self, prefix: str, now: datetime) -> str:
+        self._update(issued=self.state.issued + 1)
+        return f"{prefix}{self.state.issued}-{to_us(now)}"
+
+    def _count(self, key: str) -> bool:
+        """Count `key` toward C3's intent limit if a session has started and it is new. True when
+        this made the count exceed the limit while the engine wasn't halted (`check`)."""
+        if self.state.session is None or key in self.state.intents:
+            return False
+        self._update(intents=(*self.state.intents, key))
+        return len(self.state.intents) > self._config.max_intents_per_day and not (
+            self.state.halted
+        )
+
+    def _check(
+        self, intent: OrderIntent, context: RiskContext, *, pending: PendingApproval | None
+    ) -> RiskVerdict:
+        now = self._clock.now()
+        config = self._config
+        stage = RiskCheck.INTENT
+        over = False  # this intent is over C3's limit, so its verdict halts trading
+        claims_stopped = False  # a SELL that needs a working stop cancelled first
+
+        def veto(reason: str, *, halts: bool = False) -> Veto:
+            if halts:
+                self._halt(reason)
+            if over:
+                self._halt(INTENT_LIMIT)
+            log.warning("risk_veto", check=stage.value, reason=reason, halts=halts or over)
+            return Veto(intent, stage, reason, halts or over)
+
+        try:
+            self._forget_expired(now)
+            key = f"{intent.decision_id}#{intent.leg}"
+            self._revoke(key, "replaced by a re-check of its intent")
+            if context.halted or context.drift_frozen or not context.healthy:
+                self._revoke_where(_buys, "a check saw HALTED, a drift freeze or rule 6")
+            if pending is None:
+                over = self._count(key)
+            # Revalidate even a model constructed or copied without pydantic validation.
+            OrderIntent.model_validate(intent.model_dump())
+            day = intent.tau.astimezone(NEW_YORK).date()
+            decision = next(
+                (
+                    d
+                    for d in decision_schedule(self._calendar, day, self._timing)
+                    if d.tau == intent.tau
+                ),
+                None,
+            )
+            if decision is None:
+                return veto("intent is not a scheduled decision")
+            execution_day = decision.executes_at.astimezone(NEW_YORK).date()
+            session = self._calendar.session(execution_day)
+            expires = next(
+                bar.t_close
+                for bar in session.bars
+                if bar.t_open <= decision.executes_at < bar.t_close
+            )
+            if self.state.session != execution_day:
+                return veto("intent needs its execution session started")
+            if not decision.executes_at <= now < expires:
+                return veto("intent is outside its execution window")
+            buy = intent.side is Side.BUY
+
+            stage = RiskCheck.HALTED
+            if buy and (self.state.halted or context.halted):
+                return veto("trading is halted")
+
+            stage = RiskCheck.RECONCILIATION
+            broker, book = context.broker, context.book
+            BrokerSnapshot.model_validate(broker.model_dump())
+            InternalBook.model_validate(book.model_dump())
+            reconciled = reconcile(broker, book, now=now, max_age_s=config.snapshot_max_age_s)
+            if reconciled.status is ReconcileStatus.STALE:
+                return veto("broker snapshot is stale or from the future")
+            if reconciled.mismatch:
+                details = "; ".join(d.detail for d in reconciled.discrepancies)
+                return veto(f"reconciliation mismatch: {details}", halts=True)
+
+            stage = RiskCheck.LIMITS
+            price = context.limit_price
+            valid_price = isinstance(price, (int, float)) and not isinstance(price, bool)
+            valid_price = valid_price and isfinite(price) and price > 0
+            quantity = intent.quantity
+            in_flight = [f for f in self._in_flight if f.spent_at >= broker.taken_at]
+            # A flatten the snapshot can't show yet may sell every share it holds (B9c review).
+            sellable = (
+                0
+                if any(f.flatten for f in in_flight)
+                else (
+                    broker.position
+                    - sum(
+                        order.quantity
+                        for order in broker.open_orders
+                        if order.side is Side.SELL and order.kind is OrderKind.LIMIT
+                    )
+                    - sum(f.quantity for f in in_flight if f.side is Side.SELL and not f.stop)
+                )
+            )
+            if self._outstanding_quantity(Side.SELL) > sellable:
+                self._revoke_where(_sells, "a snapshot holds fewer shares than they reserve")
+            if buy:
+                if decision.reduce_only:
+                    return veto("this decision can only reduce exposure")
+                held = (
+                    broker.position
+                    + quantity
+                    + sum(
+                        order.quantity
+                        for order in broker.open_orders
+                        if order.side is Side.BUY and order.kind is OrderKind.LIMIT
+                    )
+                    + sum(f.quantity for f in in_flight if f.side is Side.BUY)
+                    + self._outstanding_quantity(Side.BUY)
+                )
+                cap = min(
+                    config.max_gross_exposure,
+                    config.uncertain_cap
+                    if intent.uncertain or intent.label is None
+                    else config.label_caps.cap(intent.label),
+                )
+                if decision.last_fillable:
+                    cap = min(cap, config.overnight_cap)
+                # Invalid prices are refused by PRICE; they cannot earn an approval.
+                equity = _exact(broker.equity)
+                if valid_price and _exact(held) * _exact(price) > _exact(cap) * equity:
+                    return veto("resulting position exceeds its exposure cap")
+                if valid_price and _exact(quantity) * _exact(price) > (
+                    _exact(config.single_order_cap) * equity
+                ):
+                    return veto("order exceeds the single-order cap")
+            else:
+                unreserved = sellable - self._outstanding_quantity(Side.SELL)
+                quantity = min(quantity, unreserved)
+                if quantity <= 0:
+                    return veto("no unreserved shares remain to sell")
+                stopped = sum(
+                    order.quantity
+                    for order in broker.open_orders
+                    if order.side is Side.SELL and order.kind is OrderKind.STOP
+                ) + sum(f.quantity for f in in_flight if f.stop)
+                claims_stopped = quantity > unreserved - stopped
+
+            stage = RiskCheck.LOCKS
+            if buy:
+                if self.state.daily_loss_locked:
+                    return veto("daily-loss lock blocks entries")
+                if context.drift_frozen:
+                    return veto("drift freeze blocks entries")
+                if not context.healthy:
+                    return veto("rule 6 blocks entries")
+
+            stage = RiskCheck.RATE
+            if over and buy:
+                return veto(INTENT_LIMIT)
+
+            stage = RiskCheck.PRICE
+            quote = context.quote
+            Quote.model_validate(quote.model_dump())
+            age = (now - quote.at).total_seconds()
+            if not 0 <= age <= config.quote_max_age_s:
+                return veto("quote is stale or from the future")
+            if quote.bid > quote.ask:
+                return veto("quote is crossed")
+            ref = _exact(quote.ask if buy else quote.bid)
+            collar = _exact(config.collar_bp) / 10_000
+            if not valid_price or abs(_exact(price) - ref) > ref * collar:
+                return veto("limit price is invalid or outside the collar")
+            if buy and (intent.stop_price is None or intent.stop_price >= price):
+                return veto("entry needs a protective stop below its limit")
+            notional = quantity * price
+            if not isfinite(notional):
+                return veto("order notional must be finite")
+
+            stage = RiskCheck.APPROVAL
+            if pending is not None and _exact(price) > _exact(pending.limit_price) * (1 + collar):
+                return veto("re-priced more than the collar above the price you approved")
+            large = buy and notional > config.manual_approval_notional
+            if large and self._mode is TradingMode.LIVE and pending is None:
+                waiting = PendingApproval(
+                    self._next_id("P", now),
+                    intent,
+                    quantity,
+                    float(price),
+                    float(notional),
+                    now,
+                    expires,
+                )
+                self._pending[waiting] = _pending_fields(waiting)
+                log.warning(
+                    "risk_pending_approval", pending_id=waiting.pending_id, notional=notional
+                )
+                return waiting
+            if over:
+                self._halt(INTENT_LIMIT)  # a reduction past the limit passes, and halts
+            if claims_stopped:  # an outstanding stop counted those shares as covered
+                self._revoke_where(_stops, "a SELL claims the shares a working stop covers")
+            flagged = large or pending is not None
+            approval = RiskApprovedOrder(
+                token=_TOKEN,
+                approval_id=self._next_id("O", now),
+                intent=intent,
+                quantity=quantity,
+                limit_price=float(price),
+                notional=float(notional),
+                issued_at=now,
+                expires_at=expires,
+                flagged=flagged,
+                halts=over,
+            )
+            self._issued[approval] = _Issued(
+                _approval_fields(approval), key, _intent_hash(intent), expires
+            )
+            self._outstanding[key] = _Hold(approval, intent.side, quantity, expires)
+            if flagged:
+                log.warning(
+                    "risk_flagged_order", approval_id=approval.approval_id, notional=notional
+                )
+            return approval
+        except (QuantError, ValueError, TypeError, AttributeError, ArithmeticError) as exc:
+            return veto(f"invalid intent or context: {exc}")
+
+    def _outstanding_quantity(self, side: Side) -> int:
+        return sum(hold.quantity for hold in self._outstanding.values() if hold.side is side)
+
+
+def verdict_record(verdict: RiskVerdict) -> dict[str, Any]:
+    """The verdict as plain data for the DecisionRecord (ARCHITECTURE §4.3), ready for canonical
+    JSON. Never the token.
+
+    - approved: `{"verdict": "approved", "approval_id", "intent", "quantity", "limit_price",
+      "notional", "issued_at", "expires_at", "flagged", "halts"}`;
+    - pending: `{"verdict": "pending", "pending_id", "intent", "quantity", "limit_price",
+      "notional", "issued_at", "expires_at"}`;
+    - veto: `{"verdict": "veto", "intent", "check", "reason", "halts"}`, `check` as its value.
+
+    `intent` is the OrderIntent itself (canonical JSON dumps a model); times stay datetimes.
+    """
+    if isinstance(verdict, Veto):
+        return {
+            "verdict": "veto",
+            "intent": verdict.intent,
+            "check": verdict.check.value,
+            "reason": verdict.reason,
+            "halts": verdict.halts,
+        }
+    record: dict[str, Any] = {
+        "intent": verdict.intent,
+        "quantity": verdict.quantity,
+        "limit_price": verdict.limit_price,
+        "notional": verdict.notional,
+        "issued_at": verdict.issued_at,
+        "expires_at": verdict.expires_at,
+    }
+    if isinstance(verdict, PendingApproval):
+        record.update(verdict="pending", pending_id=verdict.pending_id)
+    else:
+        record.update(
+            verdict="approved",
+            approval_id=verdict.approval_id,
+            flagged=verdict.flagged,
+            halts=verdict.halts,
+        )
+    return record
+
+
+@dataclass(frozen=True)
+class _Issued:
+    """How the engine registered an approval: its fields as issued and, for an order, the key
+    of its intent, the intent's canonical hash and its expiry."""
+
+    fields: tuple[object, ...]
+    key: str = ""
+    intent_hash: str | None = None
+    expires_at: datetime | None = None  # an order's; the engine lets go of it from then on
+
+
+@dataclass(frozen=True, eq=False)
+class _Hold:
+    """What an outstanding order approval holds until it is spent, released, revoked or
+    expires. The side and quantity are the engine's own copies, never read back from the
+    approval."""
+
+    approval: RiskApprovedOrder | RiskApprovedStop
+    side: Side
+    quantity: int
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class _InFlight:
+    """A spent order, stop (`stop`) or flatten (`flatten`, which sells whatever the broker
+    holds, so its quantity is 0 and it frees no share), counted until a snapshot taken after
+    `spent_at` can show it."""
+
+    side: Side
+    quantity: int
+    spent_at: datetime
+    stop: bool = False
+    flatten: bool = False
+
+
+@dataclass
+class _Publish:
+    """What a `_publishing` body tells it: `reducing` when what the call issues or spends only
+    reduces risk, so a failed save is recorded instead of raised (your call of 2026-10-14)."""
+
+    reducing: bool = False
+
+
+_APPROVED_TYPES: Final = (
+    RiskApprovedOrder,
+    RiskApprovedCancel,
+    RiskApprovedFlatten,
+    RiskApprovedStop,
+)
+
+
+def _buys(hold: _Hold) -> bool:
+    return hold.side is Side.BUY
+
+
+def _sells(hold: _Hold) -> bool:
+    """SELL order approvals and stop approvals: both reserve shares."""
+    return hold.side is Side.SELL
+
+
+def _stops(hold: _Hold) -> bool:
+    return isinstance(hold.approval, RiskApprovedStop)
+
+
+def _reduces(verdict: RiskVerdict) -> bool:
+    """True for a verdict that only reduces risk: an approved SELL."""
+    return isinstance(verdict, RiskApprovedOrder) and verdict.intent.side is Side.SELL
+
+
+def _exact(value: float) -> Decimal:
+    """The decimal value `value` prints as, for comparisons that must hold at the boundary."""
+    return Decimal(repr(value))
+
+
+def _fell_by(base: float, equity: float, fraction: float) -> bool:
+    """True when `equity` is at least `fraction` of `base` below it, in decimal values."""
+    return _exact(base) - _exact(equity) >= _exact(fraction) * _exact(base)
+
+
+def _intent_hash(intent: OrderIntent) -> str | None:
+    try:
+        return sha256_hex(intent)
+    except (QuantError, ValueError, TypeError):
+        return None
+
+
+def _initialize(approval: _Approved, token: object, fields: dict[str, object]) -> None:
+    if token is not _TOKEN:
+        raise ApprovalError("an approval requires the risk engine's private token")
+    object.__setattr__(approval, "_token", token)
+    for name, value in fields.items():
+        object.__setattr__(approval, name, value)
+
+
+def _approval_fields(approval: Approval) -> tuple[object, ...]:
+    return tuple(
+        getattr(approval, name, None) for name in (*_Approved.__slots__, *type(approval).__slots__)
+    )
+
+
+def _pending_fields(pending: PendingApproval) -> tuple[object, ...]:
+    return tuple(getattr(pending, name, None) for name in PendingApproval.__dataclass_fields__)
+
+
+def _unchanged(current: tuple[object, ...], issued: tuple[object, ...]) -> bool:
+    return all(now is then for now, then in zip(current, issued, strict=True))
+
+
+def _check_equity(equity: float) -> None:
+    if isinstance(equity, bool) or not isinstance(equity, (int, float)):
+        raise RiskError("equity must be finite and positive")
+    if not isfinite(equity) or equity <= 0:
+        raise RiskError("equity must be finite and positive")
