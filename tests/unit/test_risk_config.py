@@ -78,6 +78,7 @@ def test_the_committed_file_holds_the_kill_settings() -> None:
     assert (kill.crash_loop_starts, kill.crash_loop_window_s) == (3, 600.0)
     assert kill.flatten_incomplete_s == 600.0
     assert kill.stop_missing_s == 300.0
+    assert kill.stop_distance_bp == 100.0  # B9c: the stop a kill leaves when it can't finish
 
 
 @pytest.mark.spec("ARCH§8.1", "ARCH§9.3", "SPEC§10")

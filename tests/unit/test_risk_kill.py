@@ -19,7 +19,13 @@ import pytest
 from quant.core.calendar import NEW_YORK
 from quant.core.errors import ApprovalError, RiskError
 from quant.core.orders import BrokerSnapshot, OrderKind, Quote, Side
-from quant.risk.engine import RiskApprovedCancel, RiskApprovedFlatten, RiskApprovedOrder, RiskState
+from quant.risk.engine import (
+    RiskApprovedCancel,
+    RiskApprovedFlatten,
+    RiskApprovedOrder,
+    RiskApprovedStop,
+    RiskState,
+)
 from quant.risk.kill import (
     FileKillLock,
     KillExecutor,
@@ -27,10 +33,12 @@ from quant.risk.kill import (
     KillReport,
     KillRequest,
     KillStatus,
+    KillStop,
     MemoryKillLock,
     in_regular_hours,
     kill_collar_bp,
     kill_limit_price,
+    kill_stop_price,
     next_open,
 )
 from quant.risk.limits import RiskConfig
@@ -664,3 +672,122 @@ def test_outside_hours_a_position_that_appears_keeps_its_new_stop() -> None:
     assert report.kept == ("stop-2",)
     assert "stop-2" in rig.broker.orders
     assert report.queued_exit_at == CAL.session(NEXT_DAY).open
+
+
+# --- B9c: a kill that can't finish leaves a stop; risk-reducing approvals need no save ----------
+
+# No stop is placed yet, so `report.stops` is empty; the price helper is a stub.
+RED_STOP = pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+RED_PRICE = pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
+
+
+def the_stop(rig: Rig, report: KillReport) -> KillStop:
+    """The one stop the run left, checked against the broker and the engine."""
+    assert len(report.stops) == 1, report
+    (stop,) = report.stops
+    working = rig.broker.orders[stop.client_order_id]
+    assert (working.side, working.kind) == (Side.SELL, OrderKind.STOP)
+    assert (working.quantity, working.price) == (stop.quantity, stop.stop_price)
+    placed = [a for a in rig.broker.spent if isinstance(a, RiskApprovedStop)]
+    assert len(placed) == 1
+    assert rig.kinds().index("place_stop") < rig.kinds().index("alert")
+    return stop
+
+
+@RED_STOP
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16", "I4")
+def test_a_kill_that_reaches_its_deadline_leaves_a_stop_on_the_remaining_shares() -> None:
+    rig = Rig(fill_at=1.0)  # no exit ever fills
+    report = rig.run()
+    assert report.status is KillStatus.INCOMPLETE
+    stop = the_stop(rig, report)
+    assert (stop.quantity, stop.stop_price) == (300, 99.00)  # 100 bp below the 100.00 bid
+    assert list(rig.broker.orders) == [stop.client_order_id]  # the working exit was cancelled
+    assert stop.placed_at >= report.started_at + timedelta(seconds=300)
+    rig.broker.trigger_stops()
+    assert rig.broker.position == 0
+    assert min(rig.broker.positions) >= 0
+
+
+@RED_STOP
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
+def test_a_kill_stopped_by_the_close_leaves_a_stop_and_queues_the_exit() -> None:
+    rig = Rig(at=et(DAY, 15, 59), fill_at=1.0)
+    report = rig.run()
+    assert report.status is KillStatus.INCOMPLETE
+    assert report.queued_exit_at == CAL.session(NEXT_DAY).open
+    stop = the_stop(rig, report)
+    assert (stop.quantity, stop.stop_price) == (300, 99.00)
+
+
+@RED_STOP
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "D9")
+def test_the_stop_covers_only_the_shares_no_working_sell_covers() -> None:
+    # The old stop covers 100 of the 300 shares and no cancel ever lands, so no exit can go out.
+    old = open_order("stop-1", Side.SELL, OrderKind.STOP, 100, 95.0)
+    rig = Rig(orders=(old,), fail={"cancel": 10_000})
+    report = rig.run()
+    assert report.status is KillStatus.INCOMPLETE
+    stop = the_stop(rig, report)
+    assert stop.quantity == 200
+    rig.broker.trigger_stops()
+    assert rig.broker.position == 0
+    assert min(rig.broker.positions) >= 0
+
+
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "D9")
+def test_shares_a_stop_already_covers_get_no_second_stop() -> None:
+    rig = Rig(fail={"cancel": 10_000})  # the 300-share stop can't be cancelled
+    report = rig.run()
+    assert report.status is KillStatus.INCOMPLETE
+    assert report.stops == ()
+    assert "place_stop" not in rig.kinds()
+    assert list(rig.broker.orders) == ["stop-1"]
+
+
+@RED_STOP
+@pytest.mark.spec("SPEC§10", "ARCH§8.3")
+def test_outside_hours_an_incomplete_kill_leaves_a_stop_on_the_bare_shares() -> None:
+    # No stop and an exit for 50 that never cancels: 250 shares are bare overnight.
+    rig = Rig(at=et(DAY, 18), day=None, orders=(EXIT,), fail={"cancel": 10_000})
+    report = rig.run()
+    assert report.status is KillStatus.INCOMPLETE
+    stop = the_stop(rig, report)
+    assert stop.quantity == 250
+    rig.broker.trigger_stops()
+    rig.broker.fill_sells()
+    assert min(rig.broker.positions) >= 0
+
+
+@pytest.mark.spec("SPEC§10", "ARCH§8.3")
+def test_a_kill_that_ends_flat_or_queued_places_no_stop() -> None:
+    for rig in (Rig(), Rig(at=et(DAY, 18), day=None)):
+        report = rig.run()
+        assert report.status in (KillStatus.FLAT, KillStatus.QUEUED)
+        assert report.stops == ()
+        assert "place_stop" not in rig.kinds()
+
+
+@RED_PRICE
+@pytest.mark.spec("SPEC§10", "ARCH§8.3")
+def test_the_stop_price_sits_its_distance_below_the_bid_rounded_down() -> None:
+    kill = config().kill
+    at = et(DAY, 11)
+    assert kill_stop_price(Quote(bid=100.0, ask=100.1, at=at), kill=kill) == 99.00
+    assert kill_stop_price(Quote(bid=123.457, ask=123.5, at=at), kill=kill) == 122.22
+    assert kill_stop_price(Quote(bid=271.18, ask=271.2, at=at), kill=kill) == 268.46
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§8.1")
+def test_a_lasting_save_failure_still_takes_the_account_flat() -> None:
+    # Your call of 2026-10-14: cancel and flatten approvals don't wait for a save.
+    persist = FlakyPersist(OSError("ops.db is full"), set(range(1, 10_000)))
+    rig = Rig(on_change=persist)
+    persist.armed = True
+    report = rig.run()
+    assert report.status is KillStatus.FLAT
+    assert rig.broker.position == 0
+    assert rig.engine.state.halted
+    assert "OSError: ops.db is full" in report.errors
+    assert rig.alerts.reports == [report]

@@ -50,7 +50,9 @@ class KillConfig(StrictModel):
     - `max_collar_bp`: the furthest, in basis points, a kill exit ever sits from the quote (100);
     - `poll_s`: seconds between the executor's broker reads while it waits (1);
     - `deadline_s`: seconds after the executor starts by which the account must be flat and
-      clean; past it the executor stops, reports INCOMPLETE and alerts (300).
+      clean; past it the executor stops, reports INCOMPLETE and alerts (300);
+    - `stop_distance_bp`: how far below the bid, in basis points, the protective stop sits that
+      the executor leaves when it can't finish (100; the engine has no ATR, B9c).
 
     The automatic triggers (quant.risk.triggers):
 
@@ -79,6 +81,7 @@ class KillConfig(StrictModel):
     crash_loop_window_s: float = Field(gt=0.0)
     flatten_incomplete_s: float = Field(gt=0.0)
     stop_missing_s: float = Field(gt=0.0)
+    stop_distance_bp: float = Field(gt=0.0, le=1000.0)
 
     @model_validator(mode="after")
     def _consistent(self) -> KillConfig:

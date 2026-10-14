@@ -183,6 +183,64 @@ def test_a_state_that_cannot_be_persisted_stops_the_call() -> None:
         d2.check(intent(Side.BUY, 100, leg=2))  # neither an approval nor a Veto
 
 
+# --- B9c: risk-reducing approvals go out even when the save fails (your call of 2026-10-14) -----
+
+
+class Disk:
+    """An `on_change` that saves every state it is given, and raises OSError while `full`."""
+
+    def __init__(self) -> None:
+        self.full = False
+        self.saved: list[RiskState] = []
+
+    def __call__(self, state: RiskState) -> None:
+        if self.full:
+            raise OSError("disk full")
+        self.saved.append(state)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=OSError)
+@pytest.mark.spec("ARCH§8.1", "ARCH§8.3", "I4", "C3")
+def test_risk_reducing_approvals_are_issued_and_spent_while_the_save_fails() -> None:
+    disk = Disk()
+    d = desk(on_change=disk)
+    disk.full = True
+    cancel = d.engine.approve_cancel("eng1-x", reason="kill")
+    flatten = d.engine.approve_flatten(reason="kill")
+    stop = d.stop(100)
+    sell = approved(d.check(intent(Side.SELL, 100), position=300))
+    for approval in (cancel, stop, sell, flatten):
+        assert d.engine.spend(approval) is approval
+    assert isinstance(d.engine.unsaved, OSError)
+    # The changes stay in memory: four ids numbered, one SELL submitted.
+    assert d.engine.state.issued == 4
+    assert d.engine.state.submissions == 1
+    assert disk.saved[-1].issued == 0
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=NotImplementedError)
+@pytest.mark.spec("ARCH§8.1", "ARCH§4.4", "C3")
+def test_a_buy_still_needs_its_save_and_the_next_save_catches_up() -> None:
+    disk = Disk()
+    d = desk(on_change=disk)
+    early = approved(d.check(intent(Side.BUY, 100)))
+    disk.full = True
+    with pytest.raises(OSError, match="disk full"):
+        d.check(intent(Side.BUY, 100, leg=2))  # neither an approval nor a Veto
+    with pytest.raises(OSError, match="disk full"):
+        d.engine.spend(early)  # the adapter sends nothing unless spend returns
+    assert isinstance(d.engine.unsaved, OSError)
+    cancel = d.engine.approve_cancel("eng1-x", reason="kill")
+    disk.full = False
+    saved = len(disk.saved)
+    d.engine.spend(cancel)  # changes nothing in RiskState, but the state in memory is unsaved
+    assert len(disk.saved) == saved + 1
+    assert disk.saved[-1] == d.engine.state
+    assert d.engine.unsaved is None
+    d.engine.spend(d.engine.approve_cancel("eng1-y", reason="kill"))
+    assert len(disk.saved) == saved + 2  # only the id it numbered, once saving is current
+
+
 # --- C8: what a resume resets ----------------------------------------------------------------------
 
 

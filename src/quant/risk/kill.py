@@ -85,6 +85,17 @@ class KillExit:
 
 
 @dataclass(frozen=True)
+class KillStop:
+    """One protective stop the executor left at the broker when it couldn't finish: its client
+    order id, the shares it covers, its trigger price, and when it was placed."""
+
+    client_order_id: str
+    quantity: int
+    stop_price: float
+    placed_at: datetime
+
+
+@dataclass(frozen=True)
 class KillReport:
     """What one run did. The executor sends it to `KillAlerts.send` and returns it.
 
@@ -100,6 +111,8 @@ class KillReport:
     - `queued_exit_at`: when the queued exit runs (QUEUED, or INCOMPLETE at the close), else
       None;
     - `final`: the last broker snapshot read, or None when none was read;
+    - `stops`: the protective stops placed before the run ended INCOMPLETE with a position
+      open (KillExecutor.execute, step 6);
     - `errors`: every error recorded and survived, in order, as `f"{type name}: {message}"`.
     """
 
@@ -115,6 +128,7 @@ class KillReport:
     queued_exit_at: datetime | None = None
     final: BrokerSnapshot | None = None
     errors: tuple[str, ...] = ()
+    stops: tuple[KillStop, ...] = ()
 
 
 class KillLock(Protocol):
@@ -282,6 +296,13 @@ def kill_limit_price(
     else:
         price = (_exact(quote.ask) * (1 + width)).quantize(_CENT, rounding=ROUND_CEILING)
     return float(price)
+
+
+def kill_stop_price(quote: Quote, *, kill: KillConfig) -> float:
+    """The trigger price of the protective stop a kill leaves: `quote.bid * (1 -
+    kill.stop_distance_bp / 10_000)` in decimal values, rounded *down* to the cent, so it always
+    sits below the bid. A bid of 100.00 with 100 bp gives 99.00."""
+    raise NotImplementedError("B9c: kill_stop_price")
 
 
 class KillExecutor:

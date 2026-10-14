@@ -75,7 +75,15 @@ class MonitorReport:
       already run for the halt in force;
     - `data_fault`: why this tick's cash or price can't be used (a cash that isn't a finite
       number, a price that isn't finite and positive), or None. Nothing is marked and no
-      DRAWDOWN fires on it; the caller treats the engine as unhealthy (rule 6) and alerts.
+      DRAWDOWN fires on it; the caller treats the engine as unhealthy (rule 6) and alerts;
+    - `exit_covered`: no stop covers the position, but risk-approved exit SELLs working at the
+      broker do (C5, your call of 2026-10-14): the stop isn't reported missing and its clock
+      pauses;
+    - `exit_since`: when exits first covered the position in this uncovered spell, while
+      `exit_covered`; else None. STOP_MISSING fires once it is `kill.stop_missing_s` old;
+    - `stop_missing_s`: the stop-missing clock, the seconds the position has gone with neither
+      a stop nor an exit over it in this spell; None when a stop covers it or the snapshot is
+      stale.
     """
 
     at: datetime
@@ -89,6 +97,9 @@ class MonitorReport:
     flatten: bool
     kill: tuple[KillTrigger, ...]
     data_fault: str | None = None
+    exit_covered: bool = False
+    exit_since: datetime | None = None
+    stop_missing_s: float | None = None
 
 
 class MinuteMonitor:

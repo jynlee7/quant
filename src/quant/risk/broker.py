@@ -9,8 +9,8 @@ simulated broker implement it there. Tests use `tests.support.broker.FakeBroker`
 The port is a Protocol: an adapter implements it by shape, without inheriting from it.
 
 **Changing anything at the broker takes an approval (I4, ARCHITECTURE §4.4).** `submit`,
-`cancel` and `flatten` are the only methods that change anything at the broker, and each takes
-the matching approved type. An adapter is built with the RiskEngine that issued its approvals,
+`cancel`, `flatten` and `place_stop` are the only methods that change anything at the broker,
+and each takes the matching approved type. An adapter is built with the RiskEngine that issued its approvals,
 and calls `RiskEngine.spend(approval)` right before it sends; it sends nothing when `spend`
 raises, and lets that ApprovalError propagate unchanged. A request the broker fails or refuses
 after the spend raises BrokerError, and the approval stays spent: a retry needs a new one.
@@ -24,7 +24,12 @@ from __future__ import annotations
 from typing import Protocol
 
 from quant.core.orders import BrokerSnapshot, Quote
-from quant.risk.engine import RiskApprovedCancel, RiskApprovedFlatten, RiskApprovedOrder
+from quant.risk.engine import (
+    RiskApprovedCancel,
+    RiskApprovedFlatten,
+    RiskApprovedOrder,
+    RiskApprovedStop,
+)
 
 
 class BrokerPort(Protocol):
@@ -68,4 +73,16 @@ class BrokerPort(Protocol):
         BrokerError, after the spend, when the broker holds no position, or refuses the order
         (Alpaca refuses a SELL while open sell orders, the stop included, reserve the shares,
         which is why the executor cancels every order first, ARCHITECTURE §8.2)."""
+        ...
+
+    def place_stop(self, approval: RiskApprovedStop) -> str:
+        """Spend `approval`, then send one GTC stop-market SELL of `approval.quantity` shares of
+        SPY triggered at `approval.stop_price` (spec §10's broker-side stop). Returns the new
+        order's client order id. The engine approved it only for shares no other SELL covers,
+        below the bid it was shown, so it can never take the position short. The kill executor
+        leaves one when it can't finish (quant.risk.kill); execution (B13) places the protective
+        stop after a fill with one.
+
+        BrokerError, after the spend, when the broker refuses the order (Alpaca refuses a SELL
+        while open sell orders already reserve the shares)."""
         ...

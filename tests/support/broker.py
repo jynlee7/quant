@@ -8,7 +8,11 @@ in full, when its limit crosses the quote (a SELL at or below the bid, a BUY at 
 and is at or through `fill_at` (no further bound when `fill_at` is None); otherwise it stays
 working until it is cancelled. `partial` makes the next exit fill only that many shares.
 `positions` is the signed position after every change, starting with the first, so a test can
-see a short however briefly it lasted. `fail` makes the named methods raise BrokerError, after the spend, a given number of
+see a short however briefly it lasted. `place_stop` adds a working STOP SELL without asking
+whether other SELLs already reserve the shares, so only the engine's own bound keeps a stop from
+selling a share twice; `submit` refuses a SELL beyond the shares open SELLs leave free, as
+Alpaca does (ARCHITECTURE §8.2). `trigger_stops` and `fill_sells` play a fall through every
+stop and the fill of every working SELL. `fail` makes the named methods raise BrokerError, after the spend, a given number of
 times. Every change is appended to `events`, a list a test may share with the store and the
 alert sink to check the order of the steps.
 """
@@ -28,6 +32,7 @@ from quant.risk.engine import (
     RiskApprovedCancel,
     RiskApprovedFlatten,
     RiskApprovedOrder,
+    RiskApprovedStop,
     RiskEngine,
 )
 from tests.support.risk import EQUITY, PRICE
@@ -70,6 +75,7 @@ class FakeBroker:
         self.halted_at_first_change: bool | None = None
         self.snapshots = 0
         self._exits = 0
+        self._stops = 0
 
     # --- reads -------------------------------------------------------------------------------
 
@@ -92,6 +98,10 @@ class FakeBroker:
     def submit(self, approval: RiskApprovedOrder, *, client_order_id: str) -> str:
         self._spend(approval)
         self._maybe_fail("submit")
+        if approval.intent.side is Side.SELL:
+            reserved = sum(o.quantity for o in self.orders.values() if o.side is Side.SELL)
+            if reserved + approval.quantity > self.position:
+                raise BrokerError("insufficient qty available")  # Alpaca's rule, ARCH §8.2
         self.orders[client_order_id] = OpenOrder(
             client_order_id=client_order_id,
             side=approval.intent.side,
@@ -143,6 +153,35 @@ class FakeBroker:
                 price=limit_price,
             )
         return client_order_id
+
+    def place_stop(self, approval: RiskApprovedStop) -> str:
+        self._spend(approval)
+        self._maybe_fail("place_stop")
+        self._stops += 1
+        client_order_id = f"kill-stop-{self._stops}"
+        self.orders[client_order_id] = OpenOrder(
+            client_order_id=client_order_id,
+            side=Side.SELL,
+            kind=OrderKind.STOP,
+            quantity=approval.quantity,
+            price=approval.stop_price,
+        )
+        self.events.append(("place_stop", client_order_id, approval.quantity, approval.stop_price))
+        return client_order_id
+
+    def trigger_stops(self) -> None:
+        """The price falls through every stop: each working STOP SELL fills in full."""
+        for client_order_id, order in list(self.orders.items()):
+            if order.kind is OrderKind.STOP and order.side is Side.SELL:
+                del self.orders[client_order_id]
+                self.move(-order.quantity)
+
+    def fill_sells(self) -> None:
+        """Every working SELL LIMIT fills in full."""
+        for client_order_id, order in list(self.orders.items()):
+            if order.kind is OrderKind.LIMIT and order.side is Side.SELL:
+                del self.orders[client_order_id]
+                self.move(-order.quantity)
 
     # --- helpers -----------------------------------------------------------------------------
 

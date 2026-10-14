@@ -195,10 +195,10 @@ def test_a_missing_stop_is_re_placed_and_kills_after_5_minutes() -> None:
             True,
         ),
         (SHARES, (open_order("s", Side.SELL, OrderKind.STOP, 500, 90.0),), False),
-        (SHARES, (open_order("x", Side.SELL, OrderKind.LIMIT, SHARES, 99.0),), False),
+        (SHARES, (open_order("x", Side.SELL, OrderKind.LIMIT, 500, 99.0),), False),
         (0, (), True),
     ],
-    ids=["one stop", "two stops", "half covered", "a limit is no stop", "flat"],
+    ids=["one stop", "two stops", "half covered", "half an exit", "flat"],
 )
 def test_a_stop_covers_the_position_only_with_stop_sells_for_every_share(
     position: int, orders: tuple[OpenOrder, ...], covered: bool
@@ -206,6 +206,103 @@ def test_a_stop_covers_the_position_only_with_stop_sells_for_every_share(
     report = Watch().tick(100.0, position=position, orders=orders, cash=EQUITY - position * 100.0)
     assert report.stop_covered is covered
     assert report.replace_stop is not covered
+    assert not report.exit_covered
+
+
+# --- B9c: a working exit counts as cover, for 5 minutes (C5, your call of 2026-10-14) -----------
+
+EXIT = open_order("x-1", Side.SELL, OrderKind.LIMIT, SHARES, 99.9)
+RED = pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+
+
+@RED
+@pytest.mark.spec("SPEC§10", "ARCH§16")
+def test_a_limit_is_no_stop_but_a_working_exit_for_every_share_covers() -> None:
+    # Before B9c this case read "a limit is no stop" and asked to re-place the stop; the
+    # owner's C5 call makes a risk-approved exit for the full position count as cover.
+    report = Watch().tick(100.0, orders=(EXIT,))
+    assert report.stop_covered is False  # a limit is still no stop ...
+    assert report.exit_covered  # ... but the exit covers every share
+    assert not report.replace_stop
+    assert report.stop_missing_since is None
+    assert report.kill == ()
+
+
+@RED
+@pytest.mark.spec("SPEC§10", "ARCH§16")
+def test_an_exit_with_a_stop_covering_the_rest_covers() -> None:
+    orders = (
+        open_order("x-1", Side.SELL, OrderKind.LIMIT, 400, 99.9),
+        open_order("s", Side.SELL, OrderKind.STOP, 600, 90.0),
+    )
+    report = Watch().tick(100.0, orders=orders)
+    assert report.exit_covered
+    assert not report.replace_stop
+
+
+@pytest.mark.spec("SPEC§10", "ARCH§16", "ARCH§8.1")
+def test_an_exit_the_engine_doesnt_know_is_no_cover() -> None:
+    w = Watch()
+    now = w.desk.clock.now()
+    report = w.monitor.tick(
+        MinuteInput(
+            price=100.0,
+            price_at=now,
+            cash=0.0,
+            snapshot=BrokerSnapshot(
+                taken_at=now, position=SHARES, equity=EQUITY, open_orders=(EXIT,)
+            ),
+            book=InternalBook(position=SHARES, open_orders=()),
+        )
+    )
+    assert not report.exit_covered
+    assert report.replace_stop
+    assert KillTrigger.RECONCILIATION in report.kill
+
+
+@RED
+@pytest.mark.spec("SPEC§10", "ARCH§16", "ARCH§8.3")
+def test_an_exit_still_working_after_5_minutes_fires_the_stop_missing_kill() -> None:
+    w = Watch()
+    start = w.desk.clock.now()
+    first = w.tick(100.0, orders=(EXIT,))
+    assert (first.exit_covered, first.exit_since, first.kill) == (True, start, ())
+    w.advance(299)
+    assert w.tick(100.0, orders=(EXIT,)).kill == ()
+    # A re-quote is a new order: the clock runs from the first exit, not this one.
+    requote = open_order("x-2", Side.SELL, OrderKind.LIMIT, SHARES, 99.9)
+    w.advance(1)
+    late = w.tick(100.0, orders=(requote,))
+    assert late.kill == (KillTrigger.STOP_MISSING,)
+    assert late.exit_since == start
+    assert not late.replace_stop
+    w.advance(60)
+    covered = w.tick(100.0)  # a stop over every share ends the spell
+    assert covered.stop_covered
+    assert not covered.exit_covered
+    assert (covered.exit_since, covered.stop_missing_s, covered.kill) == (None, None, ())
+
+
+@RED
+@pytest.mark.spec("SPEC§10", "ARCH§16")
+def test_the_stop_missing_clock_pauses_while_an_exit_works() -> None:
+    w = Watch()
+    bare = w.tick(100.0, orders=())
+    assert (bare.replace_stop, bare.stop_missing_s) == (True, 0.0)
+    w.advance(120)
+    paused = w.tick(100.0, orders=(EXIT,))  # 120 s bare, then the exit goes out
+    assert not paused.replace_stop
+    assert paused.stop_missing_s == 120.0
+    w.advance(100)
+    assert w.tick(100.0, orders=(EXIT,)).stop_missing_s == 120.0  # paused
+    resumed = w.tick(100.0, orders=())  # the exit was cancelled: bare again
+    assert (resumed.replace_stop, resumed.stop_missing_s, resumed.kill) == (True, 120.0, ())
+    w.advance(179)
+    assert w.tick(100.0, orders=()).kill == ()
+    w.advance(1)
+    fired = w.tick(100.0, orders=())
+    assert fired.stop_missing_s == 300.0
+    assert fired.kill == (KillTrigger.STOP_MISSING,)
 
 
 # --- B9b review ------------------------------------------------------------------------------------

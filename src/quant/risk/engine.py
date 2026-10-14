@@ -295,7 +295,65 @@ class RiskApprovedFlatten(_Approved):
         return f"RiskApprovedFlatten({self.approval_id}, {self.symbol})"
 
 
-Approval = RiskApprovedOrder | RiskApprovedCancel | RiskApprovedFlatten
+@final
+class RiskApprovedStop(_Approved):
+    """Leave to place one broker-side stop-market SELL of `quantity` shares of `symbol` at
+    `stop_price` (spec §10's protective stop; your call of 2026-10-14). It only reduces risk,
+    so the engine issues it halted or not, but only for shares no other SELL already covers, so
+    it can never take the position short, and only below the current bid.
+
+    - `quantity`: shares the stop sells when it triggers;
+    - `stop_price`: the trigger price, below the bid the engine was shown;
+    - `expires_at`: the snapshot behind it goes stale then (`snapshot_max_age_s` after it was
+      taken), and `spend` refuses it from then on;
+    - `reason`: why it was asked for, in plain words.
+
+    The constructor raises ApprovalError unless `token` is this module's private token.
+    """
+
+    __slots__ = ("expires_at", "quantity", "reason", "stop_price", "symbol")
+
+    symbol: str
+    quantity: int
+    stop_price: float
+    expires_at: datetime
+    reason: str
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        approval_id: str,
+        symbol: str,
+        quantity: int,
+        stop_price: float,
+        reason: str,
+        issued_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        _initialize(
+            self,
+            token,
+            {
+                "approval_id": approval_id,
+                "symbol": symbol,
+                "quantity": quantity,
+                "stop_price": stop_price,
+                "reason": reason,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+            },
+        )
+
+    def __repr__(self) -> str:
+        """`RiskApprovedStop(<approval_id>, SELL <quantity> stop <stop_price>, until <expires_at>)`."""
+        return (
+            f"RiskApprovedStop({self.approval_id}, SELL {self.quantity} stop {self.stop_price}, "
+            f"until {self.expires_at})"
+        )
+
+
+Approval = RiskApprovedOrder | RiskApprovedCancel | RiskApprovedFlatten | RiskApprovedStop
 
 
 # --- verdicts and context -------------------------------------------------------------------------
@@ -516,6 +574,12 @@ class RiskEngine:
     def state(self) -> RiskState:
         """The current state, as an immutable snapshot."""
         return self._state
+
+    @property
+    def unsaved(self) -> Exception | None:
+        """The exception from the latest failed `on_change` while the state in memory is newer
+        than the last one saved; None once a save succeeds (class docstring, C7)."""
+        raise NotImplementedError("B9c: RiskEngine.unsaved")
 
     def start_session(self, day: date, *, equity: float) -> None:
         """Begin session `day` with start-of-day equity `equity`: the peak becomes the larger of
@@ -777,6 +841,38 @@ class RiskEngine:
             )
             self._issued[approval] = _Issued(_approval_fields(approval))
         return approval
+
+    def approve_stop(
+        self,
+        snapshot: BrokerSnapshot,
+        quote: Quote,
+        *,
+        quantity: int,
+        stop_price: float,
+        reason: str,
+    ) -> RiskApprovedStop:
+        """A registered approval to place one broker-side stop-market SELL of `quantity` shares
+        at `stop_price` (your call of 2026-10-14), issued halted or not, since a stop only
+        reduces risk. The kill executor leaves one when it can't finish (quant.risk.kill), and
+        execution (B13) places the protective stop with one.
+
+        ApprovalError, changing nothing, unless:
+
+        - `snapshot` is no older than `snapshot_max_age_s` and not from the future, and `quote`
+          no older than `quote_max_age_s`, not from the future and not crossed;
+        - `quantity` is a whole number of at least 1, and `stop_price` is finite, positive and
+          below `quote.bid` (in decimal values; exactly the bid is refused);
+        - `quantity` is at most the shares no other SELL covers: `snapshot.position`, minus
+          every working SELL order on the snapshot (LIMIT and STOP), minus the SELLs and stops
+          spent at or after `snapshot.taken_at` (the snapshot can't show them yet), minus every
+          outstanding SELL and stop approval. So a stop never sells a share another SELL may
+          also sell, and never takes the position short.
+
+        The approval expires `snapshot_max_age_s` after `snapshot.taken_at`, when the snapshot
+        behind it would no longer pass check 2. Until it is spent, revoked or expires it
+        reserves its shares like an outstanding SELL; once spent it counts as in flight until
+        a snapshot taken after the spend can show it. A stop never counts as a submission."""
+        raise NotImplementedError("B9c: RiskEngine.approve_stop")
 
     def release(self, approval: RiskApprovedOrder) -> None:
         """Give up `approval` unsent: execution calls this when it drops an approved order

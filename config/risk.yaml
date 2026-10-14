@@ -45,3 +45,4 @@ kill:
   crash_loop_window_s: 600.0  # ... within this many seconds are a crash loop (C2)
   flatten_incomplete_s: 600.0 # a rule-6 flatten still incomplete after this (C2)
   stop_missing_s: 300.0       # a position with no covering broker-side stop for this long
+  stop_distance_bp: 100.0     # a kill that can't finish leaves a stop this far below the bid

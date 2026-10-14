@@ -30,6 +30,7 @@ from quant.core.orders import (
 )
 from quant.core.schedule import Decision, decision_schedule
 from quant.risk.engine import (
+    RiskApprovedStop,
     RiskContext,
     RiskEngine,
     RiskState,
@@ -156,6 +157,34 @@ class Desk:
 
     def check(self, intent: OrderIntent, **kwargs: Any) -> RiskVerdict:
         return self.engine.check(intent, self.ctx(**kwargs))
+
+    def stop(
+        self,
+        quantity: int = 300,
+        *,
+        stop_price: float = STOP,
+        position: int = 300,
+        open_orders: tuple[OpenOrder, ...] = (),
+        snapshot_age: timedelta = timedelta(0),
+        quote_age: timedelta = timedelta(0),
+        bid: float = PRICE,
+        ask: float = PRICE,
+        reason: str = "protect",
+    ) -> RiskApprovedStop:
+        """`RiskEngine.approve_stop` on a snapshot and a quote read now (B9c)."""
+        now = self.clock.now()
+        return self.engine.approve_stop(
+            BrokerSnapshot(
+                taken_at=now - snapshot_age,
+                position=position,
+                equity=EQUITY,
+                open_orders=open_orders,
+            ),
+            Quote(bid=bid, ask=ask, at=now - quote_age),
+            quantity=quantity,
+            stop_price=stop_price,
+            reason=reason,
+        )
 
 
 def desk(
