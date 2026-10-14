@@ -2,6 +2,24 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## Docs · Jev shadow advisor (approved 2026-10-13)
+
+You approved the plan on 2026-10-11 and the doc changes on 2026-10-13 ("approve Jev shadow"). Jev, TypeSafe AI's typed-decision model, joins as a shadow advisor: it is logged next to the HMM, scored only on forward paper bars, and never affects a decision or an order. No code changed.
+
+- **SPEC v1.3 → v1.4:** layer L1s and invariant I7 (§1), the new §12a (the three questions, the bundle, forward-only scoring, late and missing, and the promotion test, fixed now), and a known risk for Jev's unchecked vendor claims (§16).
+- **ARCHITECTURE v1.5 → v1.6:** AD7, the `shadow/` package and rule K7 (§3), the `quant-shadow` and ingest jobs and the shadow secret (§2), `shadow.db` (§9.1), the spool, outbox and ingest (§11.1), the I7 and K7 tests (§13), the outage row (§16), §17 narrowed to "any LLM that can affect a decision", and the spike's questions (§18).
+- **PLAN v1.1 → v1.2:** step B20 (§1 and §4), after B19, size M. It depends on B14, B16 and B17.
+- **CLAUDE.md** now names SPEC v1.4, ARCHITECTURE v1.6 and PLAN v1.2.
+- **New ids:** I7, K7, AD7, SPEC§12a, and step B20.
+- **Your calls on 2026-10-13 ("approve"):** the promotion test has two looks, fixed now: at 500 scored bars, and at 1,000 only if the first fails, each at p < 0.025 (Bonferroni). After a second failure Jev is never proposed. The ingest stamp is `received_at`, not `asked_at`, because it is taken when the answer is read.
+- **Tests:** two gate tests used `K7` as their example of an id that doesn't exist. Now that K7 is defined, they use `ZZ999`, which is too long to collide with a future doc id. Neither test is weaker: each still plants an unknown id and expects the gate to catch it.
+
+**Open items**
+
+- The spike (`spikes/jev_probe.py`) waits for your TypeSafe key in `.env`.
+- `.importlinter` is unchanged. B20's red commit adds K7 and puts `quant.shadow` in K1–K4, since a contract on a missing module would break the gate.
+- quant-check's trace reads only numbered sections, so B20 teaches it lettered ones such as `SPEC§12a` before a test can name that id.
+
 ## B3 · Features and the scaler (done 2026-10-06, tag `b03-done`)
 
 **Built**

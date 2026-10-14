@@ -1,7 +1,7 @@
 # PLAN — SPY Regime Trader
 
-**Status:** APPROVED v1.1 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does.
-**Builds on:** [SPEC.md](SPEC.md) v1.2 (v1.1 plus this plan's C11–C17) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.4 (v1.0 aligned with this plan, plus notes from B0 and B2), all approved 2026-10-05
+**Status:** APPROVED v1.2 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does. v1.2 adds step B20, Jev as a shadow advisor (SPEC v1.4 §12a, ARCHITECTURE v1.6), which you approved on 2026-10-13 (§0, §0.3, §1, §4).
+**Builds on:** [SPEC.md](SPEC.md) v1.4 (v1.1 plus this plan's C11–C17, B3's reading of §3 and the Jev shadow advisor) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.6 (v1.0 aligned with this plan, notes from B0, B2 and B10, and the Jev shadow advisor), approved 2026-10-05 and amended since; the shadow advisor was approved 2026-10-13
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The build started 2026-10-05 with B0. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -9,7 +9,7 @@ The build started 2026-10-05 with B0. Progress is in [BUILD_LOG.md](BUILD_LOG.md
 
 ## 0. What you approved
 
-This plan turns the architecture into an ordered build: 19 steps (B0–B18) in seven milestones, plus one step (B19) that waits until it's needed. For every step it lists the tests written first, the spec and architecture IDs they enforce, and what "done" means. It also fixes the seed strategy, r1, before anyone looks at the data, and it names the five checkpoints where I stop for you.
+This plan turns the architecture into an ordered build: 19 steps (B0–B18) in seven milestones, plus one step (B19) that waits until it's needed and one add-on (B20, the Jev shadow advisor, v1.2). For every step it lists the tests written first, the spec and architecture IDs they enforce, and what "done" means. It also fixes the seed strategy, r1, before anyone looks at the data, and it names the five checkpoints where I stop for you.
 
 Four ideas carry the plan:
 
@@ -61,6 +61,7 @@ Writing the plan surfaced seven more questions that the code has to answer. They
 | CP2 | Read the first honest look and reply | 10 min |
 | CP3 | Agree to seal the lockbox and start paper. The trading account must be flat with no open orders; resetting the paper account does that. Keep the Mac awake and on power during market hours. | 5 min |
 | B17 | Read and run one sudo script, which creates `_quantllm`, `/opt/quant-llm` and the L1 spool folders. Then put your Anthropic API key in `/opt/quant-llm/.env.llm` yourself. | 15 min |
+| By B20 | A TypeSafe AI API key, in `.env` for the spike and then in `/opt/quant-llm/.env.shadow` for the job. Add it yourself; don't paste it into the chat. Then run the updated sudo script once more, which adds the shadow spool folders (v1.2). | 5 min |
 | CP4, CP5 | Read the report and reply | 10 min each |
 | Ship phase | A VPS: Ubuntu 24.04, 4 vCPU, 8 GB of RAM | later |
 
@@ -100,6 +101,8 @@ If something isn't ready when I reach the step that needs it, I continue with th
 | B18 | systemd units, hardening, `adopt-account` | Backups restore bit for bit | M | **CP5** |
 | **Deferred** | | | | |
 | B19 | Go-live gate: checklist, lockbox test | (P9) | M | when a candidate clears G1–G6 |
+| **Add-ons** | | | | |
+| B20 | Jev shadow advisor: spool, quant-shadow, ingest, evening scoring (v1.2) | I7 and K7; a late answer is never scored; nothing on the decision path reads Jev | M | TypeSafe key |
 
 **Sizes:** S is a small module set and M a focused subsystem. L covers several subsystems and is split into sub-steps (B4a, B4b, …), each with its own red and green commits.
 
@@ -522,6 +525,38 @@ If r1 fails the gates at CP2, as spec §0 expects, the build continues as planne
   - the April 2025 replay;
   - the parity report over C17's evidence window;
   - the "WHAT COULD BLOW UP THIS ACCOUNT?" review.
+
+### Add-ons
+
+#### B20 · Jev shadow (M)
+
+Added in v1.2. Jev answers three questions about the next bar, and its answers are logged and scored next to the HMM's. It never affects a decision (SPEC §12a, ARCHITECTURE §11.1).
+
+- **Needs you:** a TypeSafe AI API key, and one more run of the sudo setup script for the shadow spool folders (§0.3).
+- **Depends on:** B14 (decision records and the live loop), B16 (the daily report) and B17 (`_quantllm`, the spool, outbox and ingest pattern).
+- **Spike first:** `spikes/jev_probe.py` answers ARCHITECTURE §18's Jev questions and records them in VERIFY.md. It sends synthetic bundles only, never DEV or lockbox bars.
+- **Builds:**
+  - the shadow bundle schema in `core`, and the engine's spool write after the DecisionRecord is persisted, only in paper trading inside FORWARD;
+  - `quant.shadow`:
+    - the TypeSafe client, on plain `httpx` if TypeSafe documents an HTTP API (AD5);
+    - the `quant-shadow` job, run as `_quantllm` with only `TYPESAFE_API_KEY`, which goes through `register_secret`;
+    - the strict answer schema and the ingest into `var/shadow.db`, with `late` and `missing`;
+  - scoring in `eval/`: Brier score and log-loss for `next_up` and `next_stress`, the HMM's forecasts of the same events, `next_label` accuracy against the A4 label, and the Diebold–Mariano test;
+  - one line in the daily report, with the late and missing counts;
+  - import rules: contract K7, `quant.shadow` in K1–K4, a contract that keeps `research` and the harness from importing it, and the `shadow.db` scan;
+  - quant-check's trace learns lettered sections, so tests can name `SPEC§12a`;
+  - the launchd units, and the shadow spool folders in the sudo setup script.
+- **Red tests first:**
+  - I7 and K7 catch planted violations in a copy of the repo: `decide` importing `quant.shadow`, `shadow` importing `risk`, and `research` naming `shadow.db`;
+  - the answer schema (hypothesis) rejects a `Noul` outside [0, 1], an unknown `Choice`, extra keys and an oversized outbox file;
+  - a late answer is never scored, and an outage or an invalid answer is `missing` and never a health event;
+  - golden Brier, log-loss and Diebold–Mariano values on fixed fixtures;
+  - the bundle holds no secret, date or ticker, and backtests and replays write no bundle;
+  - the shadow job's environment holds only `TYPESAFE_API_KEY`;
+  - the fast tier stays offline, with a fake Jev client fed from recorded fixtures. A `jev` marker runs the real API by hand.
+- **No T-NL1 layer:** B20 stays off the decision path, and I7 proves it.
+- **Covers:** spec §1 (L1s), §12a and §16; I6, I7; AD4, AD5, AD7; K7.
+- **Done when:** green, plus one real paper session end to end: bundle → Jev → outbox → ingest → evening score → daily report line. The promotion test (SPEC §12a) comes much later, after 500 scored bars, and passing it only allows a proposal.
 
 ## 5. Seed release r1 and the feature menu
 
