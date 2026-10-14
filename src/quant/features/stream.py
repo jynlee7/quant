@@ -581,10 +581,13 @@ def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar:
 
 def freeze_arrays(instance: object, *names: str) -> None:
     """Replace each named array attribute of a frozen dataclass with a read-only copy, from its
-    `__post_init__`, so writing to one raises ValueError and the caller's array stays its own."""
+    `__post_init__`, so writing to one raises ValueError and the caller's array stays its own.
+
+    The copy is a view of an immutable `bytes` object, so its WRITEABLE flag can't be set back
+    to True either (a copy that owned its memory could be)."""
     for name in names:
-        frozen = getattr(instance, name).copy()
-        frozen.flags.writeable = False
+        values = np.ascontiguousarray(getattr(instance, name))
+        frozen = np.frombuffer(values.tobytes(), dtype=values.dtype).reshape(values.shape)
         object.__setattr__(instance, name, frozen)
 
 

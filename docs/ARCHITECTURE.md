@@ -1,7 +1,7 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.6 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). v1.6 adds Jev as a shadow advisor (SPEC v1.4 §12a): decision AD7, the `shadow/` package and rule K7, the quant-shadow job, its spool and ingest, its tests and failure mode, a narrower §17, and the spike's questions (§0.1, §2, §3, §9.1, §11, §13, §16–§18). You approved it on 2026-10-13. Each change is tagged where it lands.
-**Builds on:** [SPEC.md](SPEC.md) v1.4, which is v1.0 plus this document's C1–C10, the plan's C11–C17, B3's reading of §3 (v1.3) and the Jev shadow advisor (v1.4)
+**Status:** APPROVED v1.8 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). v1.6 adds Jev as a shadow advisor (SPEC v1.4 §12a): decision AD7, the `shadow/` package and rule K7, the quant-shadow job, its spool and ingest, its tests and failure mode, a narrower §17, and the spike's questions (§0.1, §2, §3, §9.1, §11, §13, §16–§18). You approved it on 2026-10-13. v1.7 is held for B9's risk engine write-up, which lands with B9's merge. v1.8 records how B4 trains: single-threaded BLAS in the pool's workers, which failures a restart may absorb, candidates set aside, and what meta.json records for drift and determinism (§7.1, §7.2, §7.5, §14; 2026-10-14). Each change is tagged where it lands.
+**Builds on:** [SPEC.md](SPEC.md) v1.6, which is v1.0 plus this document's C1–C10, the plan's C11–C17, B3's reading of §3 (v1.3), the Jev shadow advisor (v1.4) and B4's reading of §4–§6 (v1.6)
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -268,13 +268,18 @@ On half days the calendar shifts everything earlier. With a 13:00 close, decisio
 - `hmm.train` is the only module that imports hmmlearn, and it calls only `fit`. All densities and probabilities used afterwards come from our own numpy/scipy code reading the stored parameters.
 - The 50 restarts run in parallel processes, each single-threaded, with seeds `base_seed + i`. One restart starts from the previous model's parameters. The winner is the highest training log-likelihood, with ties broken by seed index.
 - Selection over K × covariance (spec §4) runs only for the first model and for a gated HMM-config change.
+- The pool's workers are spawned with `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` set to 1 in their environment, whatever the caller's says, because Apple's Accelerate reads only its variable, at load, and threadpoolctl can't limit it. Each worker receives the rows once, through the pool's initializer, and a task is just a block and a restart index (v1.8).
+- A restart is set aside only for an expected fit failure (ModelError or ValueError, numpy's LinAlgError included), and is listed in `meta.json`. Any other exception is a bug and stops training. Every seed `base_seed + i` lies in numpy's range [0, 2³² − 1], checked in the config (v1.8).
+- A candidate whose restarts all fail, on either fit, is set aside and listed in the report. Selection fails only when no candidate is left (v1.8).
+- The 0.1% instability band is taken of the standardized rows' log-likelihood, so feature units can't move it. The warning names its fit, full window or validation, and the table records both fits' stability (v1.8).
+- A refit (`train_candidate`) also fits its validation block, so every model records its own drift baseline (§7.5). A state with no filtered mass has no label, so such a refit is refused as the sanity reject it is (v1.8).
 
 ### 7.2 Model artifacts
 
 Each model is an immutable directory, `artifacts/models/<sha256>/`:
 
 - `params.npz`: start probabilities, transition matrix, means, full covariances, scaler;
-- `meta.json`: fit window, data hash, feature-config hash, HMM config, seeds and per-restart log-likelihoods, the label table with v and d, sanity checks, the validation block's predictive log-likelihood distribution, the code commit, the lockfile hash, and library and BLAS versions.
+- `meta.json`: fit window, data hash, feature-config hash, HMM config, seeds and per-restart log-likelihoods, the label table with v and d, sanity checks, the validation block's predictive log-likelihood distribution and drift baseline (§7.5), the code commit, the lockfile hash, library versions, the platform (system, release, machine), and the BLAS and LAPACK builds numpy and scipy were compiled against (v1.8).
 
 No pickles: they are unsafe to load and break across library versions.
 
@@ -296,7 +301,7 @@ The backtest calls this same job at the same simulated times.
 
 ### 7.5 Live drift
 
-The engine tracks the 35-bar rolling mean of the predictive log-likelihood. When it falls below the 1st percentile stored in the model's `meta.json`, entries freeze and you get an alert.
+The engine tracks the 35-bar rolling mean of the predictive log-likelihood. When it falls below the 1st percentile stored in the model's `meta.json`, entries freeze and you get an alert. That percentile, `validation.drift.threshold`, is the linear 1st percentile of the means of every full 35-bar window of the validation block's log-likelihoods, each mean an exactly rounded sum over 35. Both sides are raw-row densities, so it needs no rescaling to the live model's scaler (v1.8).
 
 ## 8. Orders, risk and the kill switch
 
@@ -472,7 +477,7 @@ The test suite has six other layers:
 ## 14. Determinism
 
 - `uv.lock` pins every dependency with hashes, and the Python 3.12 patch version is pinned too.
-- The engine, backtest and harness set single-threaded BLAS (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` all set to 1) and `PYTHONHASHSEED=0` before importing numpy. Parallelism happens only across separate processes.
+- The engine, backtest and harness set single-threaded BLAS (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` all set to 1) and `PYTHONHASHSEED=0` before importing numpy. Parallelism happens only across separate processes. The training pool sets the four thread variables in its workers' environment itself, so a refit is single-threaded in its workers even when its caller isn't (v1.8).
 - All arithmetic is float64, hashing uses canonical JSON, and every seed is explicit.
 - Every artifact and DecisionRecord records the code commit, the lockfile hash, the platform and the BLAS build.
 - The paper track record counts toward go-live only for decisions made from a clean, tagged commit.
