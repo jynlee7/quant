@@ -17,11 +17,11 @@ from quant.core.ids import decision_id
 from quant.core.orders import (
     SYMBOL,
     BrokerSnapshot,
-    Label,
     OrderIntent,
     Quote,
     Side,
 )
+from quant.core.regime import Label
 
 TAU = datetime(2018, 3, 6, 15, 46, tzinfo=UTC)  # 10:46 ET
 

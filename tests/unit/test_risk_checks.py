@@ -16,7 +16,8 @@ import pytest
 
 from quant.core.canonical import sha256_hex
 from quant.core.errors import ApprovalError, RiskError
-from quant.core.orders import Label, OrderKind, Side, TradingMode
+from quant.core.orders import OrderKind, Side, TradingMode
+from quant.core.regime import Label
 from quant.risk.engine import (
     CHECK_ORDER,
     MarkOutcome,

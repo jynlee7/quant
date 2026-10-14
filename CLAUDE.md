@@ -1,6 +1,6 @@
 # CLAUDE.md: SPY Regime Trader
 
-This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.2, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.4 and [docs/PLAN.md](docs/PLAN.md) v1.1. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
+This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.6, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.8 and [docs/PLAN.md](docs/PLAN.md) v1.3. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
 
 ## Start every session here
 
@@ -30,7 +30,7 @@ Hooks and services call `.venv/bin/...` directly, never `uv run`, because uv liv
 4. A step that touches the decision path adds its layer to the T-NL1 truncation harness before it is done.
 5. **Review:** an independent code review of the step's diff (the code-review skill), checked against the step's ids. Fix every finding, or write it down in BUILD_LOG.md with a reason.
 6. **No silent deviations:** if code must differ from SPEC, ARCHITECTURE or PLAN, change the doc in the same merge, with a minor version and a BUILD_LOG note. Changing an approved decision needs the user first.
-7. **Done:** `git merge --no-ff` to `main`, tag `bNN-done`, and add a BUILD_LOG.md entry: built, tests, run times, deviations, open items.
+7. **Done:** push the branch and open a PR to `main` on `origin` (private, github.com/jynlee7/quant), `git merge --no-ff` locally (the hook runs the full gate), push `main` (GitHub marks the PR merged), tag `bNN-done` and push the tag, and add a BUILD_LOG.md entry: built, tests, run times, deviations, open items.
 
 ## When to stop for the user (P6)
 

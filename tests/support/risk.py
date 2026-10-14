@@ -20,7 +20,6 @@ from quant.core.ids import decision_id
 from quant.core.orders import (
     BrokerSnapshot,
     InternalBook,
-    Label,
     OpenOrder,
     OrderIntent,
     OrderKind,
@@ -28,6 +27,7 @@ from quant.core.orders import (
     Side,
     TradingMode,
 )
+from quant.core.regime import Label
 from quant.core.schedule import Decision, decision_schedule
 from quant.risk.engine import (
     RiskApprovedStop,

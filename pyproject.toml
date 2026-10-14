@@ -20,6 +20,7 @@ dependencies = [
     "scipy",
     "statsmodels",
     "structlog",
+    "threadpoolctl>=3.7",  # single-threaded BLAS for the training pool (B4b)
     "typer",
     "uvicorn",
 ]

@@ -119,10 +119,10 @@ def test_a_test_naming_no_spec_id_fails_the_gate(planted: PlantedRepo) -> None:
 def test_an_unknown_spec_id_fails_the_gate(planted: PlantedRepo) -> None:
     planted.write(
         "tests/test_planted.py",
-        'import pytest\n\n\n@pytest.mark.spec("K7")\ndef test_k7() -> None:\n    pass\n',
+        'import pytest\n\n\n@pytest.mark.spec("ZZ999")\ndef test_zz999() -> None:\n    pass\n',
     )
     result = planted.run_gate("--only", "tests")
-    assert result.caught("trace", "tests/test_planted.py::test_k7"), result.explain()
+    assert result.caught("trace", "tests/test_planted.py::test_zz999"), result.explain()
 
 
 @pytest.mark.spec("P2")

@@ -1,6 +1,6 @@
 # SPEC — SPY Regime Trader
 
-**Status:** APPROVED v1.5 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). v1.5 says that a resume after the kill switch re-bases peak equity to the equity at the resume, so the next 10% drawdown is measured from there (§10); you decided it on 2026-10-13. v1.5 also records your calls of 2026-10-14: a kill that can't finish leaves a broker-side stop under the shares it couldn't sell, a kill outside regular hours places one under any shares no stop covers, and a working exit for the whole position stands in for the stop for at most 5 minutes (§10). Each one is tagged where it lands.
+**Status:** APPROVED v1.6 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). v1.4 adds Jev, TypeSafe AI's typed-decision model, as a shadow advisor that is logged next to the HMM, scored only on forward paper bars and never affects a decision: layer L1s and invariant I7 (§1), §12a, and a known risk (§16). You approved it on 2026-10-13. v1.5 says that a resume after the kill switch re-bases peak equity to the equity at the resume, so the next 10% drawdown is measured from there (§10); you decided it on 2026-10-13. v1.5 also records your calls of 2026-10-14: a kill that can't finish leaves a broker-side stop under the shares it couldn't sell, a kill outside regular hours places one under any shares no stop covers, and a working exit for the whole position stands in for the stop for at most 5 minutes (§10). v1.6 spells out how B4 reads §4–§6: instability measured on the standardized rows, candidates whose restarts all fail set aside, inclusive sanity edges, the drift baseline every model records, and the filter's log-likelihood, missing bars, absorbing labels and entropy (2026-10-14). Each one is tagged where it lands.
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The spec, the architecture and the [plan](PLAN.md) are approved, and the build started 2026-10-05. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -56,6 +56,7 @@ When we reach setup, you will add your keys to `.env` yourself. I'll create `.en
 |---|---|---|---|
 | **L1 Opus 5.5** | Nightly, as a separate process and Unix user, with only `ANTHROPIC_API_KEY` in its environment | Propose features (from a tested menu), playbooks, strategy.md edits and HMM configs; audit fit reports; review sessions | Hold broker keys; place or cancel orders; read or write risk limits; grade or promote its own proposals; run inside the trading loop |
 | **L2 HMM** | Every candle | Emit filtered state probabilities, next-bar state probabilities, entropy and predictive log-likelihood | See a future candle; decide or size anything |
+| **L1s Jev shadow** (v1.4) | Every decision bar, after the decision is recorded, as a separate process under L1's Unix user, with only `TYPESAFE_API_KEY` in its environment | Answer three fixed questions about the next bar (§12a); have its answers logged and scored against the HMM's | Hold broker keys; place or cancel orders; read risk limits or the databases; affect any decision, size or order; be called on a backtest, a replay, DEV or the lockbox |
 | **L3 Code** | Every candle, at all times | Own thresholds, switching, sizing, risk vetoes, every order, the kill switch, and promotions through the gates | Be overridden by L1 or L2 output |
 
 Each invariant is enforced by a test that fails the build:
@@ -68,6 +69,7 @@ Each invariant is enforced by a test that fails the build:
 | I4 | Every order passes the risk engine | The broker adapter accepts only a `RiskApprovedOrder`, and only the risk engine can construct one |
 | I5 | The live endpoint is unreachable unless the go-live gate passes | Adapter constructor test |
 | I6 | Secrets never appear in code, logs, the database or LLM prompts | Secret scan plus a test of the redacting log filter |
+| I7 | No decision-path module, and neither `research` nor `harness`, imports `quant.shadow` or reads `shadow.db` (v1.4) | Import-graph test (ARCHITECTURE K7) plus a scan for the `shadow.db` path |
 
 ---
 
@@ -107,9 +109,9 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
 
 - `hmmlearn.GaussianHMM` on Python 3.12, because hmmlearn 0.3.3 ships no wheels for your default Python 3.14.
 - **Candidates:** K ∈ {2, 3, 4, 5} × covariance ∈ {diag, full}.
-- **Restarts:** 50 per candidate, with seeds `base_seed + i` and `base_seed` fixed in config. The run with the highest training log-likelihood wins. A warning fires if fewer than 3 restarts land within 0.1% of the best, which signals an unstable optimum.
-- **Selection:** each candidate gets two scores: BIC on the fit window, and mean one-step-ahead predictive log-likelihood on a validation block. The validation block is the last 12 months of the fit window, with the model fit on the rest. "Close" means within 10 BIC points, or within one standard error of the best validation log-likelihood (session-block bootstrap). The pick is the simplest candidate that is close to the best on both scores. If no candidate is, the pick is the simpler of the two winners. The chosen candidate is then refit on the full window.
-- **Sanity rejects:** a candidate is rejected if any state has under 2% occupancy, an expected duration under 2 bars, or a covariance condition number above 10⁶.
+- **Restarts:** 50 per candidate, with seeds `base_seed + i` and `base_seed` fixed in config. The run with the highest training log-likelihood wins. A warning fires if fewer than 3 restarts land within 0.1% of the best, which signals an unstable optimum. The 0.1% is taken of the best log-likelihood of the *standardized* rows, so the features' units can't change it (v1.6).
+- **Selection:** each candidate gets two scores: BIC on the fit window, and mean one-step-ahead predictive log-likelihood on a validation block. The validation block is the last 12 months of the fit window, with the model fit on the rest. "Close" means within 10 BIC points, or within one standard error of the best validation log-likelihood (session-block bootstrap). The pick is the simplest candidate that is close to the best on both scores. If no candidate is, the pick is the simpler of the two winners. The chosen candidate is then refit on the full window. A candidate whose restarts all fail, on either fit, is set aside like a rejected one and listed in the report; selection fails only when no candidate is left (v1.6).
+- **Sanity rejects:** a candidate is rejected if any state has under 2% occupancy, an expected duration under 2 bars, or a covariance condition number above 10⁶. Each edge is inclusive and compared on the decimal values of the numbers: exactly 2%, exactly 2 bars or exactly 10⁶ passes (v1.6).
 - **Report for every model version:** the transition matrix. For each state: annualized mean return and volatility, expected duration `1 / (1 − a_kk)` in bars and in sessions, occupancy and label. Plus the BIC and validation log-likelihood table for every candidate.
 - **Auto-labels:** the thresholds are fixed in config before any out-of-sample run. Define `v = σ_state / σ_all` and `d = μ_state / σ_state`, both annualized and computed from raw returns weighted by filtered probability over the fit window. Rules are checked in order:
 
@@ -131,7 +133,7 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
   - a matched state's expected duration changes by more than 50%;
   - a matched state's mean moves more than 0.5 units on any feature, measured in the previous model's standardized units;
   - a matched state's rule-derived label differs from the label it inherited;
-  - in live trading, the 35-bar rolling mean of the predictive log-likelihood falls below the 1st percentile of its distribution on the validation block.
+  - in live trading, the 35-bar rolling mean of the predictive log-likelihood falls below the 1st percentile of its distribution on the validation block. That distribution is the means of every full 35-bar window of the block's log-likelihoods under the validation fit (§4). Every model records its own, a refit included, which fits its validation block for this alone. Both sides are densities of the raw rows, so the two models' scalers need no reconciling (v1.6).
 - **Failed refit:** a refit that fails a drift check is stored but not activated. The current model keeps running, with entries frozen (C5).
 - **Unfreeze:** either the next refit passes every check, or you acknowledge the drift manually (logged). The backtest simulates only the first path.
 - **Versioning:** every model, playbook and strategy.md is an immutable version behind a `current` pointer. Rollback is one command. Refits, promotions and rollbacks take effect at the next session open, never mid-session. An urgent rollback is the kill switch, then the rollback, then a resume (C7).
@@ -140,6 +142,11 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
 
 - **Our own forward filter**, in log space and normalized: `p_t ∝ b(x_t) ⊙ (p_{t−1} A)`. Emission log-densities are computed with scipy from the model's means and covariances, not from hmmlearn internals.
 - **Outputs on every bar:** filtered state and label probabilities; next-bar probabilities `q_t = p_t A`; normalized label entropy `H_t ∈ [0, 1]`; the predictive log-likelihood `log p(x_t | x_{<t})`; and the expected remaining duration of the active label.
+- **Clarifications (v1.6):**
+  1. The predictive log-likelihood is the density of the raw row, so it includes the scaler's Jacobian, −Σ log std.
+  2. A missing or NaN bar is absent from the filter: no transition is taken for it, and rule 6 handles the decision.
+  3. A model with a reachable label it can never leave, other than a label covering every state, is a model error when its filter is built.
+  4. Entropy is normalized by ln(the number of labels in the model).
 - **Model swap:** a new model's filter is initialized by running it over its own fit window up to the swap time, so it only ever sees past data.
 - **What hmmlearn does:** `predict_proba` and `score_samples` return *smoothed* posteriors, and `predict` and `decode` return Viterbi paths. All four are banned from the decision path (I2). Smoothed posteriors exist only in `eval/`, for calibration and for the nightly review of wrong state calls. EM training uses forward-backward internally, but only on the fit window; that is estimation on past data, not a decision.
 
@@ -253,6 +260,36 @@ The winner is written to `strategy.md` along with its config hash, model version
 - **Harness:** each proposal adds an entry to the trial ledger, then runs a full walk-forward on the development period and gates G1–G6. If it passes and beats the current champion, it is queued for your approval (D12). Beating the champion means a higher out-of-sample Sharpe after costs on the development period; a champion that fails any gate is beaten by any candidate that passes all six (C9). Once approved, it is promoted as a new version that can be rolled back.
 - **Model:** `claude-opus-5-5` via the Anthropic API. With the server-side refusal fallback on, another model may answer on a night Opus declines, and each proposal records which model wrote it (AD6).
 
+## 12a. Shadow advisor (Jev) (v1.4)
+
+Jev is TypeSafe AI's typed-decision model. It takes a text state and named, typed questions, and returns typed answers in one pass. Here it runs as a shadow: its answers are logged next to the HMM's and scored, and nothing on the way to a decision, a size or an order reads them (I7). Its vendor claims are unchecked (§16), so B20's spike checks them first.
+
+- **When:** every decision bar of paper trading (the FORWARD segment), after the engine has recorded the decision. Backtests, replays, DEV and the lockbox never call Jev. A cloud model has probably seen that market history in training, so a score there would quietly use the future, and its answers may not repeat run to run.
+- **Questions:** one call per bar, with three questions.
+
+  | Name | Type | Question |
+  |---|---|---|
+  | `next_label` | `Choice` of CALM_UP, CHOP, STRESS, CRASH | The next bar's regime label |
+  | `next_up` | `Noul`, a probability in [0, 1] | The next bar's return (F1) is above 0 |
+  | `next_stress` | `Noul` | The next bar is STRESS or CRASH |
+
+- **The bundle** holds only features F1–F5 at τ, the filtered and next-bar label probabilities, the entropy, the active playbook and the position fraction. It holds no dates or times, no ticker and no secrets, and a secret scan must pass before it is written.
+- **Answers** are checked against a strict schema. Extra keys, a `Noul` outside [0, 1], a label outside the four, or an answer over the size cap make the answer `missing`.
+- **Late and missing:** an answer that arrives at or after the next bar's `available_at` is `late`. It is stored and never scored. An outage, a timeout or a rejected answer is `missing`. Neither is an engine health event; the daily report counts both.
+- **Scoring** runs each evening in `eval/`, the only place smoothing runs:
+  - the Brier score and log-loss of `next_up` and `next_stress` against what happened. Log-loss clips probabilities to [1e-6, 1 − 1e-6];
+  - the HMM's forecasts of the same events, scored the same way on the same bars. P(next F1 > 0) comes from its Gaussian mixture weighted by the next-bar state probabilities, and P(next bar is STRESS or CRASH) from the next-bar label probabilities;
+  - `next_label` accuracy. The outcome of `next_label` and `next_stress` is the A4 smoothed label;
+  - one line in the daily report, with the counts of late and missing answers.
+
+  A bar is scored once, on the evening its outcome is known, and its score is never revised.
+- **Promotion test**, fixed now, before any data exists. Jev may be **proposed** as an input only when all three hold:
+  1. the test runs at one of its two looks, fixed now: at 500 scored forward bars, and once more at 1,000 only if the first look fails. It never runs at any other time, and after a second failure Jev is never proposed;
+  2. a one-sided Diebold–Mariano test on the per-bar `next_stress` Brier differences (Jev minus HMM), over the bars where both are scored, with a Newey–West standard error, finds Jev's Brier score lower at p < 0.025. That is 0.05 split across the two looks (Bonferroni), so repeated looks can't manufacture a pass;
+  3. Jev's late-or-missing rate is under 2% of the bars it was asked about.
+
+  Passing allows only a proposal. Adopting it is a separate approval from you, with a spec change. An adopted input could only cut risk: it could lower the size multiplier, never raise it and never open a position. Its responses would be recorded as decision inputs, so replays stay exact.
+
 ## 13. Dashboard, alerts and reports
 
 - **Dashboard:** a local web app. It is read-only apart from the kill and approve buttons. It shows:
@@ -303,6 +340,7 @@ The checklist ends with a section titled **WHAT COULD BLOW UP THIS ACCOUNT?** An
 | Pattern-day-trader rules on small live accounts | Check before going live |
 | You loosen limits under pressure | Changing `risk.yaml` needs a restart and a commit, and sends an alert |
 | Keys leak | `.env` only, log redaction, and keys are never pasted into chat |
+| Jev's vendor claims (calibration, latency, determinism, data retention) come from secondary blogs and haven't been checked (v1.4) | Shadow only (I7); B20's spike checks the claims first and records them in VERIFY.md; promotion needs its own forward evidence and your approval (§12a) |
 
 ## 17. Build process: how "done" is defined
 

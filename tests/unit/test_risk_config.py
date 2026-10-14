@@ -14,7 +14,7 @@ import pydantic
 import pytest
 
 from quant.core.errors import ConfigError
-from quant.core.orders import Label
+from quant.core.regime import Label
 from quant.risk.limits import (
     RISK_YAML,
     RiskConfig,
@@ -51,7 +51,12 @@ def test_the_committed_file_holds_the_spec_section_10_limits() -> None:
     data = COMMITTED_FILE.read_bytes()
     limits = load_risk_config(COMMITTED_FILE, committed=data)
     assert limits.max_gross_exposure == 1.0
-    assert [limits.label_caps.cap(label) for label in Label] == [1.0, 0.5, 0.25, 0.0]
+    assert {label: limits.label_caps.cap(label) for label in Label} == {
+        Label.CALM_UP: 1.0,
+        Label.CHOP: 0.5,
+        Label.STRESS: 0.25,
+        Label.CRASH: 0.0,
+    }
     assert limits.uncertain_cap == 0.0
     assert limits.overnight_cap == 0.5
     assert limits.single_order_cap == 0.5

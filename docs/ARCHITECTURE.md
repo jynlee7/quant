@@ -1,7 +1,7 @@
 # ARCHITECTURE — SPY Regime Trader
 
-**Status:** APPROVED v1.7 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). v1.7 records how B9 built the risk engine: the checks' precondition, how approvals hold exposure until they are spent, how intents and submissions are counted, how halts are signalled, persisted and resumed, that a resume re-bases the peak, and that discretionary exits keep the ±10 bp collar while only kill-switch exits widen (§4.4, §8.1–§8.3; your calls of 2026-10-13). It also records that the broker port lives in `risk/`, and how B9b built the kill executor, reconciliation and the minute monitor (§3, §8.3). Still v1.7, it records your calls of 2026-10-14: the kill settings approved as proposed, a fourth approved type `RiskApprovedStop` that a kill unable to finish leaves under the bare shares, risk-reducing approvals issued even when the risk state can't be saved, and a working exit counting as the stop for at most 5 minutes (§3, §4.4, §8.1, §8.3, §16). Still v1.7, it records your answers to B9c's open calls and the B9c review: `kill.stop_distance_bp` 100 approved, an outside-hours kill that queues its exit also places a stop under shares no stop covers, a kill that is ending waits for its cancels before it sizes the stop, a halt waiting for its save holds SELL orders back, and a spent flatten frees no share of an older snapshot (§8.1, §8.3, §16). Each change is tagged where it lands.
-**Builds on:** [SPEC.md](SPEC.md) v1.2, which is v1.0 plus this document's C1–C10 and the plan's C11–C17
+**Status:** APPROVED v1.8 (Gate 2 of 3) · 2026-10-05. v1.0 was approved as written: decisions AD1–AD6 confirmed and clarifications C1–C10 accepted, and C1–C10 are now part of SPEC.md. v1.1 aligns this document with the approved plan: clarifications C11 and C14, the test tiers (P4) and spikes (P11). v1.2 records how B0 built the gate (§13), v1.3 how B2 resolves the view's knowledge time (§6.2), and v1.4 how B2 stamps that time, flags moves against stored minutes, and lets calibration read forward data (§6.1–§6.3). v1.5 records how B10's tickets bind the walk-forward, that the segment starts are fixed in code, and what the ledger's chain can't catch (§4.4, §6.3, §10). v1.6 adds Jev as a shadow advisor (SPEC v1.4 §12a): decision AD7, the `shadow/` package and rule K7, the quant-shadow job, its spool and ingest, its tests and failure mode, a narrower §17, and the spike's questions (§0.1, §2, §3, §9.1, §11, §13, §16–§18). You approved it on 2026-10-13. v1.7 records how B9 built the risk engine: the checks' precondition, how approvals hold exposure until they are spent, how intents and submissions are counted, how halts are signalled, persisted and resumed, that a resume re-bases the peak, and that discretionary exits keep the ±10 bp collar while only kill-switch exits widen (§4.4, §8.1–§8.3; your calls of 2026-10-13). It also records that the broker port lives in `risk/`, and how B9b built the kill executor, reconciliation and the minute monitor (§3, §8.3). Still v1.7, it records your calls of 2026-10-14: the kill settings approved as proposed, a fourth approved type `RiskApprovedStop` that a kill unable to finish leaves under the bare shares, risk-reducing approvals issued even when the risk state can't be saved, and a working exit counting as the stop for at most 5 minutes (§3, §4.4, §8.1, §8.3, §16). Still v1.7, it records your answers to B9c's open calls and the B9c review: `kill.stop_distance_bp` 100 approved, an outside-hours kill that queues its exit also places a stop under shares no stop covers, a kill that is ending waits for its cancels before it sizes the stop, a halt waiting for its save holds SELL orders back, and a spent flatten frees no share of an older snapshot (§8.1, §8.3, §16). v1.8 records how B4 trains: single-threaded BLAS in the pool's workers, which failures a restart may absorb, candidates set aside, and what meta.json records for drift and determinism (§7.1, §7.2, §7.5, §14; 2026-10-14). Each change is tagged where it lands.
+**Builds on:** [SPEC.md](SPEC.md) v1.6, which is v1.0 plus this document's C1–C10, the plan's C11–C17, B3's reading of §3 (v1.3), the Jev shadow advisor (v1.4) and B4's reading of §4–§6 (v1.6)
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The [plan](PLAN.md) was approved 2026-10-05 and the build has started. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -34,6 +34,7 @@ Four ideas carry the design:
 | AD4 | L1 on this Mac | A hidden role user, `_quantllm`, created once with `sudo`, runs L1 under launchd. It gets its own group, not `staff`. Your home folder is mode 750 with group `staff`, so this user can't read the repo, `.env` or `risk.yaml`. (Checked: macOS role accounts aren't members of `staff`.) | The spec's separate-user rule holds from day one. The alternative is no nightly loop until the VPS. |
 | AD5 | Stack | Python 3.12 via uv (not installed yet; uv fetches it) · alpaca-py · hmmlearn 0.3.3 · numpy, scipy · exchange_calendars · pydantic 2 · statsmodels (Newey–West) · scikit-learn (isotonic regression only) · FastAPI with SSE, HTMX and uPlot (vendored, no Node build) · typer · structlog · httpx · anthropic · pytest, hypothesis · import-linter · ruff · mypy · gitleaks | Mainstream, open source and pinned by `uv.lock`. Nothing closed-source runs near the keys. |
 | AD6 | The L1 request | One streaming request a night to `claude-opus-5-5`, with effort `high`, JSON-schema structured output and no tools. Anthropic's server-side refusal fallback is **on**: if Opus declines, another model answers, and the proposal records which model wrote it. Cost is about $0.30–0.75 a night. | Every proposal faces the same gates, whichever model wrote it. With the fallback off, a night when Opus declines produces no proposals. |
+| AD7 | Shadow advisor (v1.6) | Jev (SPEC §12a) reuses L1's isolation (AD4). The `quant-shadow` job runs as `_quantllm` with only `TYPESAFE_API_KEY`, reads a per-bar bundle from a spool and writes its answer to an outbox. An ingest job, as quant, validates the answer and writes `var/shadow.db`. That is a sixth scheduled job beside AD1's five and a fifth SQLite file beside AD2's four. The code, `quant.shadow`, imports only `core` (K7), and nothing on the decision path, in `research` or in the harness imports it or reads `shadow.db` (I7). | The L1 pattern already keeps a cloud model away from keys, limits and orders, so reusing it adds no new trust boundary. A shadow can't touch P&L, so it can be scored honestly on forward bars before anyone relies on it. |
 
 ### 0.2 Spec clarifications (accepted 2026-10-05)
 
@@ -77,11 +78,13 @@ Processes communicate only through SQLite tables and the two L1 spool directorie
 
 | Unit | Runs | User | Secrets it receives | Writes | Network |
 |---|---|---|---|---|---|
-| `quant-engine` | always; restarted on exit; 90 s watchdog | quant | trading-account Alpaca keys | market.db, ops.db, alerts and approval requests in control.db | Alpaca data and broker |
+| `quant-engine` | always; restarted on exit; 90 s watchdog | quant | trading-account Alpaca keys | market.db, ops.db, alerts and approval requests in control.db, the shadow spool (v1.6) | Alpaca data and broker |
 | `quant-control` | always; restarted on exit | quant | trading-account Alpaca keys (used only to cancel and close), Telegram token | control.db | Alpaca broker, Telegram |
 | `quant-dashboard` | always; restarted on exit | quant | none | commands and approvals in control.db | 127.0.0.1 only |
 | `quant-evening` | 16:20 and 17:00 ET on trading days | quant | none | ops.db, artifacts, L1 inbox, alerts in control.db | none |
 | `quant-nightly` | 18:00 ET on trading days | quant-llm | Anthropic key only | L1 outbox | Anthropic API |
+| `quant-shadow` | each decision bar, started when a bundle lands in the shadow spool (v1.6) | quant-llm | TypeSafe key only (`TYPESAFE_API_KEY`) | shadow outbox | TypeSafe API |
+| `quant-shadow-ingest` | started when an answer lands in the shadow outbox (v1.6) | quant | none | shadow.db | none |
 | `quant-harness` | from 18:30 ET until done; stops at 09:00 | quant | none | research.db, artifacts, `journal/losses.md`, approval queue and alerts in control.db | none |
 | `quant-backup` | 02:00 ET daily | quant | none | backups | optional copy off the box |
 | `quant-itest` | Wednesdays 12:00 ET, and on demand | quant | test-account Alpaca keys | test results in ops.db | Alpaca broker (test account) |
@@ -93,10 +96,12 @@ On the Mac, "quant" is your own login and "quant-llm" is `_quantllm`. The engine
 | Code | this repo; L1 runs from its own install in `/opt/quant-llm` | `/opt/quant/app` (git checkout) and `/opt/quant/venv` | both users, except `config/` |
 | Engine secrets | `.env` in the repo, gitignored, mode 600 | `/etc/quant/engine.env`, root, 600, injected by systemd | engine and control only |
 | L1 secret | `/opt/quant-llm/.env.llm`, 600 | `/etc/quant/llm.env`, root, 600 | L1 only |
+| Shadow secret (v1.6) | `/opt/quant-llm/.env.shadow`, 600 | `/etc/quant/shadow.env`, root, 600 | quant-shadow only; L1 never loads it |
 | Test-account secrets | `.env.test`, 600 | `/etc/quant/test.env`, root, 600 | itest only |
 | `config/` (`risk.yaml`, `gates.yaml`, …) | in the repo, committed | in the checkout, 750 root:quant | quant only, never L1 |
 | Databases, artifacts, journal | `var/` in the repo, gitignored | `/var/lib/quant`, 700 | quant only |
 | L1 inbox and outbox | `/Users/Shared/quant-l1/` | `/var/lib/quant-l1/` | inbox: quant writes, L1 reads · outbox: L1 writes, quant reads |
+| Shadow spool and outbox (v1.6) | `/Users/Shared/quant-shadow/` | `/var/lib/quant-shadow/` | spool: engine writes, quant-shadow reads · outbox: quant-shadow writes, ingest reads |
 
 ## 3. Code layout and structural rules
 
@@ -128,6 +133,7 @@ quant/
     research/   gates G1–G6, baselines, deflated Sharpe, trial ledger
     harness/    proposal intake and validation, trial runs, approval queue, promotion
     llm/        L1: bundle reader, prompt, Anthropic client, output schema
+    shadow/     Jev shadow: TypeSafe client, answer schema, ingest, shadow.db   (v1.6; created by B20)
     control/    Telegram, kill service, alert sender
     dashboard/  FastAPI app, SSE, templates, vendored JS
     golive/     checklist validation, parity replay, lockbox test
@@ -136,7 +142,7 @@ quant/
   tests/      unit · property · invariants · golden · sim · integration
 ```
 
-Each rule below is a test in the build gate. import-linter checks K1–K4, and small AST scans check K5 and K6.
+Each rule below is a test in the build gate. import-linter checks K1–K4 and K7, and small AST scans check K5 and K6.
 
 | ID | Rule | Enforces |
 |---|---|---|
@@ -146,6 +152,9 @@ Each rule below is a test in the build gate. import-linter checks K1–K4, and s
 | K4 | Only `engine`, `control` and `cli` import the Alpaca broker adapter | Research, the dashboard and L1 can't trade |
 | K5 | `RiskApprovedOrder`, `RiskApprovedCancel`, `RiskApprovedFlatten` and `RiskApprovedStop` are constructed only in `risk.engine`, and `TrialTicket` only in `research.ledger` | I4 and A2 (scan plus a runtime token, §4.4) |
 | K6 | `datetime.now` and `time.time` appear only in `core.clock` | I1: "now" always comes from the Clock port |
+| K7 | `shadow` imports only `core` (v1.6) | AD7 and I7: like K2 for L1, the shadow job can't reach broker, risk, data, decision or engine code, and K3 keeps the decision path from reaching it |
+
+When B20 creates `quant.shadow`, it joins K1's and K2's forbidden lists, K3's forbidden list and K4's sources, and K7 becomes an import-linter contract, with a second contract that keeps `research` and the harness from importing it. Until then the package doesn't exist, and a contract on a missing module would break the gate (v1.6).
 
 ## 4. The decision core
 
@@ -260,13 +269,18 @@ On half days the calendar shifts everything earlier. With a 13:00 close, decisio
 - `hmm.train` is the only module that imports hmmlearn, and it calls only `fit`. All densities and probabilities used afterwards come from our own numpy/scipy code reading the stored parameters.
 - The 50 restarts run in parallel processes, each single-threaded, with seeds `base_seed + i`. One restart starts from the previous model's parameters. The winner is the highest training log-likelihood, with ties broken by seed index.
 - Selection over K × covariance (spec §4) runs only for the first model and for a gated HMM-config change.
+- The pool's workers are spawned with `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` set to 1 in their environment, whatever the caller's says, because Apple's Accelerate reads only its variable, at load, and threadpoolctl can't limit it. Each worker receives the rows once, through the pool's initializer, and a task is just a block and a restart index (v1.8).
+- A restart is set aside only for an expected fit failure (ModelError or ValueError, numpy's LinAlgError included), and is listed in `meta.json`. Any other exception is a bug and stops training. Every seed `base_seed + i` lies in numpy's range [0, 2³² − 1], checked in the config (v1.8).
+- A candidate whose restarts all fail, on either fit, is set aside and listed in the report. Selection fails only when no candidate is left (v1.8).
+- The 0.1% instability band is taken of the standardized rows' log-likelihood, so feature units can't move it. The warning names its fit, full window or validation, and the table records both fits' stability (v1.8).
+- A refit (`train_candidate`) also fits its validation block, so every model records its own drift baseline (§7.5). A state with no filtered mass has no label, so such a refit is refused as the sanity reject it is (v1.8).
 
 ### 7.2 Model artifacts
 
 Each model is an immutable directory, `artifacts/models/<sha256>/`:
 
 - `params.npz`: start probabilities, transition matrix, means, full covariances, scaler;
-- `meta.json`: fit window, data hash, feature-config hash, HMM config, seeds and per-restart log-likelihoods, the label table with v and d, sanity checks, the validation block's predictive log-likelihood distribution, the code commit, the lockfile hash, and library and BLAS versions.
+- `meta.json`: fit window, data hash, feature-config hash, HMM config, seeds and per-restart log-likelihoods, the label table with v and d, sanity checks, the validation block's predictive log-likelihood distribution and drift baseline (§7.5), the code commit, the lockfile hash, library versions, the platform (system, release, machine), and the BLAS and LAPACK builds numpy and scipy were compiled against (v1.8).
 
 No pickles: they are unsafe to load and break across library versions.
 
@@ -288,7 +302,7 @@ The backtest calls this same job at the same simulated times.
 
 ### 7.5 Live drift
 
-The engine tracks the 35-bar rolling mean of the predictive log-likelihood. When it falls below the 1st percentile stored in the model's `meta.json`, entries freeze and you get an alert.
+The engine tracks the 35-bar rolling mean of the predictive log-likelihood. When it falls below the 1st percentile stored in the model's `meta.json`, entries freeze and you get an alert. That percentile, `validation.drift.threshold`, is the linear 1st percentile of the means of every full 35-bar window of the validation block's log-likelihoods, each mean an exactly rounded sum over 35. Both sides are raw-row densities, so it needs no rescaling to the live model's scaler (v1.8).
 
 ## 8. Orders, risk and the kill switch
 
@@ -394,9 +408,10 @@ The dashboard binds to 127.0.0.1, rejects any other Host header (which blocks DN
 | `ops.db` | Decision records, state snapshots, orders, fills, equity marks, risk, health and drift events, pointers, job runs, integration-test runs | engine, evening jobs, itest |
 | `control.db` | HALTED flag, commands, approvals (promotions and live orders), alert outbox | dashboard, control, CLI, engine |
 | `research.db` | Trial ledger, proposals, gate runs, walk-forward results, fit-cache index | harness, research CLI |
+| `shadow.db` | Jev's answers, their status (`ok`, `late` or `missing`) and their scores; read only by `eval` scoring, the daily report and the dashboard (v1.6) | shadow ingest, evening jobs |
 | `artifacts/` | Models, releases, calibrations, reports; immutable and named by SHA-256 | evening jobs, harness |
 
-All four databases run in WAL mode. `ops.db` and `control.db` use `synchronous=FULL`, so a decision or a halt that has been recorded survives a power cut.
+All five databases run in WAL mode. `ops.db` and `control.db` use `synchronous=FULL`, so a decision or a halt that has been recorded survives a power cut.
 
 ### 9.2 Releases and pointers
 
@@ -454,6 +469,21 @@ Each proposed change is a structured edit, `{path, from, to}`, against the relea
 
 **Cost:** about 30–60k input tokens and 10–25k output tokens, thinking included, at $4 and $20 per million: $0.30–0.75 a night, under $20 a month. Prompt caching wouldn't help, because a cache entry lives at most an hour and the request runs once a night.
 
+### 11.1 Shadow advisor (v1.6)
+
+Jev (SPEC §12a, AD7) reuses this pattern once per decision bar instead of once a night.
+
+1. **Each decision bar, engine (quant):** after the DecisionRecord is persisted, the engine writes `spool/<τ>.json` as canonical JSON. This is a file write outside `decide()`, and the bundle schema lives in `core`, as L1's does, so the engine never imports `quant.shadow`. The bundle holds only features F1–F5, the filtered and next-bar label probabilities, the entropy, the active playbook and the position fraction. τ is in the file name, never in what Jev is sent; there is no ticker and no secret, and a secret scan must pass before the write. The engine writes it only in paper trading, inside FORWARD. Backtests and replays never write it. A failed write is logged and is never a health event.
+2. **quant-shadow (quant-llm):** reads only the spool and makes one call with the three questions. It writes `outbox/<τ>.json`, capped at 64 KB. It stops waiting at the next bar's `available_at`. On an outage, a timeout or a refusal it writes only an error record.
+3. **Ingest (quant):** starts when a file lands in the outbox.
+   - Re-validates the answer with strict pydantic models: unknown keys are rejected, each `Noul` must lie in [0, 1], `next_label` must be one of the four labels, and the 64 KB cap applies.
+   - Stamps `received_at` from the Clock as it reads the answer. The answer is `late` if `received_at` is at or after the next bar's `available_at`, and a late answer is never scored.
+   - Records an error record or an invalid answer as `missing`, with the reason. Neither is an engine health event.
+   - Writes one row per bar to `var/shadow.db`: τ, the bundle's and the answer's SHA-256, the status and the answers.
+4. **16:20, evening job (quant):** marks every bar of the day with no row as `missing`, then scores in `eval/` (SPEC §12a). The HMM's forecasts come from each DecisionRecord's filter output and the model it names. The daily report gets one line and the late and missing counts.
+
+**Cost:** a few hundred input tokens a bar at a quoted $0.042 per million, so well under a cent a month. The spike checks the real token count (§18).
+
 ## 12. Dashboard, alerts and reports
 
 - **Dashboard:** FastAPI serves server-rendered pages updated with HTMX, uPlot draws the charts, and SSE pushes changes. It reads all four databases read-only, polls `ops.db` every second, and writes only commands and approvals to `control.db`. It shows everything listed in spec §13.
@@ -469,9 +499,10 @@ Each proposed change is a structured edit, `{path, from, to}`, against the relea
 | I3 | Isolation | Rules K1 and K2 |
 | I4 | One choke point | Rule K5's scan, the runtime token, and adapter tests that reject plain objects, subclasses, and reused or expired approvals |
 | I5 | Paper lock | Adapter-constructor tests across every combination of mode, URL and checklist state |
-| I6 | No secrets leak | gitleaks, plus redaction tests over logs, database rows and the L1 bundle |
+| I6 | No secrets leak | gitleaks, plus redaction tests over logs, database rows, the L1 bundle and the shadow bundle (v1.6) |
 | T-NL2 | Provenance | Every DecisionRecord's model fit window and calibration as-of time precede τ |
 | T-NL3 | Filter ≠ smoother | On synthetic HMM data, interior points differ from hmmlearn's posteriors and the final point matches |
+| I7, K7 | Shadow stays out of decisions | Rules K3 and K7, a contract that `research` and the harness don't import `quant.shadow`, and a scan that fails if the decision path, `research` or the harness names `shadow.db`. Each is shown catching a planted violation in a copy of the repo, for example `decide` importing `quant.shadow` and `shadow` importing `risk` (v1.6). |
 | A2 | Lockbox | DataPolicy refuses to score LOCKBOX without a ticket, and the ledger chain verifies |
 | (none) | Determinism | Two backtest runs give identical record hashes, and so does a replay of recorded live inputs |
 
@@ -489,7 +520,7 @@ The test suite has six other layers:
 ## 14. Determinism
 
 - `uv.lock` pins every dependency with hashes, and the Python 3.12 patch version is pinned too.
-- The engine, backtest and harness set single-threaded BLAS (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` all set to 1) and `PYTHONHASHSEED=0` before importing numpy. Parallelism happens only across separate processes.
+- The engine, backtest and harness set single-threaded BLAS (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS` all set to 1) and `PYTHONHASHSEED=0` before importing numpy. Parallelism happens only across separate processes. The training pool sets the four thread variables in its workers' environment itself, so a refit is single-threaded in its workers even when its caller isn't (v1.8).
 - All arithmetic is float64, hashing uses canonical JSON, and every seed is explicit.
 - Every artifact and DecisionRecord records the code commit, the lockfile hash, the platform and the BLAS build.
 - The paper track record counts toward go-live only for decisions made from a clean, tagged commit.
@@ -531,6 +562,7 @@ The test suite has six other layers:
 | SPY splits | Corporate-actions feed | Halt and alert |
 | A refit fails sanity or drift | Refit job | Keep the current model; drift also freezes entries (C5); alert |
 | L1 refuses, times out or returns invalid JSON | Nightly job; harness validation | No proposals that night; logged and alerted |
+| Jev is down, slow or returns invalid output (v1.6) | quant-shadow; ingest validation; the 16:20 sweep | The bar is recorded `missing` or `late` and never scored; the daily report counts it. It is never a health event, and the engine doesn't notice. |
 | The harness is still running at 09:00 | Deadline | Stops and resumes the next night |
 | The Mac sleeps in market hours | Heartbeat gap | Treated as an engine outage (C6) |
 | A market-wide trading halt | No new minute bars | Rule 6; orders can't fill anyway, and the broker-side stop stays in place |
@@ -541,7 +573,7 @@ The test suite has six other layers:
 - Streaming bars for decisions. The engine polls at τ, which is exactly what the backtest models.
 - Short and leveraged code paths. Position targets are non-negative types.
 - Extended-hours orders.
-- Any LLM at runtime. L1's output is data that the harness checks.
+- Any LLM that can affect a decision. L1's output is data that the harness checks, and Jev runs only as a shadow that nothing on the decision path reads (SPEC §12a) (v1.6).
 - A multi-asset abstraction beyond a `symbol` setting.
 
 ## 18. To verify during setup
@@ -550,6 +582,11 @@ The test suite has six other layers:
 - Whether your Alpaca login can open a second paper account (AD3).
 - That SIP minute bars on your plan are served 15 minutes after the minute, so the 16-minute decision delay (D2) holds.
 - Alpaca's rate limits against the 1-million-bar backfill.
+- Jev, in B20's spike (`spikes/jev_probe.py`, findings in VERIFY.md) (v1.6):
+  - the real call shape, and whether TypeSafe documents a plain HTTP API, so the job can call it with `httpx` rather than a closed SDK near the key (AD5);
+  - whether 10 identical calls return identical answers;
+  - the latency, and the real input token count of one bundle;
+  - the key format, for a gitleaks rule, and TypeSafe's data-retention terms.
 
 ## 19. The plan
 

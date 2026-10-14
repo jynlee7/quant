@@ -23,18 +23,10 @@ from quant.core.clock import ensure_utc
 from quant.core.errors import ClockError
 from quant.core.ids import decision_id
 from quant.core.model import StrictModel
+from quant.core.regime import Label
 
 SYMBOL: Final = "SPY"
 """The one instrument (D1)."""
-
-
-class Label(StrEnum):
-    """The regime labels (spec §4, D8). Each has a hard cap in config/risk.yaml."""
-
-    CALM_UP = "CALM_UP"
-    CHOP = "CHOP"
-    STRESS = "STRESS"
-    CRASH = "CRASH"
 
 
 class Side(StrEnum):

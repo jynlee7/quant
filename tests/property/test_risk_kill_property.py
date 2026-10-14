@@ -30,7 +30,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from quant.core.errors import ApprovalError
-from quant.core.orders import Label, OpenOrder, OrderKind, Side, TradingMode
+from quant.core.orders import OpenOrder, OrderKind, Side, TradingMode
+from quant.core.regime import Label
 from quant.risk.engine import RiskApprovedOrder
 from quant.risk.kill import KillExecutor, KillRequest, KillStatus, MemoryKillLock
 from quant.risk.triggers import KillTrigger

@@ -2,6 +2,151 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B4 · HMM: train, select, filter, label (done 2026-10-14, tag `b04-done`)
+
+B4 was built in two halves on `b04-hmm`, in the worktree beside B9: B4a (the artifact, the filter, labels and the smoother) and B4b (training, selection and the sanity rejects). Claude agents wrote the reds and the review fixes, Codex wrote B4a's green, and B4b's green is Codex's work committed by the orchestrator after Codex hit its usage limit.
+
+**Built**
+
+- `hmm.model`: `HmmModel`, `GaussianParams`, `ScalerParams` and `TrainingRecord`.
+  - The artifact is a hand-written, byte-identical `params.npz`, loaded with `allow_pickle=False`, plus canonical `meta.json`. The hash covers the canonical meta and each array's dtype, shape and SHA-256, and −inf is stored as None.
+  - Models are immutable: training is re-parsed from canonical JSON, `TrainingRecord.info` is frozen all the way down, and `freeze_arrays` backs arrays with immutable bytes.
+  - `save_model` fsyncs each file, the staged directory and the root, holds a flock for the whole save, and clears what a crash left. A best restart other than the argmax of `restart_logliks` (ties to the lowest index) is refused.
+  - `ScalerParams.from_scaler` converts B3's Scaler with its STD_RTOL check. Every entry point takes `columns=` and refuses a mismatch.
+- `hmm.filter`: our forward pass, in log space.
+  - Densities come from each covariance's inverse Cholesky (`GaussianParams.whitening`), and emissions are centered on the bar's largest before the prior is added, so an outlier can't round the prior away.
+  - l_t carries the scaler's Jacobian, so it is the density of the raw row (SPEC §6).
+  - A missing or NaN row is absent, with no transition. `forward_pass(..., previous=)` continues a pass bit for bit. The state snapshots and restores.
+  - `FilterOutput.top_label` and `top_label_remaining` are the most probable label. `ForwardFilter.remaining(label)` gives any label's duration for the switching engine's active label.
+- `hmm.labels`: the rule table from v and d, label probabilities, entropy normalized by ln of the model's label count, and remaining duration w·(I−A_SS)⁻¹·1 over the states that leave the label. `Durations` refuses, when the filter is built, a model whose chain can reach from π a state that can never leave its label. A volatility within rounding residue of 0 is a ModelError.
+- `eval.smoother`: our forward-backward, for evaluation only. It reuses the forward pass's emissions and centers them the same way.
+- `hmm.select`, pure rules with no hmmlearn import:
+  - free-parameter counts and BIC;
+  - "simplest" means fewest free parameters, then fewer states, then diag before full;
+  - restart choice, with ties to the lowest index and the 0.1% instability band taken of the standardized rows' log-likelihood;
+  - the validation start and score;
+  - the session-block bootstrap SE;
+  - the sanity rejects, inclusive and compared as decimals after `math.fsum`;
+  - the close rules and the simpler-winner fallback;
+  - `drift_threshold`, the linear 1st percentile of the validation block's 35-bar rolling means.
+- `hmm.train`: the only hmmlearn import, and it calls only `fit` (I2).
+  - Restarts run in a spawn pool. Workers get the four BLAS thread variables set to 1 and get the rows once, through the initializer.
+  - Seeds are `base_seed + i` within numpy's range. Only ModelError or ValueError counts as a failed restart, and a candidate whose restarts all fail is set aside.
+  - The log-likelihood comes from our forward pass, and covariances are symmetrized exactly.
+  - `select_and_train` and `train_candidate` both fit the validation block, so every model records its validation distribution and drift baseline. `meta.json` names the platform and numpy's and scipy's BLAS and LAPACK builds.
+  - r1: `base_seed` 20160104, 50 restarts, K ∈ {2,3,4,5} × {diag, full}, n_iter 1000, tol 1e-2, min_covar 1e-3.
+- `core.regime.Label`, the regime labels.
+- `threadpoolctl` was added to the dependencies.
+
+**Tests:** 199 new (196 fast, 3 full), for 552 fast and 560 in all. Highlights:
+
+- **Recovery:** on 20,000 bars from a known 3-state HMM, training recovers the parameters up to a relabeling, for full and for diag covariances. Selection picks K = 3 and the generator's covariance type.
+- **Equivalence:** the filter matches loop references, and a continued pass matches one pass. The smoother isn't the filter (`test_filter_not_smoother`).
+- **Determinism:** the same seeds give the same hash, twice and pool against serial. Another seed gives other parameters, which a spy on `random_state` confirms.
+- **Rules at their edges:** each sanity reject alone and at its exact threshold, the close rules at their edges, restart ties, and the instability warning at exactly 0.1%.
+- **Leaks:** a spy checks byte for byte that the validation fit's scaler and EM rows exclude the validation block.
+- **I2:** training calls only `fit`, checked at runtime. An unpickling payload with a side effect never runs.
+- **Full tier:** `test_r1_selection_on_twenty_thousand_bars` runs r1's full 50-restart, 8-candidate selection.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| Fast gate | about 61 s (552 tests in 59 s) |
+| Full gate | 1,107 s (560 tests), with the B9 agent loading the machine |
+| One full r1 selection (50 restarts × 8 candidates, 20,000 bars) | about 516 s (Codex's measurement) |
+| Warming the filter over 20,000 bars (K = 5, d = 5) | 0.78 s, down from 2.83 s |
+
+**Review** (code-review skill and a Codex review in parallel, after each half's green). Each candidate was probed before a test was written.
+
+**B4a, round 1** (81da83d red, 42bf030 green):
+
+- R1: the prior was added before the emissions were centered, so a 1e9 row erased it.
+- R3: the smoother lost transition evidence under an outlier.
+- R2/C1: a label's duration solve went singular on an unreachable absorbing state, and a reachable closed label wasn't refused when the filter was built.
+- C2: a covariance that passed validation crashed scipy with a bare LinAlgError.
+- C3: `forward_pass` couldn't continue from earlier rows, which biased validation scores.
+- C4: l_t lacked the scaler's Jacobian.
+- R5: constant returns gave v = 337 from summation residue.
+- C12: warming over 20,000 bars took 2.8 s.
+
+**B4a, round 2** (61b4e4a red, 73695c6 green):
+
+- R4: a model's info and arrays could change after hashing.
+- C5: the scaler skipped STD_RTOL, and rows went in without their columns.
+- C7: `active_label` became `top_label`, so it can't be mistaken for the engine's.
+- C9: the unpickling test couldn't fail.
+- C10: saves weren't durable.
+- C11: nothing checked that the best restart was the argmax.
+
+**B4b** (0b4c471 red, b5b680f green):
+
+- R1/C7: one candidate whose restarts all failed aborted selection.
+- R2/C4: `threadpool_limits(1)` can't limit Accelerate, so the workers now set the variables.
+- R3: occupancy at exactly 2% was rejected by float residue.
+- R4: the seed tests couldn't see the seeds actually passed to `fit`.
+- C1: no test caught a validation leak.
+- C2, parts 1 and 2: the drift baseline wasn't derivable from meta.json, and refits recorded none.
+- C3: feature units moved the instability band.
+- C5: the platform and BLAS weren't recorded.
+- C6: out-of-range seeds and bugs silently dropped restarts.
+- C8: a zero-mass state is now an explicit sanity reject.
+- C9: validation-fit warnings were indistinguishable from full-window warnings.
+- C10: the rows were pickled once per task.
+
+Not fixed, with reasons:
+
+- **B4a C8. A bad row is absent from the filter, with no transition**, not a predict-only step. This matches how `compute_features` drops NaN rows and skips incomplete bars, so warm-up and live agree, and rule 6 handles the decision. SPEC v1.6 states it.
+- **B4a C6. Entropy is normalized by ln of the model's label count.** SPEC v1.6 states it.
+- **B4a C5, in part.** `Scaler` and `ScalerParams` stay separate types: the Scaler carries a window and a row count the artifact doesn't store, and it raises FeatureError.
+- **B4b C2, part 3, is not a defect.** l_t is the raw-row density on both sides, Jacobian included, so the baseline needs no rescaling to the live scaler. ARCHITECTURE §7.5 says so.
+- **B4b C8 raises rather than returning a failing report.** A zero-mass state can't be labeled, and a sanity reject keeps the current model (ARCHITECTURE §7.3). The TrainResult docstring says so.
+
+B4b's fixes weren't reviewed again. Each has its test, and the full gate passes.
+
+**Deviations** (documents updated in this merge)
+
+- SPEC v1.6 (v1.5 is held for B9's merge), §4–§6, with no approved decision changed:
+  - the instability band is measured on the standardized rows;
+  - candidates whose restarts all fail are set aside;
+  - the sanity edges are inclusive;
+  - every model records its drift baseline (the 35-bar rolling-mean percentile);
+  - l_t is the raw-row density, a missing bar is absent from the filter, and a reachable label the chain can never leave is a model error at build;
+  - entropy is normalized by ln of the label count.
+- ARCHITECTURE v1.8 (v1.7 is held for B9's merge), §7.1, §7.2, §7.5 and §14:
+  - the workers set single-threaded BLAS themselves;
+  - only ModelError and ValueError count as a failed restart;
+  - candidates can be set aside;
+  - meta.json records the drift baseline, the platform and the BLAS builds.
+- `choose_restart(..., jacobian=, fit=)` and `train_candidate` fitting its validation block (so its window needs more than 12 months) differ from the red stubs. No document names those signatures.
+
+**Open items**
+
+- **B9's merge** adopts `core.regime.Label` in place of its own `core.orders.Label`, and takes SPEC v1.5 and ARCHITECTURE v1.7 as reserved.
+- **B5:** T-NL1 covers B3's features and scaler, and B4's filter (CLAUDE.md rule 4).
+- **B7:** live drift computes rolling means as training does (full windows, each mean an fsum). ARCHITECTURE §7.1's "one restart starts from the previous model" is B7's.
+- **Cost:** a refit now runs 2 × 50 restarts, and one full selection takes about 9 minutes.
+- **BLAS:** the serial path uses whatever thread settings the caller had before importing numpy (ARCHITECTURE §14). The engine and harness must set them.
+- **Fast tier:** about 60 s of the 120 s budget. The B4 files take the largest share.
+
+## Docs · Jev shadow advisor (approved 2026-10-13)
+
+You approved the plan on 2026-10-11 and the doc changes on 2026-10-13 ("approve Jev shadow"). Jev, TypeSafe AI's typed-decision model, joins as a shadow advisor: it is logged next to the HMM, scored only on forward paper bars, and never affects a decision or an order. No code changed.
+
+- **SPEC v1.3 → v1.4:** layer L1s and invariant I7 (§1), the new §12a (the three questions, the bundle, forward-only scoring, late and missing, and the promotion test, fixed now), and a known risk for Jev's unchecked vendor claims (§16).
+- **ARCHITECTURE v1.5 → v1.6:** AD7, the `shadow/` package and rule K7 (§3), the `quant-shadow` and ingest jobs and the shadow secret (§2), `shadow.db` (§9.1), the spool, outbox and ingest (§11.1), the I7 and K7 tests (§13), the outage row (§16), §17 narrowed to "any LLM that can affect a decision", and the spike's questions (§18).
+- **PLAN v1.1 → v1.2:** step B20 (§1 and §4), after B19, size M. It depends on B14, B16 and B17.
+- **CLAUDE.md** now names SPEC v1.4, ARCHITECTURE v1.6 and PLAN v1.2.
+- **New ids:** I7, K7, AD7, SPEC§12a, and step B20.
+- **Your calls on 2026-10-13 ("approve"):** the promotion test has two looks, fixed now: at 500 scored bars, and at 1,000 only if the first fails, each at p < 0.025 (Bonferroni). After a second failure Jev is never proposed. The ingest stamp is `received_at`, not `asked_at`, because it is taken when the answer is read.
+- **Tests:** two gate tests used `K7` as their example of an id that doesn't exist. Now that K7 is defined, they use `ZZ999`, which is too long to collide with a future doc id. Neither test is weaker: each still plants an unknown id and expects the gate to catch it.
+
+**Open items**
+
+- The spike (`spikes/jev_probe.py`) waits for your TypeSafe key in `.env`.
+- `.importlinter` is unchanged. B20's red commit adds K7 and puts `quant.shadow` in K1–K4, since a contract on a missing module would break the gate.
+- quant-check's trace reads only numbered sections, so B20 teaches it lettered ones such as `SPEC§12a` before a test can name that id.
+
 ## B3 · Features and the scaler (done 2026-10-06, tag `b03-done`)
 
 **Built**

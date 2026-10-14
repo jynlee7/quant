@@ -18,7 +18,7 @@ from pydantic import Field, ValidationError, model_validator
 
 from quant.core.errors import ConfigError
 from quant.core.model import StrictModel
-from quant.core.orders import Label
+from quant.core.regime import Label
 
 RISK_YAML: Final = "config/risk.yaml"
 """Where the file lives, relative to the repository root."""

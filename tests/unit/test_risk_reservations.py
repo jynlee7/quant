@@ -21,7 +21,8 @@ from decimal import Decimal
 import pytest
 
 from quant.core.errors import ApprovalError
-from quant.core.orders import Label, Side, TradingMode
+from quant.core.orders import Side, TradingMode
+from quant.core.regime import Label
 from quant.risk.engine import PendingApproval, RiskApprovedOrder, RiskCheck, RiskVerdict, Veto
 from tests.support.risk import HALF_DAY, decisions, desk, intent, last_fillable
 
