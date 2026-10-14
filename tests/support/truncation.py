@@ -35,21 +35,45 @@ Everything here is synthetic, on the real NYSE calendar inside FIT (2016). DEV s
 
 from __future__ import annotations
 
+import math
+import random
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from dataclasses import asdict, dataclass
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
+from functools import cache, cached_property, lru_cache
+from itertools import pairwise
 from typing import Any, Final, Protocol
 
-from quant.core.schedule import Decision
+import numpy as np
+from structlog.testing import capture_logs
+
+from quant.core.calendar import TradingCalendar
+from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
+from quant.core.clock import SimClock
+from quant.core.epoch import from_us, to_us
+from quant.core.errors import FeatureError, ModelError
+from quant.core.orders import Side, TradingMode
+from quant.core.regime import Label
+from quant.core.schedule import Decision, decision_schedule
 from quant.data.frames import MinuteFrame
-from quant.data.market_db import BarStore
+from quant.data.market_db import HISTORY, BarStore
+from quant.data.policy import Purpose
 from quant.data.view import PointInTimeView
-from quant.features.menu import FeatureConfig
+from quant.features.menu import FeatureConfig, r1_features
 from quant.features.scaler import Scaler
+from quant.features.stream import FeatureStream, compute_features, features_for
+from quant.hmm.filter import ForwardFilter
+from quant.hmm.labels import r1_thresholds
 from quant.hmm.model import HmmModel
+from quant.hmm.select import Candidate
+from quant.hmm.train import TrainingData, r1_train_config, train_candidate
+from quant.risk.engine import MemorySpentApprovals, RiskApprovedOrder, RiskEngine, Veto
 from quant.risk.limits import RiskConfig
+from tests.support.bars import SYMBOL, revise_close, synthetic_days
+from tests.support.risk import config as risk_config
+from tests.support.risk import context, intent
 
 # --- the synthetic world ---------------------------------------------------------------------
 # Minutes from DATA_FIRST to DATA_LAST (tests.support.bars.synthetic_days, seed DATA_SEED). The
@@ -120,13 +144,25 @@ class Record:
         """`quant.core.canonical.sha256_hex` of {"tau", "layer", "output", "provenance": null or
         {"model", "fit_end"}, "state"}. Raises CanonicalJSONError for an output without a
         canonical form, which the harness reports as that layer's failure."""
-        raise NotImplementedError
+        return self._digest
+
+    @cached_property
+    def _digest(self) -> str:
+        return sha256_hex(
+            {
+                "tau": self.tau,
+                "layer": self.layer,
+                "output": self.output,
+                "provenance": None if self.provenance is None else asdict(self.provenance),
+                "state": self.state,
+            }
+        )
 
 
 def error_output(exc: Exception) -> dict[str, str]:
     """The output a layer records for a decision it refuses: {"error": the exception's class
     name, "message": str(exc)}."""
-    raise NotImplementedError
+    return {"error": type(exc).__name__, "message": str(exc)}
 
 
 # --- layers ----------------------------------------------------------------------------------
@@ -144,7 +180,7 @@ class Source:
 
     def view(self, tau: datetime) -> PointInTimeView:
         """`store.view(tau, as_of=tau)`: the data as the backtest sees it at `tau`."""
-        raise NotImplementedError
+        return self.store.view(tau, as_of=tau)
 
 
 class Layer(Protocol):
@@ -170,23 +206,29 @@ class Registry:
     swapped for a substitute of the same name, in the same place."""
 
     def __init__(self, layers: Iterable[Layer] = ()) -> None:
-        raise NotImplementedError
+        self._layers: dict[str, Layer] = {}
+        for layer in layers:
+            self.register(layer)
 
     def register(self, layer: Layer) -> None:
-        raise NotImplementedError
+        if layer.name in self._layers:
+            raise ValueError(f"duplicate layer {layer.name}")
+        self._layers[layer.name] = layer
 
     def replace(self, layer: Layer) -> Registry:
         """A new registry with the layer named `layer.name` swapped for `layer`. KeyError when
         no layer has that name."""
-        raise NotImplementedError
+        if layer.name not in self._layers:
+            raise KeyError(layer.name)
+        return Registry(layer if old.name == layer.name else old for old in self.layers)
 
     @property
     def layers(self) -> tuple[Layer, ...]:
-        raise NotImplementedError
+        return tuple(self._layers.values())
 
     @property
     def names(self) -> tuple[str, ...]:
-        raise NotImplementedError
+        return tuple(self._layers)
 
 
 class ViewLayer:
@@ -198,19 +240,50 @@ class ViewLayer:
 
     name: Final = "view"
 
+    def __init__(self) -> None:
+        self._records: dict[tuple[Any, ...], Record] = {}
+
     def run(
         self,
         source: Source,
         decisions: Sequence[Decision],
         upstream: Mapping[str, Sequence[Record]],
     ) -> list[Record]:
-        raise NotImplementedError
+        records = []
+        fields = (
+            "t_open",
+            "t_close",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "minutes",
+            "complete",
+            "available_at",
+        )
+        for d in decisions:
+            view = source.view(d.tau)
+            bars = view.hourly(SYMBOL, purpose=Purpose.OPERATE, last=VIEW_DEPTH)
+            values = tuple(tuple(getattr(bar, field) for field in fields) for bar in bars)
+            key = (d.tau, view.digest(), values)
+            if key not in self._records:
+                self._records[key] = Record(
+                    d.tau,
+                    self.name,
+                    {
+                        "bars": [dict(zip(fields, row, strict=True)) for row in values],
+                        "digest": key[1],
+                    },
+                )
+            records.append(self._records[key])
+        return records
 
 
 def features_output(raw: Any, scaled: Any) -> dict[str, list[float]]:
     """The features layer's output: {"raw": the feature vector, "scaled": it standardized},
     each a list of float64 in the config's column order."""
-    raise NotImplementedError
+    return {"raw": [float(x) for x in raw], "scaled": [float(x) for x in scaled]}
 
 
 class FeaturesLayer:
@@ -224,7 +297,8 @@ class FeaturesLayer:
     name: Final = "features"
 
     def __init__(self, config: FeatureConfig, scaler: Scaler) -> None:
-        raise NotImplementedError
+        self.config, self.scaler = config, scaler
+        self._records: dict[tuple[Any, ...], Record] = {}
 
     def run(
         self,
@@ -232,7 +306,24 @@ class FeaturesLayer:
         decisions: Sequence[Decision],
         upstream: Mapping[str, Sequence[Record]],
     ) -> list[Record]:
-        raise NotImplementedError
+        stream = FeatureStream(self.config)
+        records = []
+        for d in decisions:
+            output: dict[str, Any]
+            try:
+                raw = features_for(stream, source.view(d.tau), SYMBOL, d.bar)
+                output = features_output(
+                    raw, self.scaler.transform(raw, columns=self.config.columns)
+                )
+            except (FeatureError, ModelError) as exc:
+                output = error_output(exc)
+            state = _feature_state_hash(stream)
+            # Both vectors (or the complete error) and the actual state participate.
+            key = (d.tau, canonical_dumps(output), state)
+            if key not in self._records:
+                self._records[key] = Record(d.tau, self.name, output, state=state)
+            records.append(self._records[key])
+        return records
 
 
 class FilterLayer:
@@ -252,7 +343,7 @@ class FilterLayer:
     name: Final = "filter"
 
     def __init__(self, model: HmmModel, *, activation: datetime) -> None:
-        raise NotImplementedError
+        self.model, self.activation = model, activation
 
     def run(
         self,
@@ -260,7 +351,28 @@ class FilterLayer:
         decisions: Sequence[Decision],
         upstream: Mapping[str, Sequence[Record]],
     ) -> list[Record]:
-        raise NotImplementedError
+        filt = ForwardFilter(self.model)
+        provenance = Provenance(self.model.artifact_hash(), self.model.fit_end)
+        records = []
+        for d, feature in zip(decisions, upstream["features"], strict=True):
+            if d.tau < self.activation:
+                records.append(Record(d.tau, self.name, {"model": None}))
+                continue
+            output: object = feature.output
+            if "raw" in feature.output:
+                try:
+                    output = asdict(
+                        filt.step(
+                            np.array(feature.output["raw"], dtype=np.float64),
+                            columns=self.model.scaler.columns,
+                        )
+                    )
+                except (FeatureError, ModelError) as exc:
+                    output = error_output(exc)
+            records.append(
+                Record(d.tau, self.name, output, provenance, sha256_hex(filt.snapshot()))
+            )
+        return records
 
 
 class RiskLayer:
@@ -287,7 +399,7 @@ class RiskLayer:
     name: Final = "risk"
 
     def __init__(self, config: RiskConfig, *, seed: int) -> None:
-        raise NotImplementedError
+        self.config, self.seed = config, seed
 
     def run(
         self,
@@ -295,7 +407,61 @@ class RiskLayer:
         decisions: Sequence[Decision],
         upstream: Mapping[str, Sequence[Record]],
     ) -> list[Record]:
-        raise NotImplementedError
+        if not decisions:
+            return []
+        clock = SimClock(decisions[0].tau)
+        engine = RiskEngine(
+            self.config,
+            clock=clock,
+            mode=TradingMode.PAPER,
+            calendar=TradingCalendar.xnys(),
+            spent=MemorySpentApprovals(),
+        )
+        records = []
+        # Verdicts and RiskState are the compared outputs, not rendered diagnostic logs.
+        with capture_logs():
+            for d, view, filtered in zip(
+                decisions, upstream["view"], upstream["filter"], strict=True
+            ):
+                if not view.output["bars"]:
+                    records.append(Record(d.tau, self.name, {"skipped": "no bar"}))
+                    continue
+                price = view.output["bars"][-1]["close"]
+                clock.advance_to(d.executes_at + timedelta(seconds=1))
+                day = clock.now().date()
+                if engine.state.session is None or day > engine.state.session:
+                    engine.start_session(day, equity=RISK_EQUITY)
+                label = filtered.output.get("top_label")
+                order = _risk_intent(
+                    Side.SELL if d.reduce_only else Side.BUY,
+                    _risk_quantity(self.seed, d.tau),
+                    tau=d.tau,
+                    label=None if label is None else Label(label),
+                    reduce_only=d.reduce_only,
+                    stop=0.95 * price,
+                )
+                verdict = engine.check(
+                    order,
+                    context(clock.now(), equity=RISK_EQUITY, bid=price, ask=price, limit=price),
+                )
+                output: dict[str, Any] = {"intent": order.model_dump(mode="python")}
+                if isinstance(verdict, Veto):
+                    output.update(
+                        verdict="veto",
+                        check=verdict.check,
+                        reason=verdict.reason,
+                        halts=verdict.halts,
+                    )
+                else:
+                    output.update(
+                        verdict="approved" if isinstance(verdict, RiskApprovedOrder) else "pending"
+                    )
+                    for key in ("quantity", "limit_price", "notional", "issued_at", "expires_at"):
+                        output[key] = getattr(verdict, key)
+                    if isinstance(verdict, RiskApprovedOrder):
+                        output.update(flagged=verdict.flagged, halts=verdict.halts)
+                records.append(Record(d.tau, self.name, output, state=sha256_hex(engine.state)))
+        return records
 
 
 # --- the world -------------------------------------------------------------------------------
@@ -325,11 +491,36 @@ class World:
     edges: Mapping[str, Decision]
 
 
+@cache
 def world() -> World:
     """The shared World, built on first use and cached for the session."""
-    raise NotImplementedError
+    minutes, store = _history()
+    config = r1_features()
+    matrix = compute_features(
+        store.view(HORIZON, as_of=HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE), config
+    )
+    first = from_us(int(matrix.t_open[0]))
+    cal = TradingCalendar.xnys()
+    decisions = tuple(
+        d
+        for day in cal.sessions(first.date(), DATA_LAST)
+        for d in decision_schedule(cal, day)
+        if d.bar.t_open >= first
+    )
+    scaler = Scaler.fit(matrix, start=from_us(int(matrix.available_at[0])), end=MODEL_FIT_END)
+    return World(
+        minutes,
+        store._conn,
+        store,
+        config,
+        decisions,
+        fixture_model(MODEL_FIT_END),
+        scaler,
+        edge_cuts(decisions),
+    )
 
 
+@cache
 def fixture_model(fit_end: datetime) -> HmmModel:
     """A model fit on the full store's warm feature rows with available_at in [the first warm
     row's available_at, `fit_end`): `quant.hmm.train.train_candidate` on a TrainingData of
@@ -337,14 +528,53 @@ def fixture_model(fit_end: datetime) -> HmmModel:
     ordinals), K=FIXTURE_STATES FIXTURE_COVARIANCE, FIXTURE_RESTARTS restarts from
     FIXTURE_BASE_SEED, a one-month validation block, r1's label thresholds, workers=1. Cached
     per `fit_end`."""
-    raise NotImplementedError
+    _, store = _history()
+    config = r1_features()
+    bars = store.view(HORIZON, as_of=HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE)
+    matrix = compute_features(bars, config)
+    first = from_us(int(matrix.available_at[0]))
+    matrix = matrix.window(first, fit_end)
+    by_open = {
+        to_us(b.t_open): (math.log(b.close / previous.close), b.session.toordinal())
+        for previous, b in pairwise(bars)
+    }
+    data = TrainingData(
+        matrix,
+        np.array([by_open[int(t)][0] for t in matrix.t_open], dtype=np.float64),
+        np.array([by_open[int(t)][1] for t in matrix.t_open], dtype=np.int64),
+        first,
+        fit_end,
+        config.config_hash(),
+    )
+    config_train = r1_train_config().model_copy(
+        update={
+            "n_restarts": FIXTURE_RESTARTS,
+            "base_seed": FIXTURE_BASE_SEED,
+            "validation_months": 1,
+        }
+    )
+    return train_candidate(
+        data,
+        Candidate(n_states=FIXTURE_STATES, covariance_type=FIXTURE_COVARIANCE),
+        thresholds=r1_thresholds(),
+        config=config_train,
+        provenance={"source": "B5 synthetic"},
+        workers=1,
+    ).model
 
 
 def default_registry(world: World, *, risk_seed: int = 0) -> Registry:
     """The clean decision path in order: ViewLayer, FeaturesLayer(world.config, world.scaler),
     FilterLayer(world.model, activation=ACTIVATION), RiskLayer(the committed risk.yaml,
     seed=risk_seed). Later steps add their layers here (CLAUDE.md rule 4)."""
-    raise NotImplementedError
+    return Registry(
+        (
+            ViewLayer(),
+            FeaturesLayer(world.config, world.scaler),
+            FilterLayer(world.model, activation=ACTIVATION),
+            RiskLayer(risk_config(), seed=risk_seed),
+        )
+    )
 
 
 # --- cut times -------------------------------------------------------------------------------
@@ -360,7 +590,25 @@ def edge_cuts(decisions: Sequence[Decision]) -> dict[str, Decision]:
     - "session_first": the first bar of the session after that half day.
 
     KeyError when `decisions` lacks one."""
-    raise NotImplementedError
+
+    def find(day: date, *, closing: bool = False) -> Decision:
+        for d in decisions:
+            if d.bar.session == day and (d.reduce_only if closing else d.bar.index == 0):
+                return d
+        raise KeyError(day)
+
+    if not decisions:
+        raise KeyError("first_warm")
+    model_first = next((d for d in decisions if d.tau > ACTIVATION), None)
+    if model_first is None:
+        raise KeyError("model_first")
+    return {
+        "first_warm": decisions[0],
+        "model_first": model_first,
+        "after_dst": find(date(2016, 11, 7)),
+        "half_day_close": find(date(2016, 11, 25), closing=True),
+        "session_first": find(date(2016, 11, 28)),
+    }
 
 
 def draw_cuts(world: World, n: int, *, seed: int) -> tuple[datetime, ...]:
@@ -368,7 +616,11 @@ def draw_cuts(world: World, n: int, *, seed: int) -> tuple[datetime, ...]:
     decisions' τ drawn by `random.Random(seed)`. The same seed gives the same cuts. ValueError,
     its message naming the number of cuts asked for, when n < len(EDGES) or n exceeds the
     decisions."""
-    raise NotImplementedError
+    if not len(EDGES) <= n <= len(world.decisions):
+        raise ValueError(f"invalid cut count {n}")
+    edges = {d.tau for d in world.edges.values()}
+    others = [d.tau for d in world.decisions if d.tau not in edges]
+    return tuple(sorted(edges | set(random.Random(seed).sample(others, n - len(edges)))))
 
 
 # --- the variants' stores --------------------------------------------------------------------
@@ -377,7 +629,14 @@ def draw_cuts(world: World, n: int, *, seed: int) -> tuple[datetime, ...]:
 def truncated_store(world: World, cut: datetime) -> BarStore:
     """Variant (a): a backup of `world.conn` into a new in-memory database, with every row known
     after `cut` deleted (minutes, hourly bars, flags), as a clockless BarStore."""
-    raise NotImplementedError
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    world.conn.backup(conn)
+    for table in ("minute_bars", "hourly_bars", "data_flags"):
+        conn.execute(
+            f"DELETE FROM {table} WHERE known_at > ?",  # noqa: S608 — fixed table names above
+            (to_us(cut),),
+        )
+    return BarStore(conn)
 
 
 @dataclass(frozen=True)
@@ -417,7 +676,78 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
          available_at, both at t_opens off the calendar's grid and after the cut's bar's.
 
     Returns the store and what was written."""
-    raise NotImplementedError
+    store = truncated_store(world, cut)
+    clock = SimClock(cut)
+    store = BarStore(store._conn, clock=clock)
+    decision = next(d for d in world.decisions if d.tau == cut)
+    bar = next(
+        b
+        for b in store.view(cut, as_of=cut).hourly(SYMBOL, purpose=Purpose.OPERATE, last=1)
+        if b.t_open == decision.bar.t_open
+    )
+    revision_at = cut + timedelta(minutes=5)
+    revise_close(store, clock, world.minutes, bar, 0.25, at=revision_at)
+    cal = TradingCalendar.xnys()
+    future = [
+        b
+        for day in cal.sessions(decision.bar.session, decision.bar.session + timedelta(days=14))
+        for b in cal.session(day).bars
+        if b.t_open > bar.t_open
+    ][:14]
+    values = list(range(len(future)))
+    random.Random(f"{seed}:{cut.isoformat()}").shuffle(values)
+
+    def insert(
+        spec: Any,
+        open_time: datetime,
+        close_time: datetime,
+        available: datetime,
+        prices: tuple[Any, Any, Any, Any],
+    ) -> None:
+        store._conn.execute(
+            "INSERT INTO hourly_bars VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (
+                SYMBOL,
+                to_us(open_time),
+                spec.session.isoformat(),
+                spec.slot.value,
+                to_us(close_time),
+                *prices,
+                100.0,
+                60,
+                to_us(available),
+                to_us(cut - timedelta(microseconds=1)),
+            ),
+        )
+
+    for i, spec in enumerate(future):
+        price = bar.close + values[i] + 1
+        prices: tuple[Any, Any, Any, Any] = (price, price + 1, price - 1, price)
+        if i == 0:
+            prices = (price, price + 1, price - 1, "NaN")
+        elif i == 1:
+            prices = (1e9, 1e9, 1e9, 1e9)
+        elif i == 2:
+            prices = (price, price + 1, -1e9, -1e9)
+        insert(spec, spec.t_open, spec.t_close, spec.t_close + timedelta(minutes=15), prices)
+    unavailable = (cut - timedelta(seconds=4), cut - timedelta(seconds=3))
+    for i, opened in enumerate(unavailable):
+        insert(
+            decision.bar,
+            opened,
+            cut - timedelta(seconds=1),
+            cut + timedelta(seconds=i),
+            (bar.close, bar.close + 1, bar.close - 1, bar.close),
+        )
+    return store, Garbage(
+        bar.t_open,
+        revision_at,
+        future[0].t_open,
+        future[1].t_open,
+        future[2].t_open,
+        tuple(b.t_open for b in future),
+        unavailable,
+    )
 
 
 # --- runs and the check ----------------------------------------------------------------------
@@ -439,7 +769,20 @@ def run_layers(registry: Registry, source: Source, decisions: Sequence[Decision]
     """Run every layer in order over `decisions`, each given the records of the layers before
     it. ValueError when a layer returns records that aren't one per decision, in order, with
     its name; an exception a layer raises is caught into `Run.errors`."""
-    raise NotImplementedError
+    records: dict[str, tuple[Record, ...]] = {}
+    errors: dict[str, str] = {}
+    for layer in registry.layers:
+        try:
+            result = layer.run(source, decisions, records)
+        except Exception as exc:
+            errors[layer.name] = f"{type(exc).__name__}: {exc}"
+            break
+        if len(result) != len(decisions) or any(
+            r.tau != d.tau or r.layer != layer.name for r, d in zip(result, decisions, strict=True)
+        ):
+            raise ValueError(f"unaligned records from {layer.name}")
+        records[layer.name] = tuple(result)
+    return Run(source.variant, tuple(decisions), records, errors)
 
 
 @dataclass(frozen=True)
@@ -477,16 +820,18 @@ class Report:
 
     @property
     def ok(self) -> bool:
-        raise NotImplementedError
+        return not self.failures
 
     @property
     def layers(self) -> frozenset[str]:
         """The layers the failures name."""
-        raise NotImplementedError
+        return frozenset(f.layer for f in self.failures)
 
     def explain(self) -> str:
         """The failures, one per line: cut, variant, layer, decision, kind and detail."""
-        raise NotImplementedError
+        return "\n".join(
+            f"{f.cut} {f.variant} {f.layer} {f.tau} {f.kind}: {f.detail}" for f in self.failures
+        )
 
 
 def provenance_failures(
@@ -494,7 +839,27 @@ def provenance_failures(
 ) -> list[Failure]:
     """T-NL2: a "provenance" Failure for each layer's first record with provenance whose
     fit_end is not strictly before its τ. Records without provenance pass."""
-    raise NotImplementedError
+    failures = []
+    seen = set()
+    for record in records:
+        if (
+            record.tau <= cut
+            and record.layer not in seen
+            and record.provenance is not None
+            and record.provenance.fit_end >= record.tau
+        ):
+            seen.add(record.layer)
+            failures.append(
+                Failure(
+                    cut,
+                    variant,
+                    record.layer,
+                    record.tau,
+                    "provenance",
+                    f"model {record.provenance.model} fit_end={record.provenance.fit_end}",
+                )
+            )
+    return failures
 
 
 def compare_runs(reference: Run, other: Run, *, cut: datetime) -> list[Failure]:
@@ -504,7 +869,34 @@ def compare_runs(reference: Run, other: Run, *, cut: datetime) -> list[Failure]:
     layer where the runs first part. A layer that raised has no records, nor have the layers
     after it, so its failure shows at the run's first decision, kind "error"; two runs whose
     layer raised the same error (`Run.errors` equal) agree there."""
-    raise NotImplementedError
+    names = tuple(
+        dict.fromkeys((*reference.records, *reference.errors, *other.records, *other.errors))
+    )
+    for i, d in enumerate(reference.decisions):
+        if d.tau > cut:
+            break
+        for name in names:
+            left_error, right_error = reference.errors.get(name), other.errors.get(name)
+            if left_error is not None or right_error is not None:
+                if left_error == right_error:
+                    continue
+                return [
+                    Failure(
+                        cut, other.variant, name, d.tau, "error", f"{left_error} / {right_error}"
+                    )
+                ]
+            left, right = reference.records.get(name, ()), other.records.get(name, ())
+            if i >= len(left) or i >= len(right):
+                return [Failure(cut, other.variant, name, d.tau, "missing", "record missing")]
+            try:
+                equal = left[i].digest() == right[i].digest()
+            except Exception as exc:
+                return [Failure(cut, other.variant, name, d.tau, "error", str(exc))]
+            if not equal:
+                return [
+                    Failure(cut, other.variant, name, d.tau, "mismatch", "canonical hashes differ")
+                ]
+    return []
 
 
 def check_truncation(
@@ -524,4 +916,92 @@ def check_truncation(
     on `garbage_store(seed=seed)` over the decisions up to τ; `compare_runs` checks (a) and (c)
     against (b), and `provenance_failures` checks the records of all three. With
     `stop_at_first` it returns at the first cut that fails."""
-    raise NotImplementedError
+    full = (
+        run_layers(registry, Source(world.store, Variant.FULL, None), world.decisions)
+        if slice_full
+        else None
+    )
+    failures: list[Failure] = []
+    checked = []
+    compared = dict.fromkeys(registry.names, 0)
+    for cut in cuts:
+        decisions = tuple(d for d in world.decisions if d.tau <= cut)
+        reference = (
+            full
+            if full is not None
+            else run_layers(registry, Source(world.store, Variant.FULL, None), decisions)
+        )
+        checked.append(cut)
+        failures.extend(
+            provenance_failures(
+                (r for rows in reference.records.values() for r in rows),
+                cut=cut,
+                variant=Variant.FULL,
+            )
+        )
+        for variant in (Variant.TRUNCATED, Variant.GARBAGE):
+            store = (
+                truncated_store(world, cut)
+                if variant == Variant.TRUNCATED
+                else garbage_store(world, cut, seed=seed)[0]
+            )
+            try:
+                run = run_layers(registry, Source(store, variant, cut), decisions)
+                differences = compare_runs(reference, run, cut=cut)
+                failures.extend(differences)
+                failures.extend(
+                    provenance_failures(
+                        (r for rows in run.records.values() for r in rows), cut=cut, variant=variant
+                    )
+                )
+                for index, d in enumerate(decisions):
+                    for name in registry.names:
+                        if differences and (d.tau, name) == (
+                            differences[0].tau,
+                            differences[0].layer,
+                        ):
+                            if differences[0].kind == "mismatch":
+                                compared[name] += 1
+                            break
+                        if index < min(
+                            len(reference.records.get(name, ())), len(run.records.get(name, ()))
+                        ):
+                            compared[name] += 1
+                    if differences and d.tau == differences[0].tau:
+                        break
+            finally:
+                store.close()
+        if failures and stop_at_first:
+            break
+    return Report(tuple(checked), compared, tuple(failures))
+
+
+@cache
+def _history() -> tuple[MinuteFrame, BarStore]:
+    minutes = synthetic_days(DATA_FIRST, DATA_LAST, seed=DATA_SEED)
+    store = BarStore.memory()
+    store.ingest_minutes(SYMBOL, minutes, known_at=HISTORY, source="synthetic")
+    return minutes, store
+
+
+def _feature_state_hash(stream: FeatureStream) -> str:
+    # Serialize the actual state, including every field, before caching. Pydantic's
+    # serializer preserves float64 values and signed zero. Read the state immediately
+    # without deepcopying its histories; never retain a mutable reference.
+    return _hash_feature_json(stream._state.model_dump_json())
+
+
+@lru_cache(maxsize=2048)
+def _hash_feature_json(payload: str) -> str:
+    # Convert the fast serializer's spelling to the project's canonical JSON.
+    return sha256_hex(canonical_loads(payload))
+
+
+# Intent construction validates a deterministic decision id. Reuse only exact inputs;
+# the engine and all of its checks still run afresh for every variant.
+_risk_intent = lru_cache(maxsize=4096)(intent)
+
+
+@lru_cache(maxsize=4096)
+def _risk_quantity(seed: int, tau: datetime) -> int:
+    return random.Random(f"{seed}:{tau.isoformat()}").randint(1, 200)

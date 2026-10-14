@@ -86,7 +86,6 @@ def _where(report: Report) -> set[tuple[datetime, Variant, str, datetime | None,
 # --- clean code ------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4", "ARCH§13", "ARCH§4.2")
 def test_clean_code_passes_every_variant_at_fifty_cuts() -> None:
     w = world()
@@ -101,7 +100,6 @@ def test_clean_code_passes_every_variant_at_fifty_cuts() -> None:
     assert all(count > 0 for count in report.compared.values()), report.compared
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.full
 @pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4")
 def test_clean_code_passes_every_variant_at_two_hundred_cuts() -> None:
@@ -113,7 +111,6 @@ def test_clean_code_passes_every_variant_at_two_hundred_cuts() -> None:
     assert len(report.cuts) == FULL_CUTS
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("T-NL1", "P4")
 def test_cuts_are_drawn_from_a_seed_and_include_the_edges() -> None:
     w = world()
@@ -138,7 +135,6 @@ def test_cuts_are_drawn_from_a_seed_and_include_the_edges() -> None:
 # --- the variants' stores --------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("T-NL1")
 def test_the_truncated_store_holds_only_what_was_known_by_the_cut() -> None:
     w = world()
@@ -152,7 +148,6 @@ def test_the_truncated_store_holds_only_what_was_known_by_the_cut() -> None:
     assert bars[-1].t_open == w.edges["after_dst"].bar.t_open
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("T-NL1", "P3")
 def test_the_garbage_variant_really_writes_every_kind_of_garbage() -> None:
     # Garbage the view can't see because it was never written would make variant (c) vacuous.
@@ -184,7 +179,6 @@ def test_the_garbage_variant_really_writes_every_kind_of_garbage() -> None:
 # --- T-NL2 -----------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("T-NL2")
 def test_provenance_needs_the_fit_window_to_end_strictly_before_tau() -> None:
     tau = datetime(2016, 11, 1, 14, 46, tzinfo=MODEL_FIT_END.tzinfo)
@@ -321,7 +315,6 @@ def _patch_view(monkeypatch: pytest.MonkeyPatch, old: str, new: str) -> None:
         monkeypatch.setattr(view_module, name, sql.replace(old, new))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("I1", "T-NL1", "P3", "SPEC§3")
 def test_planted_leak_1_a_centered_moving_average_is_caught_in_features() -> None:
     w = world()
@@ -330,7 +323,6 @@ def test_planted_leak_1_a_centered_moving_average_is_caught_in_features() -> Non
     _assert_caught(report, "features", MISMATCH_OR_ERROR)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("I1", "T-NL1", "P3", "SPEC§3")
 def test_planted_leak_2_a_scaler_fit_on_the_full_history_is_caught_in_features() -> None:
     w = world()
@@ -339,7 +331,6 @@ def test_planted_leak_2_a_scaler_fit_on_the_full_history_is_caught_in_features()
     _assert_caught(report, "features", MISMATCH_OR_ERROR)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("I1", "I2", "T-NL1", "P3")
 def test_planted_leak_3_a_smoother_in_place_of_the_filter_is_caught_in_filter() -> None:
     w = world()
@@ -347,7 +338,6 @@ def test_planted_leak_3_a_smoother_in_place_of_the_filter_is_caught_in_filter() 
     _assert_caught(check_truncation(w, registry, _leak_cuts(w), seed=SEED), "filter")
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_planted_leak_4_a_view_using_at_or_before_tau_is_caught_in_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -359,7 +349,6 @@ def test_planted_leak_4_a_view_using_at_or_before_tau_is_caught_in_view(
     assert {f.variant for f in report.failures} == {Variant.GARBAGE}
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_planted_leak_5_availability_from_t_close_is_caught_in_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -371,7 +360,6 @@ def test_planted_leak_5_availability_from_t_close_is_caught_in_view(
     assert {f.variant for f in report.failures} == {Variant.GARBAGE}
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("T-NL2", "P3")
 def test_planted_leak_6_a_model_fit_past_tau_is_caught_by_provenance() -> None:
     w = world()
@@ -384,7 +372,6 @@ def test_planted_leak_6_a_model_fit_past_tau_is_caught_by_provenance() -> None:
     assert {f.variant for f in report.failures} == set(Variant)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=NotImplementedError)
 @pytest.mark.spec("T-NL1", "P3")
 def test_slicing_the_full_run_hides_no_leak() -> None:
     # The full run is computed once and sliced per cut. Recomputing it per cut must find exactly
