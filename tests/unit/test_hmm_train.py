@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import math
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -448,18 +449,22 @@ def test_another_base_seed_is_another_model() -> None:
 
     data = training_data(three_full(), 1500, 4)
     hashes = set()
+    means = set()
     for seed in (R1_BASE_SEED, R1_BASE_SEED + 100):
         result = train_candidate(
             data,
             _candidate(3, "full"),
             thresholds=_thresholds(),
-            config=_config([(3, "full")], 2, base_seed=seed),
+            config=_config([(3, "full")], 2, base_seed=seed, validation_months=3),
             provenance=PROVENANCE,
             workers=1,
         )
         assert result.model.training.seeds == (seed, seed + 1)
         hashes.add(result.model.artifact_hash())
+        means.add(result.model.params.means.tobytes())
     assert len(hashes) == 2
+    # The seeds reach EM: the parameters differ, not only the recorded seeds.
+    assert len(means) == 2
 
 
 # --- The full run (PLAN B4's "done when") -----------------------------------------------------
@@ -499,3 +504,369 @@ def test_r1_selection_on_twenty_thousand_bars(
     np.testing.assert_allclose(params.means[perm], means, atol=0.1)
     np.testing.assert_allclose(params.covars[perm], covars, atol=0.15)
     np.testing.assert_allclose(params.transmat[np.ix_(perm, perm)], truth.transmat, atol=0.03)
+
+
+# --- B4b review --------------------------------------------------------------------------------
+
+BLAS_VARIABLES = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+@pytest.mark.spec("SPEC§4", "ARCH§7.1")
+def test_the_validation_fit_never_sees_the_validation_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EM for the validation fit reads only the rows before the block, standardized with a
+    scaler fit on those rows alone; the full-window fit reads every row with the full scaler."""
+    from hmmlearn.hmm import GaussianHMM
+
+    from quant.core.epoch import to_us
+    from quant.hmm.select import validation_start
+    from quant.hmm.train import select_and_train
+
+    fit = GaussianHMM.fit
+    seen: list[Any] = []
+
+    def spy(self: Any, x: Any, lengths: Any = None) -> Any:
+        seen.append(np.array(x, dtype=np.float64, copy=True))
+        return fit(self, x, lengths)
+
+    monkeypatch.setattr(GaussianHMM, "fit", spy)
+    data = training_data(three_full(), 3000, 4)
+    select_and_train(
+        data,
+        thresholds=_thresholds(),
+        config=_config([(2, "diag")], 1),
+        provenance=PROVENANCE,
+        workers=1,
+    )
+    rows = data.matrix.values
+    before = data.matrix.available_at < to_us(validation_start(data.fit_end, 12))
+    train = rows[before]
+    assert 0 < len(train) < len(rows)
+    expected = sorted(
+        [
+            (rows - rows.mean(axis=0)) / rows.std(axis=0),
+            (train - train.mean(axis=0)) / train.std(axis=0),
+        ],
+        key=len,
+    )
+    assert [len(z) for z in sorted(seen, key=len)] == [len(z) for z in expected]
+    for got, want in zip(sorted(seen, key=len), expected, strict=True):
+        assert got.tobytes() == want.tobytes()
+
+
+@pytest.mark.spec("SPEC§4", "ARCH§7.1")
+def test_each_restart_fits_with_its_own_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The seed EM actually starts from, not only the one the record lists."""
+    from hmmlearn.hmm import GaussianHMM
+
+    fit = GaussianHMM.fit
+    states: list[Any] = []
+
+    def spy(self: Any, x: Any, lengths: Any = None) -> Any:
+        states.append(self.random_state)
+        return fit(self, x, lengths)
+
+    monkeypatch.setattr(GaussianHMM, "fit", spy)
+    _, result = _fit(three_full(), 600, 3, workers=1)
+    assert states == [R1_BASE_SEED + i for i in range(3)] == list(result.seeds)
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
+def test_restart_stability_does_not_depend_on_feature_units() -> None:
+    """The same rows in units a quarter the size give the same standardized rows, so the same
+    fits, gaps and stability; only the raw log-likelihood's Jacobian moves."""
+    from quant.hmm.model import ScalerParams
+    from quant.hmm.train import fit_candidate
+    from tests.support.hmm import sample
+
+    _, x = sample(three_full(), 1500, 1)
+    candidate = _candidate(3, "full")
+    config = _config([(3, "full")], 4, base_seed=112)
+    columns = identity_columns(2)
+    unit = fit_candidate(
+        x, identity_scaler(2), candidate, columns=columns, config=config, workers=1
+    )
+    quarter = fit_candidate(
+        x * 0.25,
+        ScalerParams(columns, np.zeros(2), np.full(2, 0.25)),
+        candidate,
+        columns=columns,
+        config=config,
+        workers=1,
+    )
+    assert quarter.params.means.tobytes() == unit.params.means.tobytes()
+    logliks = np.array(unit.logliks)  # std 1: raw and standardized log-likelihoods agree
+    near = int(np.sum(np.abs(logliks - logliks.max()) <= 1e-3 * abs(logliks.max())))
+    assert (unit.choice.near_best, unit.choice.stable) == (near, near >= 3)
+    assert (quarter.choice.near_best, quarter.choice.stable) == (near, near >= 3)
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=pytest.fail.Exception)
+def test_every_seed_must_be_in_numpys_seed_range() -> None:
+    import pydantic
+
+    from quant.hmm.train import TrainConfig, r1_train_config
+
+    values = dict(r1_train_config())
+    TrainConfig(**(values | {"base_seed": 2**32 - 4, "n_restarts": 4}))  # last seed 2**32 - 1
+    with pytest.raises(pydantic.ValidationError):
+        TrainConfig(**(values | {"base_seed": 2**32 - 3, "n_restarts": 4}))
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=ModelError)
+def test_a_programming_error_in_a_restart_is_raised_not_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hmmlearn.hmm import GaussianHMM
+
+    def broken(self: Any, x: Any, lengths: Any = None) -> Any:
+        raise TypeError("a bug, not a bad optimum")
+
+    monkeypatch.setattr(GaussianHMM, "fit", broken)
+    with pytest.raises(TypeError, match="a bug"):
+        _fit(three_full(), 300, 2)
+
+
+def _collinear_data() -> Any:
+    """three_full's rows with the second feature a copy of the first: every full-covariance
+    restart is singular, while diag fits."""
+    from quant.features.stream import FeatureMatrix
+    from quant.hmm.train import TrainingData
+
+    data = training_data(three_full(), 3000, 4)
+    values = data.matrix.values.copy()
+    values[:, 1] = values[:, 0]
+    matrix = FeatureMatrix(
+        data.matrix.columns, data.matrix.t_open, data.matrix.available_at, values
+    )
+    return TrainingData(
+        matrix, data.returns, data.sessions, data.fit_start, data.fit_end, FEATURE_HASH
+    )
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=ModelError)
+def test_a_candidate_whose_restarts_all_fail_is_set_aside() -> None:
+    from quant.hmm.train import select_and_train
+
+    config = _config([(2, "diag"), (2, "full")], 2, n_iter=100)
+    result = select_and_train(
+        _collinear_data(), thresholds=_thresholds(), config=config, provenance=PROVENANCE, workers=1
+    )
+    assert (result.selection.chosen.n_states, result.selection.chosen.covariance_type) == (
+        2,
+        "diag",
+    )
+    selection = result.model.training.info["selection"]
+    assert [(r["n_states"], r["covariance_type"]) for r in selection["table"]] == [(2, "diag")]
+    failures = tuple(
+        {"index": i, "seed": R1_BASE_SEED + i, "error": "ModelError"} for i in range(2)
+    )
+    assert len(selection["set_aside"]) == 1
+    entry = selection["set_aside"][0]
+    assert (entry["n_states"], entry["covariance_type"]) == (2, "full")
+    assert dict(entry["failed"]) == {"full": failures, "validation": failures}
+
+
+@pytest.mark.spec("SPEC§4")
+def test_selection_fails_when_no_candidate_survives() -> None:
+    from quant.hmm.train import select_and_train
+
+    with pytest.raises(ModelError):
+        select_and_train(
+            _collinear_data(),
+            thresholds=_thresholds(),
+            config=_config([(2, "full")], 2, n_iter=100),
+            provenance=PROVENANCE,
+            workers=1,
+        )
+
+
+@pytest.mark.spec("SPEC§4", "ARCH§14")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
+def test_pool_workers_start_with_single_threaded_blas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Accelerate ignores threadpoolctl, so the limit must be in each spawned worker's
+    environment before it imports numpy, whatever the caller's environment says."""
+    import concurrent.futures
+    import os
+
+    import quant.hmm.train as train
+
+    seen: list[str | None] = []
+
+    class Probe(concurrent.futures.ProcessPoolExecutor):
+        def map(self, fn: Any, *iterables: Any, **kwargs: Any) -> Any:
+            results = list(super().map(fn, *iterables, **kwargs))
+            seen.extend(self.submit(os.getenv, name).result() for name in BLAS_VARIABLES)
+            return iter(results)
+
+    for name in BLAS_VARIABLES:
+        monkeypatch.setenv(name, "8")
+    monkeypatch.setattr(train, "ProcessPoolExecutor", Probe)
+    _fit(three_full(), 300, 2, workers=2)
+    assert seen == ["1"] * len(BLAS_VARIABLES)
+    assert [os.environ[name] for name in BLAS_VARIABLES] == ["8"] * len(BLAS_VARIABLES)
+
+
+@pytest.mark.spec("ARCH§7.1")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
+def test_pool_tasks_ship_indices_not_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each worker receives the rows once; a task is a few bytes, whatever the rows' size."""
+    import pickle
+
+    import quant.hmm.train as train
+
+    sizes: list[int] = []
+
+    class Inline:
+        def __init__(
+            self, max_workers: Any = None, mp_context: Any = None, initializer: Any = None,
+            initargs: tuple[Any, ...] = (),
+        ) -> None:  # fmt: skip
+            if initializer is not None:
+                initializer(*initargs)
+
+        def __enter__(self) -> Inline:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def map(self, fn: Any, items: Any) -> Any:
+            items = list(items)
+            sizes.extend(len(pickle.dumps(item)) for item in items)
+            return [fn(item) for item in items]
+
+    monkeypatch.setattr(train, "_WORKER", None, raising=False)
+    monkeypatch.setattr(train, "ProcessPoolExecutor", Inline)
+    _, pooled = _fit(three_full(), 3000, 2, workers=2)
+    _, serial = _fit(three_full(), 3000, 2, workers=1)
+    assert pooled.logliks == serial.logliks
+    assert len(sizes) == 2
+    assert max(sizes) < 512
+
+
+@pytest.mark.spec("ARCH§7.2", "ARCH§14")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
+def test_the_record_names_the_platform_and_the_blas_build() -> None:
+    import platform
+
+    import scipy
+
+    _, _, result = _selected("three_full")
+    info = result.model.training.info
+    assert dict(info["platform"]) == {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "platform": platform.platform(),
+    }
+    fields = ("name", "version", "detection method", "openblas configuration")
+    for library in (np, scipy):
+        built = library.show_config(mode="dicts")["Build Dependencies"]  # type: ignore[no-untyped-call]
+        for api in ("blas", "lapack"):
+            recorded = info["blas"][library.__name__][api]
+            assert dict(recorded) == {f: str(built[api][f]) for f in fields}
+
+
+def _rolling_quantile(loglik: Any, window: int, q: float) -> float:
+    """The q-quantile (linear) of the means of every full window of `window` consecutive
+    values, each mean an exactly rounded sum over the window."""
+    means = [math.fsum(loglik[i : i + window]) / window for i in range(len(loglik) - window + 1)]
+    return float(np.quantile(np.array(means), q))
+
+
+@pytest.mark.spec("SPEC§4", "SPEC§5", "ARCH§7.2")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
+def test_the_record_carries_the_drift_baseline() -> None:
+    """Spec §5's live check compares the 35-bar rolling mean of l_t with the 1st percentile of
+    its distribution on the validation block, so meta.json stores that percentile."""
+    _, _, result = _selected("three_full")
+    chosen = next(s for s in result.selection.scores if s.candidate == result.selection.chosen)
+    loglik = chosen.validation.loglik
+    validation = result.model.training.info["validation"]
+    assert (validation["mean"], validation["se"]) == (chosen.validation.mean, chosen.validation.se)
+    assert validation["rows"] == len(loglik)
+    drift = validation["drift"]
+    assert (drift["window"], drift["quantile"]) == (35, 0.01)
+    assert drift["threshold"] == pytest.approx(_rolling_quantile(loglik, 35, 0.01), rel=1e-12)
+    # Far above the per-bar 1st percentile: a mean of 35 bars is much less spread out.
+    assert drift["threshold"] > float(np.quantile(loglik, 0.01))
+
+
+@pytest.mark.spec("SPEC§5", "ARCH§7.2")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
+def test_a_refit_records_its_own_drift_baseline() -> None:
+    from quant.hmm.train import train_candidate
+
+    data, config, result = _selected("three_full")
+    refit = train_candidate(
+        data,
+        result.selection.chosen,
+        thresholds=_thresholds(),
+        config=config,
+        provenance=PROVENANCE,
+    )
+    assert refit.model.training.info["validation"] == result.model.training.info["validation"]
+
+
+@pytest.mark.spec("SPEC§4", "SPEC§5")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
+def test_a_refit_with_a_state_that_never_holds_is_a_sanity_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A state no bar can reach has no filtered mass, so no v or d and no label: the refit is
+    refused as a sanity reject, naming its reasons, not with a statistics error."""
+    from hmmlearn.hmm import GaussianHMM
+
+    from quant.hmm.train import train_candidate
+
+    truth = three_full()
+
+    def unreachable(self: Any, x: Any, lengths: Any = None) -> Any:
+        self.n_features = x.shape[1]
+        self.startprob_ = np.array([0.5, 0.5, 0.0])
+        self.transmat_ = np.array([[0.9, 0.1, 0.0], [0.1, 0.9, 0.0], [0.3, 0.3, 0.4]])
+        self.means_ = truth.means.copy()
+        self.covars_ = truth.covars.copy()
+        return self
+
+    monkeypatch.setattr(GaussianHMM, "fit", unreachable)
+    with pytest.raises(ModelError, match=re.escape("sanity reject: state 2: occupancy 0.0 < 0.02")):
+        train_candidate(
+            training_data(truth, 3000, 4),
+            _candidate(3, "full"),
+            thresholds=_thresholds(),
+            config=_config([(3, "full")], 1),
+            provenance=PROVENANCE,
+            workers=1,
+        )
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=KeyError)
+def test_validation_fits_warn_as_validation_and_record_their_stability() -> None:
+    from quant.hmm.train import select_and_train
+
+    with capture_logs() as logs:
+        result = select_and_train(
+            training_data(three_full(), 3000, 4),
+            thresholds=_thresholds(),
+            config=_config([(2, "diag")], 1),
+            provenance=PROVENANCE,
+            workers=1,
+        )
+    warnings = [e for e in logs if e["event"] == "hmm optimum unstable"]
+    assert sorted(e["fit"] for e in warnings) == ["full", "validation"]
+    row = result.model.training.info["selection"]["table"][0]
+    assert (row["near_best"], row["stable"]) == (1, False)
+    assert (row["validation_near_best"], row["validation_stable"]) == (1, False)

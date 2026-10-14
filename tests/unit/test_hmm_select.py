@@ -505,3 +505,56 @@ def test_selection_fails_when_every_candidate_is_rejected_or_none_given() -> Non
         select((), 2)
     with pytest.raises(ModelError):
         select((_score(2, "diag", 1.0, -1.0, 0.1), _score(2, "diag", 2.0, -1.0, 0.1)), 2)
+
+
+# --- B4b review --------------------------------------------------------------------------------
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=TypeError)
+def test_near_best_is_measured_on_the_standardized_log_likelihood() -> None:
+    """The raw log-likelihood carries the scaler's Jacobian n·J, a constant set by the features'
+    units. 0.1% is taken of the standardized-row log-likelihood LL - n·J, so units can't move it."""
+    from quant.hmm.select import choose_restart
+
+    raw = (-1000.0, -1000.5, -1000.75, -1001.0)
+    with capture_logs() as logs:
+        # LL - n·J = -500: 0.1% of it is 0.5, so -1000.5 is near (inclusive) and -1000.75 isn't.
+        choice = choose_restart(raw, candidate=_candidate(3, "full"), jacobian=-500.0, fit="full")
+    assert (choice.best, choice.near_best, choice.stable) == (0, 2, False)
+    assert [(e["event"], e["fit"]) for e in logs] == [("hmm optimum unstable", "full")]
+    # The same fit in other units: every LL and n·J shift together, and nothing else changes.
+    shifted = tuple(ll + 4096.0 for ll in raw)
+    again = choose_restart(shifted, candidate=_candidate(3, "full"), jacobian=3596.0, fit="full")
+    assert (again.best, again.near_best, again.stable) == (0, 2, False)
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=TypeError)
+def test_the_instability_warning_names_the_fit_it_comes_from() -> None:
+    from quant.hmm.select import choose_restart
+
+    with capture_logs() as logs:
+        choose_restart((-5.0,), candidate=_candidate(2, "full"), jacobian=0.0, fit="validation")
+    assert [(e["event"], e["fit"]) for e in logs] == [("hmm optimum unstable", "validation")]
+
+
+@pytest.mark.spec("SPEC§4")
+@pytest.mark.xfail(strict=True, reason="red:B4", raises=AssertionError)
+def test_sanity_thresholds_hold_exactly_at_their_decimal_edges() -> None:
+    """2% and 2 bars are decimal edges: 1,000 rows of 0.02 is exactly 2% however the float sum
+    rounds, and a_kk = 0.49999999999999994 is under 2 bars though 1 / (1 - a_kk) rounds to 2."""
+    from quant.hmm.select import sanity_check
+
+    edge = np.tile(np.array([0.49, 0.49, 0.02]), (1000, 1))
+    assert float(edge.mean(axis=0)[2]) < 0.02  # the float mean falls under the edge
+    report = sanity_check(_params(_good()), edge)
+    assert report.passed, report.reasons
+    under = np.tile(np.array([0.49, 0.49, 0.019999999999999997]), (1000, 1))
+    assert sanity_check(_params(_good()), under).reasons[0].startswith("state 2: occupancy")
+    parts = _good()
+    parts["transmat"][0] = [0.49999999999999994, 0.30000000000000004, 0.2]
+    assert 1 / (1 - parts["transmat"][0, 0]) == 2.0
+    report = sanity_check(_params(parts), _one_hot((40, 35, 25)))
+    assert [r.split(":")[0] for r in report.reasons] == ["state 0"]
+    assert "duration" in report.reasons[0]
