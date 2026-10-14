@@ -4,9 +4,11 @@ monitor and reconciliation).
 FakeBroker implements quant.risk.broker.BrokerPort in memory. Like the real adapter it spends
 every approval through the RiskEngine it was built with before it changes anything, so a test
 sees exactly which approvals the code under test obtained and used. A kill exit fills at once,
-in full, when its limit is at or through `fill_at` (any price when `fill_at` is None); otherwise
-it stays working until it is cancelled. `partial` makes the next exits fill only that many
-shares. `fail` makes the named methods raise BrokerError, after the spend, a given number of
+in full, when its limit crosses the quote (a SELL at or below the bid, a BUY at or above the ask)
+and is at or through `fill_at` (no further bound when `fill_at` is None); otherwise it stays
+working until it is cancelled. `partial` makes the next exit fill only that many shares.
+`positions` is the signed position after every change, starting with the first, so a test can
+see a short however briefly it lasted. `fail` makes the named methods raise BrokerError, after the spend, a given number of
 times. Every change is appended to `events`, a list a test may share with the store and the
 alert sink to check the order of the steps.
 """
@@ -64,6 +66,7 @@ class FakeBroker:
         self.events: list[Event] = [] if events is None else events
         self.spent: list[Approval] = []
         self.flatten_quantities: list[int] = []
+        self.positions: list[int] = [position]
         self.halted_at_first_change: bool | None = None
         self.snapshots = 0
         self._exits = 0
@@ -118,14 +121,19 @@ class FakeBroker:
         quantity = abs(self.position)
         self.flatten_quantities.append(quantity)
         self.events.append(("flatten", client_order_id, limit_price))
-        marketable = self.fill_at is None or (
-            limit_price <= self.fill_at if side is Side.SELL else limit_price >= self.fill_at
-        )
+        if side is Side.SELL:
+            marketable = limit_price <= self.bid and (
+                self.fill_at is None or limit_price <= self.fill_at
+            )
+        else:
+            marketable = limit_price >= self.ask and (
+                self.fill_at is None or limit_price >= self.fill_at
+            )
         filled = 0
         if marketable:
             filled = quantity if self.partial is None else min(self.partial, quantity)
             self.partial = None
-        self.position += -filled if side is Side.SELL else filled
+        self.move(-filled if side is Side.SELL else filled)
         if filled < quantity:
             self.orders[client_order_id] = OpenOrder(
                 client_order_id=client_order_id,
@@ -137,6 +145,11 @@ class FakeBroker:
         return client_order_id
 
     # --- helpers -----------------------------------------------------------------------------
+
+    def move(self, shares: int) -> None:
+        """Change the position by `shares` (a fill), recording the result in `positions`."""
+        self.position += shares
+        self.positions.append(self.position)
 
     def _spend(self, approval: Approval) -> None:
         if self.halted_at_first_change is None:

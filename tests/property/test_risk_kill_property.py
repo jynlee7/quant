@@ -5,12 +5,16 @@ This extends the B9a property test (test_risk_property.py) across the kill switc
 draws a session: intents before the kill (any side and size, any label, at the session's
 intraday decisions in order), each spent and filled in part or not at all, then a kill at a
 drawn moment, then more intents. The kill runs the real KillExecutor against a FakeBroker that
-holds the position the fills built. Whatever was drawn:
+holds what the fills built: the position under a covering stop, and the unfilled remainder of
+every spent order still working. Sometimes the stop has already fired, so the broker is flat
+while the engine still holds SELL approvals. The broker fills an exit only when its limit
+crosses the quote, at or through a drawn price, and sometimes fills the first exit only in part,
+so a kill may take several exits. Whatever was drawn:
 
 - before the kill, every BUY approval leaves the position, counting the BUYs outstanding, inside
   the smallest cap in force and the single-order cap; every SELL approval leaves it long or flat;
-- the kill ends FLAT: the broker holds no position and no open orders, trading is halted, and
-  the position never went below 0 on the way;
+- the kill ends FLAT: the broker holds no position and no open orders, trading is halted, the
+  signed position never went below 0 on the way, and every exit sold at or below the bid;
 - every approval issued before the kill and still unspent is refused at spend afterwards;
 - after the kill, no intent is approved at all: BUYs are halted and there is nothing to sell.
 """
@@ -26,12 +30,12 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from quant.core.errors import ApprovalError
-from quant.core.orders import Label, Side, TradingMode
+from quant.core.orders import Label, OpenOrder, OrderKind, Side, TradingMode
 from quant.risk.engine import RiskApprovedOrder
 from quant.risk.kill import KillExecutor, KillRequest, KillStatus, MemoryKillLock
 from quant.risk.triggers import KillTrigger
 from tests.support.broker import FakeBroker, RecordingAlerts, RecordingKillStore
-from tests.support.risk import CAL, EQUITY, config, decisions, desk, intent
+from tests.support.risk import CAL, EQUITY, PRICE, config, decisions, desk, intent, order
 
 INTRADAY = [d for d in decisions() if not d.reduce_only]  # the decisions that fill today
 
@@ -64,15 +68,25 @@ def exact(value: float) -> Decimal:
     return Decimal(repr(value))
 
 
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)  # R1
 @pytest.mark.spec("SPEC§10", "D9", "ARCH§8.3", "I4")
 @given(
     held_at_start=st.integers(0, 400),
     before=steps,
     after=steps,
     trigger=st.sampled_from(KillTrigger),
+    stop_fired=st.booleans(),
+    fill_at=st.sampled_from([None, 99.85, 99.75]),
+    partial=st.sampled_from([None, 1, 50]),
 )
 def test_no_sequence_with_a_kill_goes_short_or_breaches_a_cap(
-    held_at_start: int, before: list[Step], after: list[Step], trigger: KillTrigger
+    held_at_start: int,
+    before: list[Step],
+    after: list[Step],
+    trigger: KillTrigger,
+    stop_fired: bool,
+    fill_at: float | None,
+    partial: int | None,
 ) -> None:
     lock = MemoryKillLock()  # the executor's lock, built before anything runs
     limits = config()
@@ -80,6 +94,7 @@ def test_no_sequence_with_a_kill_goes_short_or_breaches_a_cap(
     position = held_at_start
     legs: dict[int, int] = {}
     unspent: list[RiskApprovedOrder] = []
+    working: list[OpenOrder] = []  # the unfilled remainders of spent orders
 
     def check(step: Step) -> object:
         decision = INTRADAY[step.decision]
@@ -125,11 +140,24 @@ def test_no_sequence_with_a_kill_goes_short_or_breaches_a_cap(
             filled = int(verdict.quantity * step.fill)
             position += filled if step.side is Side.BUY else -filled
             assert position >= 0
+            if filled < verdict.quantity:
+                remainder = verdict.quantity - filled
+                working.append(
+                    order(f"w-{len(working)}", step.side, OrderKind.LIMIT, remainder, PRICE)
+                )
         else:
             unspent.append(verdict)
 
     d.clock.advance(timedelta(seconds=1))
-    broker = FakeBroker(d.engine, d.clock, position=position)
+    if stop_fired and position > 0:  # the stop sold everything before the kill
+        position = 0
+        working = [o for o in working if o.side is Side.BUY]
+    orders = list(working)
+    if position > 0:
+        orders.append(order("stop", Side.SELL, OrderKind.STOP, position, 95.0))
+    broker = FakeBroker(
+        d.engine, d.clock, position=position, orders=orders, fill_at=fill_at, partial=partial
+    )
     report = KillExecutor(
         d.engine,
         broker,
@@ -145,7 +173,8 @@ def test_no_sequence_with_a_kill_goes_short_or_breaches_a_cap(
     assert broker.position == 0
     assert broker.orders == {}
     assert d.engine.state.halted
-    assert min(broker.flatten_quantities, default=0) >= 0
+    assert min(broker.positions) >= 0  # never short, however briefly
+    assert all(x.limit_price <= broker.bid for x in report.exits)  # a long is closed by SELLs
     position = broker.position
 
     for approval in unspent:

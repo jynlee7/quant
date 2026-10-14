@@ -7,6 +7,7 @@ exactly 1,000 x the price: $98 is the 2% daily-loss line and $90 the 10% drawdow
 
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 
 import pytest
@@ -205,3 +206,73 @@ def test_a_stop_covers_the_position_only_with_stop_sells_for_every_share(
     report = Watch().tick(100.0, position=position, orders=orders, cash=EQUITY - position * 100.0)
     assert report.stop_covered is covered
     assert report.replace_stop is not covered
+
+
+# --- B9b review ------------------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("C8", "SPEC§10")
+def test_equity_is_summed_exactly_so_the_exact_2_and_10_percent_lines_hold() -> None:
+    # B9b review R5: in floats, 18,828.80 + 192 x 412.35 is 98,000.00000000001.
+    w = Watch()
+    loss = w.tick(412.35, cash=18_828.80, position=192)
+    assert loss.equity == 98_000.0
+    assert loss.flatten
+    assert w.desk.engine.state.daily_loss_locked
+
+    w = Watch()
+    drawdown = w.tick(412.35, cash=16_189.35, position=179)
+    assert drawdown.equity == 90_000.0
+    assert drawdown.kill == (KillTrigger.DRAWDOWN,)
+
+
+@pytest.mark.spec("C8", "SPEC§10", "ARCH§16")
+@pytest.mark.parametrize(
+    ("price", "cash"),
+    [
+        pytest.param(
+            100.0,
+            math.nan,
+            id="cash nan",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError),
+        ),
+        pytest.param(
+            100.0,
+            math.inf,
+            id="cash inf",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError),
+        ),
+        pytest.param(
+            100.0,
+            -math.inf,
+            id="cash -inf",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError),
+        ),
+        pytest.param(
+            math.nan,
+            0.0,
+            id="price nan",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError),
+        ),
+        pytest.param(
+            math.inf,
+            0.0,
+            id="price inf",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=AttributeError),
+        ),
+    ],
+)
+def test_a_cash_or_price_that_isnt_finite_is_a_data_fault_not_a_kill(
+    price: float, cash: float
+) -> None:
+    # B9b review C4: a garbled broker field is bad data, not a wiped-out account.
+    w = Watch()
+    before = w.desk.engine.state
+    report = w.tick(price, cash=cash)
+    assert report.kill == ()
+    assert report.mark is None
+    assert report.equity is None
+    assert w.desk.engine.state == before
+    assert report.data_fault is not None
+    assert report.stop_covered is True  # the stop is still checked

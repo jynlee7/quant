@@ -8,6 +8,9 @@ and the 300 s deadline take no wall time. DAY (2018-03-06) is a full session, 09
 
 from __future__ import annotations
 
+import sqlite3
+import threading
+from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
@@ -15,11 +18,12 @@ import pytest
 
 from quant.core.calendar import NEW_YORK
 from quant.core.errors import ApprovalError, RiskError
-from quant.core.orders import OrderKind, Quote, Side
-from quant.risk.engine import RiskApprovedCancel, RiskApprovedFlatten
+from quant.core.orders import BrokerSnapshot, OrderKind, Quote, Side
+from quant.risk.engine import RiskApprovedCancel, RiskApprovedFlatten, RiskApprovedOrder, RiskState
 from quant.risk.kill import (
     FileKillLock,
     KillExecutor,
+    KillLock,
     KillReport,
     KillRequest,
     KillStatus,
@@ -61,16 +65,20 @@ class Rig:
         limits: RiskConfig | None = None,
         store_fails: bool = False,
         alerts_fail: bool = False,
+        on_change: Callable[[RiskState], None] | None = None,
+        broker_type: type[FakeBroker] = FakeBroker,
+        store_type: type[RecordingKillStore] = RecordingKillStore,
+        lock: KillLock | None = None,
         **broker: object,
     ) -> None:
         self.events: list[Event] = []
-        self.desk: Desk = desk(at=at, day=day)
+        self.desk: Desk = desk(at=at, day=day, on_change=on_change)
         self.engine = self.desk.engine
         self.clock = self.desk.clock
         broker.setdefault("position", 300)
         broker.setdefault("orders", (STOP,))
-        self.broker = FakeBroker(self.engine, self.clock, events=self.events, **broker)  # type: ignore[arg-type]
-        self.store = RecordingKillStore(self.events, fail_writes=store_fails)
+        self.broker = broker_type(self.engine, self.clock, events=self.events, **broker)  # type: ignore[arg-type]
+        self.store = store_type(self.events, fail_writes=store_fails)
         self.alerts = RecordingAlerts(self.events, fail=alerts_fail)
         self.lock = MemoryKillLock()
         self.limits = config() if limits is None else limits
@@ -79,7 +87,7 @@ class Rig:
             self.broker,
             self.limits,
             clock=self.clock,
-            lock=self.lock,
+            lock=self.lock if lock is None else lock,
             store=self.store,
             alerts=self.alerts,
             calendar=CAL,
@@ -409,3 +417,263 @@ def test_halt_works_before_any_session() -> None:
     d = desk(day=None)
     assert d.engine.halt("kill switch (manual, telegram): from the phone")
     assert d.engine.state.halted
+
+
+# --- B9b review: a kill never dies halfway, and never leaves an approval to go short -------------
+
+
+class FlakyPersist:
+    """An `on_change` that raises `error` on the calls numbered in `fail_on`, counted from when
+    it is armed (as a locked or full ops.db would)."""
+
+    def __init__(self, error: Exception, fail_on: set[int]) -> None:
+        self.error = error
+        self.fail_on = fail_on
+        self.armed = False
+        self.calls = 0
+
+    def __call__(self, state: RiskState) -> None:
+        if not self.armed:
+            return
+        self.calls += 1
+        if self.calls in self.fail_on:
+            raise self.error
+
+
+class SqliteFailingStore(RecordingKillStore):
+    """A KillStore whose every write fails as SQLite does: sqlite3.Error is no OSError."""
+
+    def write_halted(self, reason: str, at: datetime) -> None:
+        raise sqlite3.OperationalError("database is locked (fake)")
+
+    def queue_exit(self, run_at: datetime, reason: str) -> None:
+        raise sqlite3.OperationalError("database is locked (fake)")
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=pytest.fail.Exception)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "I4")
+def test_a_kill_that_finds_the_account_flat_still_revokes_every_outstanding_sell() -> None:
+    # B9b review R1: the stop sold the 300 shares before the kill, so the kill sends no flatten
+    # and nothing revoked the SELL the engine approved against them.
+    rig = Rig(orders=())
+    sell = rig.desk.check(intent(Side.SELL, 300), position=300)
+    assert isinstance(sell, RiskApprovedOrder)
+    rig.broker.position = 0
+    report = rig.run()
+    assert report.status is KillStatus.FLAT
+    with pytest.raises(ApprovalError):
+        rig.engine.spend(sell)  # it would open a 300-share short
+
+
+@pytest.mark.spec("SPEC§10", "ARCH§8.3")
+@pytest.mark.parametrize(
+    ("error", "fail_on"),
+    [
+        pytest.param(
+            RiskError("ops.db is full"),
+            {2},
+            id="the stop's cancel approval",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError),
+        ),
+        pytest.param(
+            sqlite3.OperationalError("database is locked"),
+            {2},
+            id="sqlite, the stop's cancel approval",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=sqlite3.OperationalError),
+        ),
+        pytest.param(
+            RiskError("ops.db is full"),
+            {3},
+            id="the exit's flatten approval",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError),
+        ),
+        pytest.param(
+            sqlite3.OperationalError("database is locked"),
+            {1},
+            id="sqlite, the halt",
+            marks=pytest.mark.xfail(strict=True, reason="red:B9", raises=sqlite3.OperationalError),
+        ),
+    ],
+)
+def test_a_failed_save_of_the_risk_state_never_stops_the_kill(
+    error: Exception, fail_on: set[int]
+) -> None:
+    # B9b review R2/C1/C2: on_change saves the state at the halt (call 1), at each cancel
+    # approval and at each flatten approval. A failed save is recorded and the step retried.
+    persist = FlakyPersist(error, fail_on)
+    rig = Rig(on_change=persist)
+    persist.armed = True
+    report = rig.run()
+    assert report.status is KillStatus.FLAT
+    assert rig.broker.position == 0
+    assert rig.engine.state.halted
+    assert f"{type(error).__name__}: {error}" in report.errors
+    assert rig.alerts.reports == [report]
+    assert not rig.lock.held
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=sqlite3.OperationalError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3")
+@pytest.mark.parametrize(
+    ("at", "status"),
+    [(None, KillStatus.FLAT), (et(DAY, 18), KillStatus.QUEUED)],
+    ids=["regular hours", "outside"],
+)
+def test_a_store_failing_as_sqlite_does_never_stops_the_kill(
+    at: datetime | None, status: KillStatus
+) -> None:
+    # B9b review C2: control.db is SQLite, and sqlite3.Error is neither QuantError nor OSError.
+    rig = Rig(at=at, day=DAY if at is None else None, store_type=SqliteFailingStore)
+    report = rig.run()
+    assert report.status is status
+    assert rig.engine.state.halted
+    assert any(error.startswith("OperationalError: ") for error in report.errors)
+    assert rig.alerts.reports == [report]
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3")
+def test_a_lock_that_cant_be_taken_still_halts_flattens_and_alerts(tmp_path: Path) -> None:
+    # B9b review C8: the break-glass `quant kill --direct` must not die on a missing var/.
+    rig = Rig(lock=FileKillLock(tmp_path / "missing" / "kill.lock"))
+    report = rig.run()
+    assert report.status is KillStatus.FLAT
+    assert rig.engine.state.halted
+    assert rig.broker.position == 0
+    assert any("kill lock" in error for error in report.errors)
+    assert rig.alerts.reports == [report]
+
+
+class BlockingBroker(FakeBroker):
+    """A FakeBroker whose first snapshot waits for `go`, so a kill can be caught mid-run."""
+
+    entered: threading.Event
+    go: threading.Event
+
+    def snapshot(self) -> BrokerSnapshot:
+        if not hasattr(self, "go"):
+            self.entered, self.go = threading.Event(), threading.Event()
+            self.entered.set()
+            assert self.go.wait(timeout=10)
+        return super().snapshot()
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=RiskError)
+@pytest.mark.spec("ARCH§8.3")
+def test_a_second_kill_on_another_thread_is_busy_with_the_file_lock(tmp_path: Path) -> None:
+    # B9b review C7: the monitor's thread and a command's thread share one executor.
+    rig = Rig(lock=FileKillLock(tmp_path / "kill.lock"), broker_type=BlockingBroker)
+    broker = rig.broker
+    assert isinstance(broker, BlockingBroker)
+    first: list[KillReport] = []
+    thread = threading.Thread(target=lambda: first.append(rig.run()))
+    thread.start()
+    try:
+        while not hasattr(broker, "entered"):
+            threading.Event().wait(0.001)
+        assert broker.entered.wait(timeout=10)
+        second = rig.run(KillRequest(KillTrigger.DRAWDOWN, "engine", "second"))
+    finally:
+        if hasattr(broker, "go"):
+            broker.go.set()
+        thread.join(timeout=10)
+    assert second.status is KillStatus.BUSY
+    assert [r.status for r in first] == [KillStatus.FLAT]
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
+def test_a_kill_started_before_the_open_queues_its_exit_for_that_open() -> None:
+    # B9b review R3/C3: two failed snapshots carry the run from 09:29:59 past 09:30.
+    rig = Rig(at=et(DAY, 9, 29) + timedelta(seconds=59), day=None, fail={"snapshot": 2})
+    report = rig.run()
+    assert not report.regular_hours
+    assert report.finished_at > CAL.session(DAY).open
+    assert report.status is KillStatus.QUEUED
+    assert report.queued_exit_at == CAL.session(DAY).open
+    assert ("queue_exit", CAL.session(DAY).open, report.halt_reason) in rig.events
+
+
+class SlowQuoteBroker(FakeBroker):
+    """A FakeBroker whose first quote takes `quote_s` seconds of the clock to arrive."""
+
+    quote_s = 0.0
+
+    def quote(self) -> Quote:
+        if self.quote_s:
+            self.clock.advance(timedelta(seconds=self.quote_s))
+            self.quote_s = 0.0
+        return super().quote()
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§5")
+def test_no_exit_is_sent_after_the_close_that_a_slow_quote_ran_into() -> None:
+    # B9b review R4: the half day closes at 13:00; the quote asked for at 12:59:59 arrives at
+    # 13:00:01.
+    rig = Rig(
+        at=et(HALF_DAY, 12, 59) + timedelta(seconds=59),
+        day=HALF_DAY,
+        orders=(),
+        broker_type=SlowQuoteBroker,
+    )
+    assert isinstance(rig.broker, SlowQuoteBroker)
+    rig.broker.quote_s = 2.0
+    report = rig.run()
+    assert "flatten" not in rig.kinds()
+    assert report.exits == ()
+    assert report.status is KillStatus.INCOMPLETE
+    assert report.queued_exit_at == CAL.session(date(2018, 11, 26)).open
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3")
+def test_no_exit_is_sent_after_the_deadline_that_a_slow_quote_ran_into() -> None:
+    # B9b review R4: the quote asked for at the start arrives 301 s later, past the deadline.
+    rig = Rig(at=et(DAY, 11), orders=(), broker_type=SlowQuoteBroker)
+    assert isinstance(rig.broker, SlowQuoteBroker)
+    rig.broker.quote_s = 301.0
+    report = rig.run()
+    assert "flatten" not in rig.kinds()
+    assert report.exits == ()
+    assert report.status is KillStatus.INCOMPLETE
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§8.1")
+def test_control_db_gets_the_halt_reason_in_force() -> None:
+    # B9b review C9: trading was already halted; RiskState keeps that first reason (C10), and
+    # control.db's HALTED must say the same.
+    rig = Rig()
+    assert rig.engine.halt("submission limit")
+    report = rig.run()
+    assert rig.engine.state.halt_reason == "submission limit"
+    assert rig.events[0] == ("write_halted", "submission limit", report.started_at)
+
+
+class RacingEntryBroker(FakeBroker):
+    """The entry `o-1` fills before its cancel lands, and execution puts a 100-share stop
+    `stop-2` over the new position."""
+
+    def cancel(self, approval: RiskApprovedCancel) -> None:
+        if approval.client_order_id == "o-1" and "o-1" in self.orders:
+            self._spend(approval)
+            del self.orders["o-1"]
+            self.move(100)
+            self.orders["stop-2"] = open_order("stop-2", Side.SELL, OrderKind.STOP, 100, 95.0)
+            self.events.append(("cancel", "o-1"))
+            return
+        super().cancel(approval)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("SPEC§10", "ARCH§8.3", "ARCH§16")
+def test_outside_hours_a_position_that_appears_keeps_its_new_stop() -> None:
+    # B9b review C10: the account looked flat with an entry working; the entry filled.
+    rig = Rig(at=et(DAY, 18), day=None, position=0, orders=(ENTRY,), broker_type=RacingEntryBroker)
+    report = rig.run()
+    assert rig.broker.position == 100
+    assert report.status is KillStatus.QUEUED
+    assert report.kept == ("stop-2",)
+    assert "stop-2" in rig.broker.orders
+    assert report.queued_exit_at == CAL.session(NEXT_DAY).open

@@ -89,3 +89,14 @@ def test_five_order_errors_within_10_minutes_fire_the_kill() -> None:
     assert not order_errors_fire([ago(600.001), *five[1:]], now=NOW, config=KILL)
     assert order_errors_fire([ago(5_000), ago(4_000), *five], now=NOW, config=KILL)
     assert not order_errors_fire([], now=NOW, config=KILL)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B9", raises=AssertionError)
+@pytest.mark.spec("C2", "ARCH§8.3", "ARCH§16")
+def test_starts_and_order_errors_after_now_are_ignored() -> None:
+    # B9b review R6: an event stamped after `now` hasn't happened yet at `now`.
+    later = [NOW + timedelta(minutes=k) for k in (1, 2, 3, 4, 5)]
+    assert judge(starts=tuple(later[:3])) == HealthVerdict((), False)
+    assert judge(starts=(ago(300), NOW, later[0])) == HealthVerdict((), False)
+    assert not order_errors_fire(later, now=NOW, config=KILL)
+    assert not order_errors_fire([ago(60), ago(30), NOW, *later[:2]], now=NOW, config=KILL)
