@@ -53,7 +53,9 @@ def backfill(
 ) -> None:
     """Fill market.db with SIP minutes and corporate actions (quant.data.backfill).
 
-    Resumable: sessions already stored are skipped. Exits 0 when done, printing what it did.
+    Resumable: sessions it already stored are skipped. It never goes past the last session
+    whose minutes are all available, whatever --end says. Exits 0 when done, printing what it
+    did, and on stderr any session written NOW and any action it couldn't store.
     Exits 2 when the settings can't be loaded (ConfigError), saying why and creating nothing.
     Exits 3 when the feed reports a split, which halts trading (ARCHITECTURE §6.1).
     """
@@ -73,6 +75,11 @@ def backfill(
         typer.echo(
             f"Fetched {len(result.fetched)}, skipped {result.skipped}, empty {len(result.empty)}; last {result.last}"
         )
+        if result.revised:
+            sessions = ", ".join(day.isoformat() for day in result.revised)
+            typer.echo(f"Completed as NOW (history can't revise them): {sessions}", err=True)
+        for conflict in result.actions.conflicts:
+            typer.echo(f"Action not stored: {conflict}", err=True)
         if result.actions.halt:
             typer.echo(result.actions.halt, err=True)
             raise typer.Exit(3)

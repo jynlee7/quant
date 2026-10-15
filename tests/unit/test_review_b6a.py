@@ -101,7 +101,6 @@ def limited(**headers: str) -> Reply:
 
 
 # X1: a resume treated any stored minute as a finished session.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.1", "ARCH§6.2")
 def test_a_partly_stored_session_is_completed_not_skipped(minutes: MinuteFrame) -> None:
     clock = SimClock(AFTER)
@@ -127,7 +126,6 @@ def test_a_partly_stored_session_is_completed_not_skipped(minutes: MinuteFrame) 
 
 
 # R9: a resume read every stored session in full to learn it wasn't empty.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.1")
 def test_a_resume_over_finished_sessions_reads_no_stored_minutes(
     minutes: MinuteFrame, monkeypatch: pytest.MonkeyPatch
@@ -148,7 +146,6 @@ def test_a_resume_over_finished_sessions_reads_no_stored_minutes(
 
 # X2, R1: an explicit end bypassed the close-plus-feed-delay boundary, and actions were asked
 # for up to it.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.1", "D2")
 def test_an_explicit_end_stops_at_the_last_available_session(minutes: MinuteFrame) -> None:
     clock = SimClock(utc(2017, 11, 22, 15, 30))  # 10:30 ET, an hour into the 22nd
@@ -161,7 +158,6 @@ def test_an_explicit_end_stops_at_the_last_available_session(minutes: MinuteFram
 
 
 # The probe: a bars request whose end is under 15 minutes old gets 403 on the free plan.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("D2", "ARCH§18")
 def test_a_bars_request_never_ends_inside_the_feed_delay(fake: AlpacaFake) -> None:
     clock = SimClock(utc(2017, 11, 24, 16, 0))  # 11:00 ET on the half day
@@ -176,7 +172,6 @@ def test_a_bars_request_never_ends_inside_the_feed_delay(fake: AlpacaFake) -> No
     assert len(minutes) == 75 - 1
 
 
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("D2", "ARCH§18")
 def test_no_bars_request_before_the_first_minute_is_available(fake: AlpacaFake) -> None:
     clock = SimClock(utc(2017, 11, 24, 14, 40))  # ten minutes after the open
@@ -186,7 +181,6 @@ def test_no_bars_request_before_the_first_minute_is_available(fake: AlpacaFake) 
 
 
 # X4: a fully missing hour, and a missing session's hours, were absent from incomplete_bars.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.1", "PLAN§3")
 def test_every_missing_or_incomplete_hourly_slot_is_listed() -> None:
     first, last = date(2017, 11, 20), date(2017, 11, 22)
@@ -205,7 +199,6 @@ def test_every_missing_or_incomplete_hourly_slot_is_listed() -> None:
 
 
 # R2: no HTTP timeout, so a stalled connection could hang the backfill or the engine.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.1", "ARCH§18")
 def test_every_request_has_a_connect_and_read_timeout(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(BARS, "bars_2016-03-01.json")
@@ -228,7 +221,6 @@ def test_every_request_has_a_connect_and_read_timeout(clock: SimClock, fake: Alp
 
 
 # R3: BarStore.latest_minutes read stored prices with no known_at and no DataPolicy purpose.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.2", "ARCH§6.3")
 def test_stored_prices_are_read_only_through_a_view() -> None:
     raw = [
@@ -243,7 +235,6 @@ def test_stored_prices_are_read_only_through_a_view() -> None:
 
 # R4: a 429 ignored X-RateLimit-Reset, refused an HTTP-date Retry-After, and gave up after
 # 5 x 3 s, inside Alpaca's 60 s window.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.1", "ARCH§18", "K6")
 def test_a_429_waits_for_x_ratelimit_reset(clock: SimClock, fake: AlpacaFake) -> None:
     reset = int(START.timestamp()) + 42
@@ -256,7 +247,6 @@ def test_a_429_waits_for_x_ratelimit_reset(clock: SimClock, fake: AlpacaFake) ->
     assert clock.now() - START < timedelta(seconds=43)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=DataError)
 @pytest.mark.spec("ARCH§6.1", "ARCH§18", "K6")
 def test_a_429_with_an_http_date_retry_after_waits_until_then(
     clock: SimClock, fake: AlpacaFake
@@ -272,7 +262,6 @@ def test_a_429_with_an_http_date_retry_after_waits_until_then(
     assert len(minutes) == 390
 
 
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=DataError)
 @pytest.mark.spec("ARCH§6.1", "ARCH§18", "K6")
 def test_429s_are_waited_out_for_a_full_rate_window(clock: SimClock, fake: AlpacaFake) -> None:
     # 429s with no wait headers at all, for the whole 60 s window.
@@ -297,7 +286,6 @@ def test_the_sdk_makes_one_request_per_call_on_a_429(clock: SimClock, fake: Alpa
 
 
 # R5: refetched actions under HISTORY raised on any correction, so every later run failed.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=DataError)
 @pytest.mark.spec("ARCH§6.2")
 def test_a_changed_action_under_history_is_reported_and_the_rest_still_store() -> None:
     store = BarStore.memory()
@@ -318,7 +306,6 @@ def test_a_changed_action_under_history_is_reported_and_the_rest_still_store() -
 
 
 # R5, proven on real data (VERIFY.md): five SPY announcements are declared after their ex-date.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.2")
 def test_an_announcement_declared_after_its_ex_date_falls_back_to_the_ex_date() -> None:
     (row,) = fixture("announcements_spy_2017-12_planted.json")
@@ -331,7 +318,6 @@ def test_an_announcement_declared_after_its_ex_date_falls_back_to_the_ex_date() 
 
 
 # R6: a stock dividend in the announcements was rejected (cash 0) or would be stored as cash.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=DataError)
 @pytest.mark.spec("ARCH§6.1", "ARCH§6.2")
 def test_a_stock_dividend_is_never_cash_and_never_fails_the_batch() -> None:
     (cash,) = fixture("announcements_spy_2017-12_planted.json")
@@ -351,7 +337,6 @@ def test_a_stock_dividend_is_never_cash_and_never_fails_the_batch() -> None:
 
 
 # R7: a page without its `corporate_actions` object raised a bare KeyError.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=KeyError)
 @pytest.mark.spec("ARCH§6.1")
 def test_a_corporate_actions_page_without_its_object_is_a_data_error(
     clock: SimClock, fake: AlpacaFake
@@ -361,7 +346,6 @@ def test_a_corporate_actions_page_without_its_object_is_a_data_error(
         client(clock).corporate_actions("SPY", date(2016, 1, 1), date(2018, 12, 31))
 
 
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AttributeError)
 @pytest.mark.spec("ARCH§6.1")
 def test_announcements_that_are_not_a_list_are_a_data_error(
     clock: SimClock, fake: AlpacaFake

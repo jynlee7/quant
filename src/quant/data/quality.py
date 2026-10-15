@@ -6,8 +6,9 @@ For one symbol and a span of sessions it lists:
 - the gaps: a session with no minutes at all, and each run of consecutive missing minutes in a
   session that has some (a minute is missing when the session map has it and the store
   doesn't);
-- the hourly bars left incomplete (their last minute is missing), which decisions treat as
-  missing;
+- every hourly slot of the session map left missing or incomplete (its last minute isn't
+  stored), which decisions treat as missing: a slot with no minutes at all, and every slot of a
+  missing session, included;
 - the move flags that stand (a one-minute move over 5%, used but alerted).
 
 Every gap must be explained before CP1. Explanations are given by gap key: the session's ISO
@@ -15,8 +16,9 @@ date for a missing session, and the first missing minute's UTC time (`2017-11-24
 for a run of missing minutes. A gap with no explanation is listed in `unexplained`, and the
 report is `ok` only when there are none.
 
-The report reads the store's latest versions. It checks data, not a strategy, so it reads every
-segment, the lockbox and DEV included; it computes no P&L.
+The report reads which minutes the store holds (`BarStore.minute_times`), never their prices. It
+checks data, not a strategy, so it covers every segment, the lockbox and DEV included; it
+computes no P&L.
 """
 
 from __future__ import annotations
@@ -31,8 +33,6 @@ import numpy as np
 
 from quant.core.calendar import TradingCalendar
 from quant.core.epoch import MINUTE_US, from_us, to_us
-from quant.core.schedule import Timing
-from quant.data.bars import build_hourly
 from quant.data.market_db import BarStore
 from quant.data.validate import DataFlag
 
@@ -69,7 +69,7 @@ class QualityReport:
     minutes_expected: int
     minutes_present: int
     gaps: tuple[Gap, ...]  # in time order
-    incomplete_bars: tuple[datetime, ...]  # t_open of each hourly bar missing its last minute
+    incomplete_bars: tuple[datetime, ...]  # t_open of each hourly slot missing its last minute
     flags: tuple[DataFlag, ...]
 
     @property
@@ -112,19 +112,22 @@ def quality_report(
         if session.is_half_day:
             half_days.append(day)
         times = np.arange(to_us(session.open), to_us(session.close), MINUTE_US, dtype=np.int64)
-        frame = store.latest_minutes(symbol, session.open, session.close)
+        stored = store.minute_times(symbol, session.open, session.close)
         expected += len(times)
-        present += len(frame)
-        if not len(frame):
+        present += len(stored)
+        lasts = np.array([to_us(bar.t_close) - MINUTE_US for bar in session.bars], dtype=np.int64)
+        incomplete.extend(
+            bar.t_open
+            for bar, held in zip(session.bars, np.isin(lasts, stored).tolist(), strict=True)
+            if not held
+        )
+        if not len(stored):
             gaps.append(Gap(GapKind.MISSING_SESSION, day, session.open, len(times), None))
             continue
-        missing = np.setdiff1d(times, frame.t)
+        missing = np.setdiff1d(times, stored)
         if len(missing):
             for run in np.split(missing, np.flatnonzero(np.diff(missing) != MINUTE_US) + 1):
                 gaps.append(Gap(GapKind.MISSING_MINUTES, day, from_us(int(run[0])), len(run), None))
-        incomplete.extend(
-            b.t_open for b in build_hourly(calendar, frame, Timing()) if not b.complete
-        )
     gaps = [replace(g, explanation=(explanations or {}).get(g.key)) for g in gaps]
     flags = tuple(
         f

@@ -6,22 +6,30 @@ Two Alpaca sources report them, in different shapes:
   2016 but gives no declaration date: its cash dividends carry only the ex, process, record and
   payable dates;
 - the trading host's announcements, `GET /v2/corporate_actions/announcements`
-  (`actions_from_announcements`), which give `declaration_date` but, as recorded on 2026-10-15,
-  return nothing for 2017.
+  (`actions_from_announcements`), which give `declaration_date` but, as the probe found on
+  2026-10-15, only from 2020-09 on (docs/VERIFY.md).
 
 As history, an action is known at the end of its declaration day in New York (ARCHITECTURE
 §6.2). Where the source gives no declaration date, the ex-date stands in for it: the latest day
 the store accepts (`BarStore.put_dividend` refuses one declared after its ex-date), so an action
-is never known earlier than it could have been. `declared_in_feed` says which it was.
+is never known earlier than it could have been. A declaration date after the ex-date can't be
+right (five of SPY's announcements have one, VERIFY.md), so it counts as missing too.
+`declared_in_feed` says whether the source's date was used.
 
 SPY has never split, and raw prices break across a split, so a split in the feed halts trading
-(ARCHITECTURE §6.1). `store_actions` stores it like any action and surfaces it in `ActionSync`.
+(ARCHITECTURE §6.1). A stock dividend (an announcement's `ca_sub_type` "stock") changes the
+share count the same way, so it maps to a split of `new_rate / old_rate`, never to cash.
+`store_actions` stores splits like any action and surfaces them in `ActionSync`.
+
+Actions are fetched again on every backfill. One stored before with the same values changes
+nothing. One that differs is a revision, which history can't make (ARCHITECTURE §6.2): it is
+left as stored and reported in `ActionSync.conflicts`, and the others are still stored.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -58,8 +66,9 @@ class CorporateActions:
 class ActionSync:
     """What `store_actions` stored, and why trading must halt, if it must."""
 
-    dividends: int
+    dividends: int  # the dividends stored or already stored, conflicts left out
     splits: tuple[Split, ...]
+    conflicts: tuple[str, ...] = ()  # actions that couldn't be stored as given, and why
 
     @property
     def halt(self) -> str | None:
@@ -69,19 +78,24 @@ class ActionSync:
         return "split: " + ", ".join(f"{s.symbol} {s.ex_date}" for s in self.splits)
 
 
-def actions_from_feed(payload: Mapping[str, Any]) -> CorporateActions:
+def actions_from_feed(payload: Any) -> CorporateActions:
     """Map the market-data feed's `corporate_actions` object (cash_dividends, forward_splits,
     reverse_splits) to dividends and splits, in ex-date order. A dividend's amount is its
     `rate`; a split's ratio is `new_rate / old_rate`. Other action types are ignored. Raises
-    DataError on a record missing a field it needs."""
+    DataError when the payload isn't an object, or on a record missing a field it needs."""
+    if not isinstance(payload, Mapping):
+        raise DataError("malformed corporate actions: not an object")
     dividends: list[Dividend] = []
     splits: list[Split] = []
     try:
         for kind in ("cash_dividends", "forward_splits", "reverse_splits"):
             for row in payload.get(kind, []):
                 ex = date.fromisoformat(row["ex_date"])
-                declared = date.fromisoformat(row.get("declaration_date") or ex.isoformat())
-                supplied = bool(row.get("declaration_date"))
+                given = row.get("declaration_date")
+                declared = date.fromisoformat(given) if given else ex
+                supplied = declared <= ex and bool(given)
+                if not supplied:  # missing, or after the ex-date: the ex-date stands in
+                    declared = ex
                 symbol = str(row["symbol"])
                 if kind == "cash_dividends":
                     dividends.append(
@@ -99,22 +113,26 @@ def actions_from_feed(payload: Mapping[str, Any]) -> CorporateActions:
     )
 
 
-def actions_from_announcements(payload: Sequence[Mapping[str, Any]]) -> CorporateActions:
+def actions_from_announcements(payload: Any) -> CorporateActions:
     """Map the trading host's announcements (ca_type dividend or split) to dividends and splits,
-    declared on their `declaration_date`. A dividend's amount is `cash`, a decimal string; a
-    split's ratio is `new_rate / old_rate`. Raises DataError on a record missing a field it
-    needs."""
+    declared on their `declaration_date`. A cash dividend's amount is `cash`, a decimal string;
+    a split's ratio, and a stock dividend's, is `new_rate / old_rate`. Raises DataError when the
+    payload isn't a list of records, or on a record missing a field it needs."""
+    if not isinstance(payload, list):
+        raise DataError("malformed announcements: not a list")
     feed: dict[str, list[dict[str, Any]]] = {"cash_dividends": [], "forward_splits": []}
     for row in payload:
-        kind = row.get("ca_type", "").lower()
+        if not isinstance(row, Mapping):
+            raise DataError("malformed announcement: not an object")
+        kind = str(row.get("ca_type", "")).lower()
         if kind not in ("dividend", "split"):
             continue
-        if not row.get("declaration_date"):
-            raise DataError("missing declaration_date")
         mapped = dict(row)
         if "initiating_symbol" not in row:
             raise DataError("missing initiating_symbol")
         mapped["symbol"] = row["initiating_symbol"]
+        if kind == "dividend" and str(row.get("ca_sub_type", "")).lower() == "stock":
+            kind = "split"  # more shares per share: raw prices break as at a split
         if kind == "dividend":
             if "cash" not in row:
                 raise DataError("missing cash")
@@ -127,18 +145,30 @@ def store_actions(
     store: BarStore, symbol: str, actions: CorporateActions, *, known_at: Stamp
 ) -> ActionSync:
     """Store `symbol`'s dividends and splits (`BarStore.put_dividend`, `put_split`), stamped as
-    `known_at` says. Storing the same actions twice changes nothing."""
+    `known_at` says. Storing the same actions twice changes nothing. An action the store
+    refuses, such as a changed one under HISTORY, is left as stored and reported in
+    `ActionSync.conflicts`; the others are still stored. Every split is surfaced, so it
+    halts."""
     dividends = [d for d in actions.dividends if d.symbol == symbol]
     splits = tuple(s for s in actions.splits if s.symbol == symbol)
+    conflicts: list[str] = []
+    stored = 0
     for d in dividends:
-        store.put_dividend(
-            symbol, ex_date=d.ex_date, amount=d.amount, declared=d.declared, known_at=known_at
-        )
+        try:
+            store.put_dividend(
+                symbol, ex_date=d.ex_date, amount=d.amount, declared=d.declared, known_at=known_at
+            )
+            stored += 1
+        except DataError as exc:
+            conflicts.append(str(exc))
     for s in splits:
-        store.put_split(
-            symbol, ex_date=s.ex_date, ratio=s.ratio, declared=s.declared, known_at=known_at
-        )
-    return ActionSync(len(dividends), splits)
+        try:
+            store.put_split(
+                symbol, ex_date=s.ex_date, ratio=s.ratio, declared=s.declared, known_at=known_at
+            )
+        except DataError as exc:
+            conflicts.append(str(exc))
+    return ActionSync(stored, splits, tuple(conflicts))
 
 
 def _positive(value: Any) -> float:

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import structlog
 
+from quant.core import logs
 from quant.core.errors import ConfigError
 from quant.core.logs import REDACTED, configure_logging
 from quant.core.orders import TradingMode
@@ -21,9 +22,10 @@ from quant.core.settings import load_settings
 KEY_ID = "settings-key-id-7f3a9c0b"
 SECRET = "settings-secret-5e1d8b2a4c6f"
 BOT_TOKEN = "settings-bot-token-91c4e7aa"
-# The keys systemd injects through the environment, in the environment test.
-ENV_KEY_ID = KEY_ID + "-env"
-ENV_SECRET = SECRET + "-env"
+# The keys systemd injects through the environment, in the environment test: unrelated to the
+# file's, so no registered file key, nor a prefix of one, can redact them.
+ENV_KEY_ID = "environ-key-id-alpha-bravo"
+ENV_SECRET = "environ-secret-charlie-delta"
 
 
 def write_env(directory: Path, text: str, *, mode: int = 0o600) -> Path:
@@ -45,6 +47,18 @@ def env_text(**overrides: str | None) -> str:
     lines = ["# trading account", ""]
     lines += [f"{name}={value}" for name, value in values.items() if value is not None]
     return "\n".join(lines) + "\n"
+
+
+@pytest.fixture(autouse=True)
+def isolated_secrets() -> Iterator[None]:
+    """Each test starts with no registered secret and leaves the registry as it found it. The
+    registry is process-global: a key an earlier test registered would redact this test's, and
+    hide a loader that registers nothing (B6a review, X3)."""
+    saved = set(logs._registered)
+    logs._registered.clear()
+    yield
+    logs._registered.clear()
+    logs._registered.update(saved)
 
 
 @pytest.fixture
@@ -152,9 +166,8 @@ def test_a_missing_env_file_is_refused(tmp_path: Path) -> None:
 
 
 # X3 (B6a review): the two redaction tests above must fail when the loader doesn't register. The
-# registry is process-global, so a key an earlier test registered, or a prefix of one, would
-# redact the value and hide a loader that registers nothing.
-@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
+# registry is process-global, so without `isolated_secrets` a key an earlier test registered, or
+# a prefix of one, would redact the value and hide a loader that registers nothing.
 @pytest.mark.spec("I6")
 @pytest.mark.parametrize("source", ["file", "environment"])
 def test_without_registration_the_same_keys_would_reach_the_log(

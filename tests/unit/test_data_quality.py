@@ -71,8 +71,12 @@ def test_the_report_finds_every_gap_on_a_planted_store() -> None:
             "2017-11-27T17:29:00Z",
         ),
     ]
-    # 11:30-12:30 ET on the 27th lost its last minute, so decisions treat it as missing.
-    assert report.incomplete_bars == (utc(2017, 11, 27, 16, 30),)
+    # Every slot of the withheld 21st, and 11:30-12:30 ET on the 27th, which lost its last
+    # minute: decisions treat them as missing.
+    assert report.incomplete_bars == (
+        *(bar.t_open for bar in XNYS.session(date(2017, 11, 21)).bars),
+        utc(2017, 11, 27, 16, 30),
+    )
     assert utc(2017, 11, 28, 16, 0) in [flag.t for flag in report.flags]
 
     assert report.unexplained == report.gaps

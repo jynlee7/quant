@@ -1,7 +1,7 @@
 # PLAN — SPY Regime Trader
 
 **Status:** APPROVED v1.3 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does. v1.2 adds step B20, Jev as a shadow advisor (SPEC v1.4 §12a, ARCHITECTURE v1.6), which you approved on 2026-10-13 (§0, §0.3, §1, §4). v1.3 records two calls of yours: B9 may merge before B5–B8, which you decided on 2026-10-13 (§4 B9), and every step merges through a pull request on the private GitHub repo, decided on 2026-10-14 (§2 rule 7).
-**Builds on:** [SPEC.md](SPEC.md) v1.6 (v1.1 plus this plan's C11–C17, B3's reading of §3, the Jev shadow advisor, B9's resume and kill calls, and B4's reading of §4–§6) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.8 (v1.0 aligned with this plan, notes from B0, B2, B4, B9 and B10, and the Jev shadow advisor), approved 2026-10-05 and amended since; the shadow advisor was approved 2026-10-13
+**Builds on:** [SPEC.md](SPEC.md) v1.6 (v1.1 plus this plan's C11–C17, B3's reading of §3, the Jev shadow advisor, B9's resume and kill calls, and B4's reading of §4–§6) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.9 (v1.0 aligned with this plan, notes from B0, B2, B4, B6, B9 and B10, and the Jev shadow advisor), approved 2026-10-05 and amended since; the shadow advisor was approved 2026-10-13
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The build started 2026-10-05 with B0. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 

@@ -13,13 +13,22 @@ Bars: `session_minutes` asks for one session, from its open to its close. Alpaca
 inclusive and the feed has extended hours, so the minute starting at the close comes back too;
 only minutes starting in [open, close) are kept. A minute Alpaca doesn't have stays missing:
 nothing is filled in, and the quality report counts it. Pages are followed by
-`next_page_token` until it is null, including through a page with no bars.
+`next_page_token` until it is null, including through a page with no bars. A request never ends
+inside the feed delay: the free plan refuses (403) one whose `end` is less than 15 minutes old
+(docs/VERIFY.md), so a session still under way is asked for only up to its last available
+minute, and one with none available yet isn't asked for at all.
+
+Every request has a connect and a read timeout, and a timeout is a DataError like any failed
+request: nothing waits on the network forever.
 
 Rate limits: requests are spaced to stay under `requests_per_minute` (200 a minute on the free
-plan). A 429 waits for its `Retry-After` and tries again, up to `max_retries` times, then raises
-DataError. All waiting goes through the Clock (`Clock.sleep_until`), never `time.sleep`, so a
-test on a SimClock waits no wall time; alpaca-py's own retry, which sleeps a fixed 3 s and
-ignores Retry-After, must not run.
+plan). A 429 waits as long as it says: its `Retry-After` (seconds or an HTTP date), else until
+its `X-RateLimit-Reset` (epoch seconds), else a backoff that doubles from 1 s to a full 60 s
+window. It tries again up to `max_retries` times, within `max_wait` of waiting in all, which
+covers a full window, then raises DataError. All waiting goes through the Clock
+(`Clock.sleep_until`), never `time.sleep`, so a test on a SimClock waits no wall time.
+alpaca-py's own retry, which sleeps a fixed 3 s and ignores Retry-After, must not run: it is
+given no status code to retry on.
 
 alpaca-py's trading package belongs to the execution adapter alone (K4), so this module never
 imports `alpaca.trading`: the calendar and the announcements come from the trading host by plain
@@ -29,12 +38,14 @@ GET.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any, Final
 
 import numpy as np
+import requests
 from alpaca.common.exceptions import APIError
 from alpaca.common.rest import RESTClient
 from requests.exceptions import RequestException
@@ -44,6 +55,7 @@ from quant.core.clock import Clock, ensure_utc
 from quant.core.epoch import to_us
 from quant.core.errors import DataError
 from quant.core.orders import Quote
+from quant.core.schedule import Timing
 from quant.core.settings import AlpacaKeys
 from quant.data.actions import (
     CorporateActions,
@@ -61,6 +73,28 @@ TRADING_URL: Final = "https://paper-api.alpaca.markets"
 FEED_BARS: Final = "sip"
 FEED_LIVE: Final = "iex"
 ADJUSTMENT: Final = "raw"
+
+TIMEOUT: Final = (5.0, 30.0)  # seconds: to connect, and between bytes of the answer
+RATE_WINDOW: Final = timedelta(seconds=60)  # Alpaca's rate limit counts a minute's requests
+MAX_WAIT: Final = timedelta(seconds=120)  # a call's waits for 429s, in all: two full windows
+
+# No HTTP status is -1, so alpaca-py's RESTClient retries nothing itself (its public
+# `retry_exception_codes`; `retry_attempts=0` is read as "use the default").
+_NO_STATUS: Final = -1
+_MINUTE: Final = timedelta(minutes=1)
+
+
+class _TimeoutSession(requests.Session):
+    """A requests session that gives every request a timeout unless it names one."""
+
+    def __init__(self, timeout: tuple[float, float]) -> None:
+        super().__init__()
+        self._timeout = timeout
+
+    def request(self, method: Any, url: Any, *args: Any, **kwargs: Any) -> requests.Response:
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = self._timeout
+        return super().request(method, url, *args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -91,44 +125,60 @@ class AlpacaMarketData:
         *,
         clock: Clock,
         calendar: TradingCalendar | None = None,
+        timing: Timing | None = None,
         requests_per_minute: int = 190,
-        max_retries: int = 5,
+        max_retries: int = 10,
+        max_wait: timedelta = MAX_WAIT,
+        timeout: tuple[float, float] = TIMEOUT,
         data_url: str = DATA_URL,
         trading_url: str = TRADING_URL,
     ) -> None:
-        if requests_per_minute <= 0 or max_retries < 0:
+        if requests_per_minute <= 0 or max_retries < 0 or max_wait < timedelta(0):
             raise ValueError("invalid rate or retry limit")
+        if len(timeout) != 2 or not all(math.isfinite(t) and t > 0 for t in timeout):
+            raise ValueError("timeouts must be finite and positive")
         self._clock = clock
         self._calendar = calendar or TradingCalendar.xnys()
+        self._timing = timing or Timing()
         self._spacing = timedelta(microseconds=math.ceil(60_000_000 / requests_per_minute))
         self._next_request = clock.now()
         self._max_retries = max_retries
+        self._max_wait = max_wait
         self._trading_url = trading_url
         # Use the SDK transport directly: importing its data package also imports
-        # alpaca.trading. Disable built-in wall-clock retries for every request.
+        # alpaca.trading. It retries no status itself; 429s are waited out here, on the Clock.
         self._client = RESTClient(
             data_url,
             api_key=keys.key_id,
             secret_key=keys.secret_key,
             raw_data=True,
-            retry_attempts=0,
+            retry_exception_codes=[_NO_STATUS],
         )
-
-        # alpaca-py treats retry_attempts=0 as falsy and restores its default.
-        self._client._retry = 0
+        # The SDK's session sets no timeout and takes none, so it gets one that does. A test
+        # checks every request carries the timeout, so this fails loudly if the SDK changes.
+        self._client._session = _TimeoutSession(timeout)
 
     def session_minutes(self, symbol: str, day: date) -> MinuteFrame:
         """`symbol`'s raw SIP minutes of session `day`, starting in [open, close), in time
-        order. Empty when Alpaca has none. Raises CalendarError when `day` isn't a session, and
-        DataError when the response is malformed or the retries run out."""
+        order, as far as they are available now: a minute is, once it has closed and the feed
+        delay has passed. Empty when Alpaca has none, or none is available yet. Raises
+        CalendarError when `day` isn't a session, and DataError when the response is malformed
+        or the retries run out."""
         session = self._calendar.session(day)
+        # The last minute available now: it starts a minute and the feed delay before now.
+        newest = (self._clock.now() - self._timing.feed_delay - _MINUTE).replace(
+            second=0, microsecond=0
+        )
+        end = min(session.close, newest)
+        if end < session.open:
+            return MinuteFrame.empty()
         params = {
             "symbols": symbol,
             "timeframe": "1Min",
             "feed": FEED_BARS,
             "adjustment": ADJUSTMENT,
             "start": session.open.isoformat(),
-            "end": session.close.isoformat(),
+            "end": end.isoformat(),
             "limit": "10000",
         }
         rows: list[tuple[int, float, float, float, float, float]] = []
@@ -136,7 +186,7 @@ class AlpacaMarketData:
             for page in self._pages("/stocks/bars", params):
                 for row in (page.get("bars") or {}).get(symbol, []):
                     at = _timestamp(row["t"])
-                    if session.open <= at < session.close:
+                    if session.open <= at < session.close and at <= newest:
                         rows.append(
                             (
                                 to_us(at),
@@ -221,7 +271,7 @@ class AlpacaMarketData:
         dividends: list[Dividend] = []
         splits: list[Split] = []
         for page in self._pages("/corporate-actions", params, version="v1"):
-            actions = actions_from_feed(page["corporate_actions"])
+            actions = actions_from_feed(page.get("corporate_actions"))
             dividends.extend(actions.dividends)
             splits.extend(actions.splits)
         return CorporateActions(
@@ -248,6 +298,7 @@ class AlpacaMarketData:
     def _get(
         self, path: str, params: dict[str, str], *, trading: bool = False, version: str = "v2"
     ) -> Any:
+        waited = timedelta(0)
         for attempt in range(self._max_retries + 1):
             self._clock.sleep_until(max(self._clock.now(), self._next_request))
             self._next_request = self._clock.now() + self._spacing
@@ -259,21 +310,51 @@ class AlpacaMarketData:
                     base_url=self._trading_url if trading else None,
                 )
             except APIError as exc:
-                if exc.status_code != 429 or attempt == self._max_retries:
+                if exc.status_code != 429:
                     raise DataError(f"Alpaca HTTP {exc.status_code}") from None
-                response = exc._http_error.response
-                try:
-                    seconds = float(response.headers.get("Retry-After", "3"))
-                    if not math.isfinite(seconds) or seconds < 0:
-                        raise ValueError
-                except (ValueError, TypeError):
-                    raise DataError("invalid Retry-After") from None
-                self._next_request = max(
-                    self._next_request, self._clock.now() + timedelta(seconds=seconds)
-                )
+                if attempt == self._max_retries:
+                    raise DataError(f"Alpaca HTTP 429 after {attempt} retries") from None
+                wait = self._rate_wait(exc.response, attempt)
+                waited += wait
+                if waited > self._max_wait:
+                    raise DataError(
+                        f"Alpaca HTTP 429: waiting {wait} more would pass {self._max_wait}"
+                    ) from None
+                self._next_request = max(self._next_request, self._clock.now() + wait)
             except (RequestException, ValueError):
-                raise DataError("Alpaca request failed") from None
+                raise DataError("Alpaca request failed or timed out") from None
         raise AssertionError("unreachable retry loop")
+
+    def _rate_wait(self, response: Any, attempt: int) -> timedelta:
+        """How long a 429 says to wait: its Retry-After, in seconds or as an HTTP date, else
+        until its X-RateLimit-Reset, in epoch seconds, else a backoff doubling from 1 s to a
+        full window. Raises DataError on a header it can't read."""
+        headers: Mapping[str, str] = {} if response is None else response.headers
+        now = self._clock.now()
+        retry_after = headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                seconds = float(retry_after)
+            except ValueError:
+                try:
+                    when = parsedate_to_datetime(retry_after)
+                except (TypeError, ValueError):
+                    raise DataError("invalid Retry-After") from None
+                if when.tzinfo is None:
+                    raise DataError("invalid Retry-After") from None
+                return max(timedelta(0), when - now)
+            if not math.isfinite(seconds) or seconds < 0:
+                raise DataError("invalid Retry-After")
+            return timedelta(seconds=seconds)
+        reset = headers.get("X-RateLimit-Reset")
+        if reset is not None:
+            try:
+                epoch = float(reset)
+                when = datetime.fromtimestamp(epoch, UTC)
+            except (ValueError, OverflowError, OSError):
+                raise DataError("invalid X-RateLimit-Reset") from None
+            return max(timedelta(0), when - now)
+        return min(timedelta(seconds=2**attempt), RATE_WINDOW)
 
     def _pages(
         self, path: str, params: dict[str, str], *, version: str = "v2"
