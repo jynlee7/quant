@@ -8,7 +8,9 @@ so these tests stay in the fast tier. The real selection on 2016–2018 is B6b's
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
+import subprocess
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -22,11 +24,14 @@ from structlog.testing import capture_logs
 from typer.testing import CliRunner
 
 import quant.cli.model as cli_model
+import quant.jobs.first_model as first_model
 from quant.cli.main import app
 from quant.core.canonical import canonical_dumps, canonical_loads
-from quant.core.errors import PolicyError
+from quant.core.epoch import to_us
+from quant.core.errors import ConfigError, DataError, ModelError, PolicyError
 from quant.data.policy import DataPolicy, Purpose, ScoringTicket
 from quant.features.menu import r1_features
+from quant.features.stream import compute_features
 from quant.hmm.labels import r1_thresholds
 from quant.hmm.model import load_model
 from quant.hmm.select import Candidate
@@ -42,10 +47,11 @@ from quant.jobs.first_model import (
     select_first_model,
     training_data,
 )
-from tests.support.bars import SYMBOL
+from tests.support.bars import SYMBOL, store_with_days
 from tests.support.truncation import (
     DATA_FIRST,
     DATA_LAST,
+    HORIZON,
     MODEL_FIT_END,
     fixture_training_data,
     garbage_store,
@@ -321,9 +327,14 @@ def test_a_span_outside_fit_is_refused_before_anything_is_read_or_written(
 ) -> None:
     policy = SpyPolicy()
     artifacts = tmp_path / "artifacts"
+    # Every statement the store's connection runs is traced, not only the reads the policy
+    # checks (review M7): refused means not one statement.
+    store = truncated_store(world(), HORIZON)
+    statements: list[str] = []
+    store._conn.set_trace_callback(statements.append)
     with pytest.raises(PolicyError):
         select_first_model(
-            world().store,
+            store,
             symbol=SYMBOL,
             first=first,
             last=last,
@@ -336,7 +347,9 @@ def test_a_span_outside_fit_is_refused_before_anything_is_read_or_written(
             workers=1,
             policy=policy,
         )
+    store.close()
     assert policy.reads == []
+    assert statements == []
     assert not artifacts.exists()
 
 
@@ -446,3 +459,179 @@ def test_code_provenance_reads_the_commit_and_lockfile_from_files(tmp_path: Path
     assert code_provenance(tmp_path)["commit"] == "c" * 40
     (git / "HEAD").write_text("ref: refs/heads/elsewhere\n")
     assert code_provenance(tmp_path)["commit"] is None
+
+
+# --- the B6b review (2026-10-15) ---------------------------------------------------------------
+
+
+def _red(raises: type[BaseException]) -> pytest.MarkDecorator:
+    return pytest.mark.xfail(strict=True, reason="red:B6", raises=raises)
+
+
+@_red(AssertionError)
+@pytest.mark.spec("D4", "SPEC§4", "ARCH§4.2")
+def test_the_feature_stream_starts_at_the_start_of_fit_not_at_the_span() -> None:
+    # Review S4: a span starting after FIT's start keeps the rows the stream started at FIT's
+    # start gives in its window, as live (ARCHITECTURE §4.2), not a stream seeded at the span.
+    w = world()
+    first = date(2016, 10, 3)
+    start, end = fit_window(first, DATA_LAST)
+    data = training_data(w.store, SYMBOL, first=first, last=DATA_LAST, features=r1_features())
+    bars = w.store.view(end, as_of=end).hourly(SYMBOL, purpose=Purpose.OPERATE)
+    expected = compute_features(bars, r1_features()).window(start, end)
+    assert data.matrix.t_open.tolist() == expected.t_open.tolist()
+    assert np.array_equal(data.matrix.values, expected.values)
+    assert (data.fit_start, data.fit_end) == (start, end)
+
+
+@_red(ModelError)
+@pytest.mark.spec("D4", "C11", "A2", "ARCH§6.3")
+def test_training_data_refuses_dev_bars_even_if_fit_last_were_wider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review M4: FIT-only must not rest on fit_window alone, since OPERATE may read anything. With
+    # FIT_LAST widened by mistake, the rows themselves are checked against DEV's start.
+    store = store_with_days(date(2018, 12, 20), date(2019, 1, 4))
+    monkeypatch.setattr(first_model, "FIT_LAST", date(2019, 12, 31))
+    with pytest.raises(PolicyError, match="DEV"):
+        training_data(
+            store, SYMBOL, first=date(2018, 12, 20), last=date(2019, 1, 4), features=r1_features()
+        )
+
+
+@_red(AssertionError)
+@pytest.mark.spec("D4", "I1", "ARCH§6.2")
+def test_a_fit_session_known_after_fit_end_is_refused_not_dropped() -> None:
+    # Review M5: a FIT session written NOW after fit_end is invisible at as_of = fit_end; the rows
+    # must not silently skip it.
+    w = world()
+    last = date(2016, 10, 31)
+    _, end = fit_window(DATA_FIRST, last)
+    store = truncated_store(w, HORIZON)
+    store._conn.execute(
+        "UPDATE hourly_bars SET known_at = ? WHERE session = '2016-07-06'",
+        (to_us(end + timedelta(days=30)),),
+    )
+    try:
+        training_data(store, SYMBOL, first=DATA_FIRST, last=last, features=r1_features())
+    except DataError as exc:
+        message = str(exc)
+    else:
+        message = ""
+    finally:
+        store.close()
+    assert "2016-07-06" in message, "a session missing at fit_end was dropped silently"
+
+
+@_red(AssertionError)
+@pytest.mark.spec("D4", "PLAN§3", "C11")
+def test_the_markdown_fit_window_is_half_open(root: Path) -> None:
+    # Review M8: the window ends at New York midnight after the span, which no CP1 reader should
+    # take for a read of DEV's first day.
+    text = selected(root).first.report_markdown.read_text()
+    n_rows = selected(root).first.report["n_rows"]
+    assert (
+        f"- Fit window: 2016-06-01 to 2016-12-30 (end exclusive 2016-12-31T05:00Z); {n_rows} rows"
+        in text.splitlines()
+    )
+
+
+@pytest.mark.spec("D4", "PLAN§3")
+@pytest.mark.parametrize(
+    "kind",
+    [
+        pytest.param("older", marks=_red(sqlite3.OperationalError)),
+        pytest.param("newer", marks=_red(ConfigError)),
+        pytest.param("not a database", marks=_red(sqlite3.DatabaseError)),
+    ],
+)
+def test_quant_model_select_refuses_a_store_it_cannot_read(tmp_path: Path, kind: str) -> None:
+    # Review S7: the read-only store can't be migrated, so a schema this code doesn't read is
+    # refused with exit 2 and a reason, never a traceback.
+    db, artifacts = tmp_path / "market.db", tmp_path / "artifacts"
+    if kind == "not a database":
+        db.write_bytes(b"not a database, just bytes " * 40)
+    else:
+        _market_db(db)
+        conn = sqlite3.connect(db)
+        if kind == "older":
+            conn.execute("DROP TABLE backfilled_sessions")
+        conn.execute(f"PRAGMA user_version = {1 if kind == 'older' else 99}")
+        conn.commit()
+        conn.close()
+    result = CliRunner().invoke(
+        app,
+        [
+            "model",
+            "select",
+            "--db",
+            str(db),
+            "--artifacts",
+            str(artifacts),
+            "--root",
+            str(tmp_path),
+        ],
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 2, result.output
+    assert "market.db" in result.output
+    assert not artifacts.exists()
+
+
+@_red(AssertionError)
+@pytest.mark.spec("ARCH§7.2")
+def test_code_provenance_follows_a_worktrees_git_file(tmp_path: Path) -> None:
+    # Review S8: in a git worktree `.git` is a file naming the worktree's git directory, whose
+    # `commondir` holds the refs.
+    common = tmp_path / "main" / ".git"
+    gitdir = common / "worktrees" / "wt"
+    gitdir.mkdir(parents=True)
+    (common / "refs" / "heads").mkdir(parents=True)
+    (common / "refs" / "heads" / "b06-data").write_text(f"{'d' * 40}\n")
+    (gitdir / "HEAD").write_text("ref: refs/heads/b06-data\n")
+    (gitdir / "commondir").write_text("../..\n")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {gitdir}\n")
+    assert code_provenance(worktree)["commit"] == "d" * 40
+    (common / "refs" / "heads" / "b06-data").unlink()
+    (common / "packed-refs").write_text(f"{'e' * 40} refs/heads/b06-data\n")
+    assert code_provenance(worktree)["commit"] == "e" * 40
+    (gitdir / "HEAD").write_text(f"{'f' * 40}\n")  # detached
+    assert code_provenance(worktree)["commit"] == "f" * 40
+
+
+def _git(root: Path, *args: str) -> None:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
+
+
+@_red(KeyError)
+@pytest.mark.spec("ARCH§7.2")
+def test_code_provenance_notes_a_dirty_tree(tmp_path: Path) -> None:
+    # Review S8: an artifact trained from uncommitted code says so.
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "code.py").write_text("x = 1\n")
+    _git(tmp_path, "add", "code.py")
+    _git(tmp_path, "commit", "-q", "-m", "one")
+    assert code_provenance(tmp_path)["dirty"] is False
+    (tmp_path / "code.py").write_text("x = 2\n")
+    assert code_provenance(tmp_path)["dirty"] is True
