@@ -37,8 +37,6 @@ from tests.support.alpaca import (
 )
 from tests.support.bars import SYMBOL
 
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
-
 OPERATE = Purpose.OPERATE
 
 
@@ -57,7 +55,6 @@ def feed() -> CorporateActions:
 
 
 @pytest.mark.spec("ARCH§6.2", "SPEC§2")
-@RED
 def test_feed_dividends_map_with_the_ex_date_standing_in_for_the_declaration() -> None:
     actions = feed()
     assert actions.splits == ()
@@ -74,7 +71,6 @@ def test_feed_dividends_map_with_the_ex_date_standing_in_for_the_declaration() -
 
 
 @pytest.mark.spec("ARCH§6.2")
-@RED
 def test_announcements_map_with_their_declaration_dates() -> None:
     actions = actions_from_announcements(fixture("announcements_spy_2017-12_planted.json"))
     assert actions.splits == ()
@@ -90,7 +86,6 @@ def test_announcements_map_with_their_declaration_dates() -> None:
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_splits_map_to_their_ratios() -> None:
     planted = fixture("corporate_actions_spy_splits_planted.json")["corporate_actions"]
     actions = actions_from_feed(planted)
@@ -102,14 +97,12 @@ def test_splits_map_to_their_ratios() -> None:
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_a_record_missing_a_field_is_refused() -> None:
     with pytest.raises(DataError, match="ex_date"):
         actions_from_feed({"cash_dividends": [{"symbol": "SPY", "rate": 1.0}]})
 
 
 @pytest.mark.spec("ARCH§6.1", "SPEC§2")
-@RED
 def test_the_client_asks_the_feed_for_dividends_and_splits(
     clock: SimClock, fake: AlpacaFake
 ) -> None:
@@ -130,7 +123,6 @@ def test_the_client_asks_the_feed_for_dividends_and_splits(
 
 
 @pytest.mark.spec("ARCH§6.2")
-@RED
 def test_the_client_reads_announcements_from_the_trading_host(
     clock: SimClock, fake: AlpacaFake
 ) -> None:
@@ -149,7 +141,6 @@ def test_the_client_reads_announcements_from_the_trading_host(
 
 
 @pytest.mark.spec("ARCH§6.2")
-@RED
 def test_a_stored_dividend_is_known_at_the_end_of_its_declaration_day() -> None:
     store = BarStore.memory()
     actions = actions_from_announcements(fixture("announcements_spy_2017-12_planted.json"))
@@ -168,7 +159,6 @@ def test_a_stored_dividend_is_known_at_the_end_of_its_declaration_day() -> None:
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_a_split_in_the_feed_is_stored_and_halts_trading() -> None:
     store = BarStore.memory()
     planted = fixture("corporate_actions_spy_splits_planted.json")["corporate_actions"]

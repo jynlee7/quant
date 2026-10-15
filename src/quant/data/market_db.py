@@ -411,6 +411,19 @@ class BarStore:
             return _Stamping(now=None, floor=self._high_water())
         assert_never(known_at)
 
+    @property
+    def high_water(self) -> datetime | None:
+        """Last NOW stamp (write or live view), without issuing a new stamp."""
+        stamp = self._high_water()
+        return None if stamp is None else from_us(stamp)
+
+    def latest_minutes(self, symbol: str, start: datetime, end: datetime) -> MinuteFrame:
+        """Latest stored minutes in [start, end), for ingestion and data-quality checks.
+
+        Not a decision or scoring view; does not advance the live high-water stamp.
+        """
+        return _overlay(self._latest_minutes(symbol, to_us(start), to_us(end)), MinuteFrame.empty())
+
     def _high_water(self) -> int | None:
         row = self._conn.execute("SELECT stamp FROM high_water").fetchone()
         return None if row is None else int(row[0])

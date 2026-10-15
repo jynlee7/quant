@@ -34,8 +34,6 @@ from tests.support.alpaca import (
     fixture_text,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
-
 START = datetime(2018, 6, 1, 15, 0, tzinfo=UTC)
 HALF_DAY = date(2017, 11, 24)  # 09:30-13:00 ET, 14:30-18:00Z
 FULL_DAY = date(2016, 3, 1)  # 09:30-16:00 ET, 14:30-21:00Z
@@ -71,7 +69,6 @@ def at(text: str) -> datetime:
 
 
 @pytest.mark.spec("D2", "SPEC§2", "ARCH§6.1")
-@RED
 def test_a_session_is_asked_for_as_raw_sip_minutes(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(BARS, "bars_2016-03-01.json")
     minutes = client(clock).session_minutes("SPY", FULL_DAY)
@@ -103,7 +100,6 @@ def test_a_session_is_asked_for_as_raw_sip_minutes(clock: SimClock, fake: Alpaca
 
 
 @pytest.mark.spec("D2", "ARCH§6.1")
-@RED
 def test_pages_are_followed_by_their_token(clock: SimClock, fake: AlpacaFake) -> None:
     pages = [
         "bars_2017-11-24_page1.json",
@@ -130,7 +126,6 @@ def test_pages_are_followed_by_their_token(clock: SimClock, fake: AlpacaFake) ->
 
 
 @pytest.mark.spec("SPEC§2", "ARCH§6.1")
-@RED
 def test_a_missing_minute_stays_missing(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(BARS, "bars_2017-11-24_missing_1015.json")
     minutes = client(clock).session_minutes("SPY", HALF_DAY)
@@ -143,7 +138,6 @@ def test_a_missing_minute_stays_missing(clock: SimClock, fake: AlpacaFake) -> No
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_an_empty_answer_is_an_empty_session(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(BARS, "bars_empty.json")
     minutes = client(clock).session_minutes("SPY", HALF_DAY)
@@ -152,7 +146,6 @@ def test_an_empty_answer_is_an_empty_session(clock: SimClock, fake: AlpacaFake) 
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_an_empty_page_with_a_token_is_followed(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(BARS, "bars_empty_page_with_token.json", "bars_2017-11-24_missing_1015.json")
     minutes = client(clock).session_minutes("SPY", HALF_DAY)
@@ -166,7 +159,6 @@ def test_an_empty_page_with_a_token_is_followed(clock: SimClock, fake: AlpacaFak
 
 
 @pytest.mark.spec("ARCH§6.1", "ARCH§18", "K6")
-@RED
 def test_a_429_waits_for_its_retry_after_on_the_clock(clock: SimClock, fake: AlpacaFake) -> None:
     limited = Reply(fixture_text("rate_limited.json"), status=429, headers={"Retry-After": "7"})
     fake.serve(BARS, limited, "bars_2016-03-01.json")
@@ -183,7 +175,6 @@ def test_a_429_waits_for_its_retry_after_on_the_clock(clock: SimClock, fake: Alp
 
 
 @pytest.mark.spec("ARCH§6.1", "ARCH§18")
-@RED
 def test_429s_past_the_retry_limit_raise_data_error(clock: SimClock, fake: AlpacaFake) -> None:
     limited = Reply(fixture_text("rate_limited.json"), status=429, headers={"Retry-After": "1"})
     fake.serve(BARS, limited, limited, limited)
@@ -193,7 +184,6 @@ def test_429s_past_the_retry_limit_raise_data_error(clock: SimClock, fake: Alpac
 
 
 @pytest.mark.spec("ARCH§6.1", "ARCH§18")
-@RED
 def test_requests_stay_under_the_rate_limit(clock: SimClock, fake: AlpacaFake) -> None:
     per_minute = 5
     fake.serve(LATEST_QUOTES, *["latest_quotes_iex.json"] * 11)
@@ -210,7 +200,6 @@ def test_requests_stay_under_the_rate_limit(clock: SimClock, fake: AlpacaFake) -
 
 
 @pytest.mark.spec("C8", "SPEC§2")
-@RED
 def test_the_latest_quote_is_iex(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(LATEST_QUOTES, "latest_quotes_iex.json")
     quote = client(clock).latest_quote("SPY")
@@ -226,7 +215,6 @@ def test_the_latest_quote_is_iex(clock: SimClock, fake: AlpacaFake) -> None:
 
 
 @pytest.mark.spec("C8")
-@RED
 def test_a_quote_with_no_ask_is_refused(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(LATEST_QUOTES, "latest_quotes_iex_no_ask.json")
     with pytest.raises(DataError, match="ask"):
@@ -234,7 +222,6 @@ def test_a_quote_with_no_ask_is_refused(clock: SimClock, fake: AlpacaFake) -> No
 
 
 @pytest.mark.spec("C8")
-@RED
 def test_the_latest_trade_is_iex(clock: SimClock, fake: AlpacaFake) -> None:
     fake.serve(LATEST_TRADES, "latest_trades_iex.json")
     trade = client(clock).latest_trade("SPY")
@@ -247,7 +234,6 @@ def test_the_latest_trade_is_iex(clock: SimClock, fake: AlpacaFake) -> None:
 
 
 @pytest.mark.spec("ARCH§5")
-@RED
 def test_the_calendar_comes_from_the_trading_host_and_agrees_with_xnys(
     clock: SimClock, fake: AlpacaFake
 ) -> None:

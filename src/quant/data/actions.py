@@ -20,11 +20,13 @@ SPY has never split, and raw prices break across a split, so a split in the feed
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from quant.core.errors import DataError
 from quant.data.market_db import BarStore, Stamp
 
 
@@ -62,7 +64,9 @@ class ActionSync:
     @property
     def halt(self) -> str | None:
         """Why trading must halt: every split, named by symbol and ex-date. None without one."""
-        raise NotImplementedError("B6: ActionSync.halt")
+        if not self.splits:
+            return None
+        return "split: " + ", ".join(f"{s.symbol} {s.ex_date}" for s in self.splits)
 
 
 def actions_from_feed(payload: Mapping[str, Any]) -> CorporateActions:
@@ -70,7 +74,29 @@ def actions_from_feed(payload: Mapping[str, Any]) -> CorporateActions:
     reverse_splits) to dividends and splits, in ex-date order. A dividend's amount is its
     `rate`; a split's ratio is `new_rate / old_rate`. Other action types are ignored. Raises
     DataError on a record missing a field it needs."""
-    raise NotImplementedError("B6: actions_from_feed")
+    dividends: list[Dividend] = []
+    splits: list[Split] = []
+    try:
+        for kind in ("cash_dividends", "forward_splits", "reverse_splits"):
+            for row in payload.get(kind, []):
+                ex = date.fromisoformat(row["ex_date"])
+                declared = date.fromisoformat(row.get("declaration_date") or ex.isoformat())
+                supplied = bool(row.get("declaration_date"))
+                symbol = str(row["symbol"])
+                if kind == "cash_dividends":
+                    dividends.append(
+                        Dividend(symbol, ex, _positive(row["rate"]), declared, supplied)
+                    )
+                else:
+                    ratio = _positive(row["new_rate"]) / _positive(row["old_rate"])
+                    splits.append(Split(symbol, ex, ratio, declared, supplied))
+    except (KeyError, ValueError, TypeError) as exc:
+        field = str(exc) if isinstance(exc, KeyError) else "invalid value"
+        raise DataError(f"malformed corporate action: {field}") from None
+    return CorporateActions(
+        tuple(sorted(dividends, key=lambda d: d.ex_date)),
+        tuple(sorted(splits, key=lambda s: s.ex_date)),
+    )
 
 
 def actions_from_announcements(payload: Sequence[Mapping[str, Any]]) -> CorporateActions:
@@ -78,7 +104,23 @@ def actions_from_announcements(payload: Sequence[Mapping[str, Any]]) -> Corporat
     declared on their `declaration_date`. A dividend's amount is `cash`, a decimal string; a
     split's ratio is `new_rate / old_rate`. Raises DataError on a record missing a field it
     needs."""
-    raise NotImplementedError("B6: actions_from_announcements")
+    feed: dict[str, list[dict[str, Any]]] = {"cash_dividends": [], "forward_splits": []}
+    for row in payload:
+        kind = row.get("ca_type", "").lower()
+        if kind not in ("dividend", "split"):
+            continue
+        if not row.get("declaration_date"):
+            raise DataError("missing declaration_date")
+        mapped = dict(row)
+        if "initiating_symbol" not in row:
+            raise DataError("missing initiating_symbol")
+        mapped["symbol"] = row["initiating_symbol"]
+        if kind == "dividend":
+            if "cash" not in row:
+                raise DataError("missing cash")
+            mapped["rate"] = row["cash"]
+        feed["cash_dividends" if kind == "dividend" else "forward_splits"].append(mapped)
+    return actions_from_feed(feed)
 
 
 def store_actions(
@@ -86,4 +128,21 @@ def store_actions(
 ) -> ActionSync:
     """Store `symbol`'s dividends and splits (`BarStore.put_dividend`, `put_split`), stamped as
     `known_at` says. Storing the same actions twice changes nothing."""
-    raise NotImplementedError("B6: store_actions")
+    dividends = [d for d in actions.dividends if d.symbol == symbol]
+    splits = tuple(s for s in actions.splits if s.symbol == symbol)
+    for d in dividends:
+        store.put_dividend(
+            symbol, ex_date=d.ex_date, amount=d.amount, declared=d.declared, known_at=known_at
+        )
+    for s in splits:
+        store.put_split(
+            symbol, ex_date=s.ex_date, ratio=s.ratio, declared=s.declared, known_at=known_at
+        )
+    return ActionSync(len(dividends), splits)
+
+
+def _positive(value: Any) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise DataError("corporate action rate must be finite and positive")
+    return number

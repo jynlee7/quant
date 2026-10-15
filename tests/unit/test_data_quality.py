@@ -17,8 +17,6 @@ from quant.data.market_db import HISTORY, BarStore
 from quant.data.quality import GapKind, quality_report
 from tests.support.bars import SYMBOL, synthetic_days, with_close
 
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
-
 FIRST, LAST = date(2017, 11, 20), date(2017, 11, 28)  # 20, 21, 22, 24 (half), 27, 28
 XNYS = TradingCalendar.xnys()
 
@@ -47,7 +45,6 @@ def planted_store() -> BarStore:
 
 
 @pytest.mark.spec("ARCH§6.1", "SPEC§2", "PLAN§3")
-@RED
 def test_the_report_finds_every_gap_on_a_planted_store() -> None:
     report = quality_report(planted_store(), SYMBOL, FIRST, LAST)
 
@@ -83,7 +80,6 @@ def test_the_report_finds_every_gap_on_a_planted_store() -> None:
 
 
 @pytest.mark.spec("ARCH§6.1", "PLAN§3")
-@RED
 def test_every_gap_must_be_explained() -> None:
     store = planted_store()
     explanations = {
@@ -102,7 +98,6 @@ def test_every_gap_must_be_explained() -> None:
 
 
 @pytest.mark.spec("PLAN§3")
-@RED
 def test_the_report_is_canonical_json() -> None:
     store = planted_store()
     first = quality_report(store, SYMBOL, FIRST, LAST).to_json()
@@ -115,7 +110,6 @@ def test_the_report_is_canonical_json() -> None:
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_a_clean_store_has_no_gaps() -> None:
     store = BarStore.memory()
     store.ingest_minutes(
@@ -129,7 +123,6 @@ def test_a_clean_store_has_no_gaps() -> None:
 
 
 @pytest.mark.spec("C1", "ARCH§6.3")
-@RED
 def test_the_report_checks_lockbox_data_without_a_ticket() -> None:
     first, last = date(2025, 1, 2), date(2025, 1, 3)
     store = BarStore.memory()

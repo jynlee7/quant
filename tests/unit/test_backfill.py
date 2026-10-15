@@ -33,8 +33,6 @@ from tests.support.alpaca import (
 )
 from tests.support.bars import SYMBOL, synthetic_days
 
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
-
 OPERATE = Purpose.OPERATE
 FIRST, LAST = date(2017, 11, 20), date(2017, 12, 1)  # nine sessions around Thanksgiving
 AFTER = datetime(2017, 12, 4, 15, 0, tzinfo=UTC)  # every session in the span is available
@@ -64,7 +62,6 @@ def digest(store: BarStore) -> str:
 
 
 @pytest.mark.spec("ARCH§6.1", "ARCH§6.2")
-@RED
 def test_an_interrupted_backfill_resumes_to_the_rows_of_one_straight_run(
     minutes: MinuteFrame,
 ) -> None:
@@ -89,7 +86,6 @@ def test_an_interrupted_backfill_resumes_to_the_rows_of_one_straight_run(
 
 
 @pytest.mark.spec("ARCH§6.2")
-@RED
 def test_each_session_is_ingested_in_one_call(
     minutes: MinuteFrame, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -114,7 +110,6 @@ def test_each_session_is_ingested_in_one_call(
 
 
 @pytest.mark.spec("ARCH§6.2", "D2")
-@RED
 def test_history_rows_are_known_when_they_became_available(minutes: MinuteFrame) -> None:
     store = BarStore.memory()
     result = backfill(store, FakeSource(minutes), SYMBOL, FIRST, LAST, clock=SimClock(AFTER))
@@ -129,7 +124,6 @@ def test_history_rows_are_known_when_they_became_available(minutes: MinuteFrame)
 
 
 @pytest.mark.spec("ARCH§6.2")
-@RED
 def test_once_live_trading_has_read_the_store_late_data_is_known_now(
     minutes: MinuteFrame,
 ) -> None:
@@ -151,7 +145,6 @@ def test_once_live_trading_has_read_the_store_late_data_is_known_now(
 
 
 @pytest.mark.spec("ARCH§6.1", "D2")
-@RED
 def test_by_default_the_backfill_stops_at_the_last_available_session(
     minutes: MinuteFrame,
 ) -> None:
@@ -164,7 +157,6 @@ def test_by_default_the_backfill_stops_at_the_last_available_session(
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_a_session_the_source_has_none_of_is_reported_empty(minutes: MinuteFrame) -> None:
     missing = XNYS.session(date(2017, 11, 21))
     t = minutes.t
@@ -177,7 +169,6 @@ def test_a_session_the_source_has_none_of_is_reported_empty(minutes: MinuteFrame
 
 
 @pytest.mark.spec("ARCH§6.1")
-@RED
 def test_a_split_in_the_feed_is_surfaced_by_the_backfill(minutes: MinuteFrame) -> None:
     split = CorporateActions(
         (), (Split(SYMBOL, date(2017, 11, 28), 2.0, date(2017, 11, 21), True),)
@@ -195,7 +186,6 @@ def fake() -> Iterator[AlpacaFake]:
 
 
 @pytest.mark.spec("ARCH§6.1", "SPEC§2", "D2")
-@RED
 def test_the_alpaca_client_feeds_the_backfill(
     fake: AlpacaFake, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -223,7 +213,6 @@ def test_the_alpaca_client_feeds_the_backfill(
 
 
 @pytest.mark.spec("I6", "ARCH§6.1")
-@RED
 def test_the_backfill_command_refuses_a_missing_env_file(tmp_path: Path) -> None:
     db = tmp_path / "market.db"
     result = CliRunner().invoke(

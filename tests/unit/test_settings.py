@@ -17,8 +17,6 @@ from quant.core.logs import REDACTED, configure_logging
 from quant.core.orders import TradingMode
 from quant.core.settings import load_settings
 
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
-
 # Unique to this file, and not shaped like an Alpaca key, so only registration can redact them.
 KEY_ID = "settings-key-id-7f3a9c0b"
 SECRET = "settings-secret-5e1d8b2a4c6f"
@@ -63,7 +61,6 @@ def stream(monkeypatch: pytest.MonkeyPatch) -> Iterator[io.StringIO]:
 
 
 @pytest.mark.spec("I6", "D1")
-@RED
 def test_settings_are_read_from_the_env_file(tmp_path: Path) -> None:
     settings = load_settings(write_env(tmp_path, env_text()), environ={})
     assert settings.alpaca.key_id == KEY_ID
@@ -78,7 +75,6 @@ def test_settings_are_read_from_the_env_file(tmp_path: Path) -> None:
 
 
 @pytest.mark.spec("I6")
-@RED
 def test_quoted_values_and_comments_are_read(tmp_path: Path) -> None:
     text = (
         f"# keys\nALPACA_API_KEY=\"{KEY_ID}\"\nALPACA_SECRET_KEY='{SECRET}'\n\nTRADING_MODE=paper\n"
@@ -90,7 +86,6 @@ def test_quoted_values_and_comments_are_read(tmp_path: Path) -> None:
 
 
 @pytest.mark.spec("I6")
-@RED
 def test_keys_read_from_the_file_are_redacted_in_logs(tmp_path: Path, stream: io.StringIO) -> None:
     settings = load_settings(write_env(tmp_path, env_text()), environ={})
     log = structlog.get_logger("test")
@@ -106,7 +101,6 @@ def test_keys_read_from_the_file_are_redacted_in_logs(tmp_path: Path, stream: io
 
 
 @pytest.mark.spec("I6", "ARCH§2")
-@RED
 def test_keys_injected_by_the_environment_are_registered_too(stream: io.StringIO) -> None:
     environ = {"ALPACA_API_KEY": KEY_ID + "-env", "ALPACA_SECRET_KEY": SECRET + "-env"}
     settings = load_settings(None, environ={**environ, "TRADING_MODE": "paper"})
@@ -118,7 +112,6 @@ def test_keys_injected_by_the_environment_are_registered_too(stream: io.StringIO
 
 @pytest.mark.spec("I6", "D1")
 @pytest.mark.parametrize("missing", ["ALPACA_API_KEY", "ALPACA_SECRET_KEY", "TRADING_MODE"])
-@RED
 def test_a_missing_or_empty_variable_is_refused_by_name(tmp_path: Path, missing: str) -> None:
     for text in (env_text(**{missing: None}), env_text(**{missing: ""})):
         with pytest.raises(ConfigError, match=missing) as caught:
@@ -129,14 +122,12 @@ def test_a_missing_or_empty_variable_is_refused_by_name(tmp_path: Path, missing:
 
 @pytest.mark.spec("D1", "I5")
 @pytest.mark.parametrize("mode", ["live", "LIVE", "Paper", "paper-live"])
-@RED
 def test_any_trading_mode_but_paper_is_refused(tmp_path: Path, mode: str) -> None:
     with pytest.raises(ConfigError, match="TRADING_MODE"):
         load_settings(write_env(tmp_path, env_text(TRADING_MODE=mode)), environ={})
 
 
 @pytest.mark.spec("I6")
-@RED
 def test_a_malformed_line_is_refused_by_number_without_echoing_it(tmp_path: Path) -> None:
     text = f"ALPACA_API_KEY={KEY_ID}\n{SECRET}\nTRADING_MODE=paper\n"
     with pytest.raises(ConfigError, match="line 2") as caught:
@@ -146,14 +137,12 @@ def test_a_malformed_line_is_refused_by_number_without_echoing_it(tmp_path: Path
 
 @pytest.mark.spec("I6", "ARCH§2")
 @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604])
-@RED
 def test_an_env_file_other_users_can_read_is_refused(tmp_path: Path, mode: int) -> None:
     with pytest.raises(ConfigError, match="600"):
         load_settings(write_env(tmp_path, env_text(), mode=mode), environ={})
 
 
 @pytest.mark.spec("I6")
-@RED
 def test_a_missing_env_file_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"\.env"):
         load_settings(tmp_path / ".env", environ={})

@@ -22,12 +22,17 @@ segment, the lockbox and DEV included; it computes no P&L.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 
+import numpy as np
+
 from quant.core.calendar import TradingCalendar
+from quant.core.epoch import MINUTE_US, from_us, to_us
+from quant.core.schedule import Timing
+from quant.data.bars import build_hourly
 from quant.data.market_db import BarStore
 from quant.data.validate import DataFlag
 
@@ -49,7 +54,9 @@ class Gap:
     def key(self) -> str:
         """The key an explanation is given by: the session's ISO date for a missing session,
         the first missing minute in UTC (`...Z`) for a run of minutes."""
-        raise NotImplementedError("B6: Gap.key")
+        if self.kind is GapKind.MISSING_SESSION:
+            return self.session.isoformat()
+        return self.start.isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -67,16 +74,21 @@ class QualityReport:
 
     @property
     def unexplained(self) -> tuple[Gap, ...]:
-        raise NotImplementedError("B6: QualityReport.unexplained")
+        return tuple(g for g in self.gaps if not g.explanation or not g.explanation.strip())
 
     @property
     def ok(self) -> bool:
         """True when every gap is explained."""
-        raise NotImplementedError("B6: QualityReport.ok")
+        return not self.unexplained
 
     def to_json(self) -> dict[str, Any]:
         """The report as plain data for canonical JSON (`quant.core.canonical`), for CP1."""
-        raise NotImplementedError("B6: QualityReport.to_json")
+        return {
+            **asdict(self),
+            "gaps": [{**asdict(g), "key": g.key} for g in self.gaps],
+            "ok": self.ok,
+            "unexplained": [g.key for g in self.unexplained],
+        }
 
 
 def quality_report(
@@ -89,4 +101,45 @@ def quality_report(
     calendar: TradingCalendar | None = None,
 ) -> QualityReport:
     """The quality of `symbol`'s stored minutes over the sessions from `first` to `last`."""
-    raise NotImplementedError("B6: quality_report")
+    calendar = calendar or TradingCalendar.xnys()
+    days = calendar.sessions(first, last)
+    gaps: list[Gap] = []
+    half_days: list[date] = []
+    incomplete: list[datetime] = []
+    expected = present = 0
+    for day in days:
+        session = calendar.session(day)
+        if session.is_half_day:
+            half_days.append(day)
+        times = np.arange(to_us(session.open), to_us(session.close), MINUTE_US, dtype=np.int64)
+        frame = store.latest_minutes(symbol, session.open, session.close)
+        expected += len(times)
+        present += len(frame)
+        if not len(frame):
+            gaps.append(Gap(GapKind.MISSING_SESSION, day, session.open, len(times), None))
+            continue
+        missing = np.setdiff1d(times, frame.t)
+        if len(missing):
+            for run in np.split(missing, np.flatnonzero(np.diff(missing) != MINUTE_US) + 1):
+                gaps.append(Gap(GapKind.MISSING_MINUTES, day, from_us(int(run[0])), len(run), None))
+        incomplete.extend(
+            b.t_open for b in build_hourly(calendar, frame, Timing()) if not b.complete
+        )
+    gaps = [replace(g, explanation=(explanations or {}).get(g.key)) for g in gaps]
+    flags = tuple(
+        f
+        for f in store.flags(symbol)
+        if days and calendar.session(days[0]).open <= f.t < calendar.session(days[-1]).close
+    )
+    return QualityReport(
+        symbol,
+        first,
+        last,
+        tuple(days),
+        tuple(half_days),
+        expected,
+        present,
+        tuple(gaps),
+        tuple(incomplete),
+        flags,
+    )

@@ -23,9 +23,10 @@ from typing import Protocol
 
 from quant.core.calendar import TradingCalendar
 from quant.core.clock import Clock
-from quant.data.actions import ActionSync, CorporateActions
+from quant.core.schedule import Timing
+from quant.data.actions import ActionSync, CorporateActions, store_actions
 from quant.data.frames import MinuteFrame
-from quant.data.market_db import BarStore, Stamp
+from quant.data.market_db import HISTORY, NOW, BarStore, Stamp
 
 
 class MarketDataSource(Protocol):
@@ -63,4 +64,31 @@ def backfill(
     plus the feed delay at or before now. An error from the source or the store propagates,
     and whatever sessions were ingested before it stay stored, so running again resumes.
     """
-    raise NotImplementedError("B6: backfill")
+    calendar = calendar or TradingCalendar.xnys()
+    days = calendar.sessions(start, end or clock.now().date())
+    if end is None:
+        days = [d for d in days if Timing().available_at(calendar.session(d).close) <= clock.now()]
+    stamp = HISTORY if store.high_water is None else NOW
+    fetched: list[date] = []
+    empty: list[date] = []
+    skipped = 0
+    for day in days:
+        session = calendar.session(day)
+        if len(store.latest_minutes(symbol, session.open, session.close)):
+            skipped += 1
+            continue
+        minutes = source.session_minutes(symbol, day)
+        store.ingest_minutes(symbol, minutes, known_at=stamp, source="alpaca:sip:raw")
+        fetched.append(day)
+        if not len(minutes):
+            empty.append(day)
+    actions = (
+        store_actions(
+            store, symbol, source.corporate_actions(symbol, start, days[-1]), known_at=stamp
+        )
+        if days
+        else ActionSync(0, ())
+    )
+    return BackfillResult(
+        tuple(fetched), skipped, tuple(empty), stamp, actions, days[-1] if days else None
+    )
