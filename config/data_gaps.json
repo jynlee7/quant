@@ -1,0 +1,11 @@
+{
+  "2016-02-02T16:19:00Z": "Alpaca vendor gap: Alpaca's SIP history holds no trades and no bars in this window, rechecked 2026-10-15 with paginated trades; not a known market halt, and SPY never goes minutes without a trade. Left missing; the bars around it are built from the minutes present.",
+  "2019-08-12T19:29:00Z": "Alpaca vendor gap: Alpaca's SIP history holds no trades and no bars in this window, rechecked 2026-10-15 with paginated trades; not a known market halt, and SPY never goes minutes without a trade. Left missing; the bars around it are built from the minutes present.",
+  "2019-08-12T19:32:00Z": "Alpaca vendor gap: Alpaca's SIP history holds no trades and no bars in this window, rechecked 2026-10-15 with paginated trades; not a known market halt, and SPY never goes minutes without a trade. Left missing; the bars around it are built from the minutes present.",
+  "2020-03-09T13:35:00Z": "Market-wide circuit breaker Level 1 (S&P 500 down 7%): a 15-minute trading halt across all US equities. Alpaca's SIP holds no trades in the window (checked 2026-10-15).",
+  "2020-03-12T13:36:00Z": "Market-wide circuit breaker Level 1 (S&P 500 down 7%): a 15-minute trading halt across all US equities. Alpaca's SIP holds no trades in the window (checked 2026-10-15).",
+  "2020-03-16T13:31:00Z": "Market-wide circuit breaker Level 1 (S&P 500 down 7%): a 15-minute trading halt across all US equities. Alpaca's SIP holds no trades in the window (checked 2026-10-15).",
+  "2020-03-18T16:57:00Z": "Market-wide circuit breaker Level 1 (S&P 500 down 7%): a 15-minute trading halt across all US equities. Alpaca's SIP holds no trades in the window (checked 2026-10-15).",
+  "2021-05-05T15:27:00Z": "Alpaca vendor gap: Alpaca's SIP history holds no trades and no bars in this window, rechecked 2026-10-15 with paginated trades; not a known market halt, and SPY never goes minutes without a trade. Left missing; the bars around it are built from the minutes present.",
+  "2023-06-05T13:52:00Z": "Alpaca vendor gap: Alpaca's SIP history holds no trades and no bars in this window, rechecked 2026-10-15 with paginated trades; not a known market halt, and SPY never goes minutes without a trade. Left missing; the bars around it are built from the minutes present."
+}
