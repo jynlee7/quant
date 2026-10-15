@@ -81,6 +81,22 @@ TrainingRecord:
 paths or the worker count, so the same data, seeds and config on the same platform give the
 same artifact hash.
 
+**The seeded restart** (spec §5, ARCHITECTURE §7.1; B7): a refit passes the current model as
+`train_candidate(..., previous=model)`. Then restart SEEDED_RESTART of the *full-window* fit
+starts from the previous model's parameters instead of a random start: its GaussianHMM is built
+with `init_params=""` (and the same `params="stmc"`, seed and settings as every restart), and
+before `fit` its `startprob_`, `transmat_`, `means_` and `covars_` are set to
+`seed_params(previous, scaler)`, the previous model converted into this fit's scaler (for
+"diag", `covars_` is given the (K, d) diagonals, as hmmlearn expects). Every other restart, and
+every restart of the validation fit, starts at random as before: the previous model was fit on
+rows that include the validation block, so seeding the validation fit with it would let the
+block reach the drift baseline's fit. The seeded restart is recorded like any other (its seed
+`base_seed + SEEDED_RESTART` in `seeds`, a failure in `failed`), can win or lose, and is named
+in meta.json: `info["restarts"]["seeded"]` is {"index": SEEDED_RESTART, "previous": the
+previous model's artifact hash}, or None for a fit without a previous model (every
+`select_and_train` fit among them). The converted parameters travel with the block to the pool's
+workers, so the pool and the serial path give the same bits and the same artifact hash.
+
 Times are UTC. "Now" is never read (K6).
 """
 
@@ -139,6 +155,8 @@ BLAS_THREAD_VARIABLES: Final = (
 )
 # What a bad local optimum raises. numpy's LinAlgError is a ValueError. Anything else is a bug.
 _FIT_FAILURES: Final = (ModelError, ValueError)
+# The restart of a refit's full-window fit that starts from the previous model (module docstring).
+SEEDED_RESTART: Final = 0
 
 
 class TrainConfig(StrictModel):
@@ -379,7 +397,8 @@ class TrainResult:
       - "candidate": {"n_states", "covariance_type", "n_params"} of the model;
       - "n_rows", "loglik", "bic": the full-window fit's row count, Σ l_t and BIC;
       - "restarts": {"near_best", "stable", "iterations": [...], "failed": [{"index", "seed",
-        "error"}]} of the full-window fit;
+        "error"}], "seeded": {"index", "previous"} or None (module docstring)} of the
+        full-window fit;
       - "sanity": {"passed", "reasons", "occupancy", "durations", "condition"}, one list entry
         per state, an infinite duration written as null;
       - "states": spec §4's per-state report, one object per state in state order:
@@ -446,6 +465,21 @@ def _full_scaler(data: TrainingData) -> ScalerParams:
     return ScalerParams.from_scaler(Scaler.fit(data.matrix, start=data.fit_start, end=data.fit_end))
 
 
+def seed_params(previous: HmmModel, scaler: ScalerParams) -> GaussianParams:
+    """The previous model's parameters in `scaler`'s standardized space, for the seeded
+    restart (module docstring). π and A are copied. Means and covariances go through raw units:
+    with r = previous.scaler.std / scaler.std,
+
+        means  = ((previous.params.means * previous.scaler.std + previous.scaler.mean)
+                  - scaler.mean) / scaler.std
+        covars = previous.params.covars * numpy.outer(r, r)
+
+    exactly those expressions, so each covariance stays exactly symmetric and a diag model's
+    stays diagonal. Raises ModelError when `scaler.columns` aren't the previous model's, or the
+    result isn't a valid GaussianParams."""
+    raise NotImplementedError("B7a: seed_params")
+
+
 def train_candidate(
     data: TrainingData,
     candidate: Candidate,
@@ -454,14 +488,20 @@ def train_candidate(
     config: TrainConfig,
     provenance: Mapping[str, Any],
     workers: int | None = None,
+    previous: HmmModel | None = None,
 ) -> TrainResult:
     """Train one fixed candidate on the whole fit window: the full-window fit of the module
     docstring, its sanity report and labels, the candidate's validation fit and score (for the
-    validation record), and the model. `config.candidates` is not consulted. Raises
-    ModelError as `fit_candidate` and `label_states` do, when either fit fails, when the
-    validation block or the rows before it span fewer than 2 sessions or the block has fewer
-    than DRIFT_WINDOW rows, for a state with no filtered mass (a sanity reject), or when
-    `provenance` has no canonical JSON form."""
+    validation record), and the model. `config.candidates` is not consulted. With `previous`
+    (a refit), restart SEEDED_RESTART of the full-window fit starts from it (module docstring,
+    "The seeded restart"). Raises ModelError as `fit_candidate` and `label_states` do, when
+    either fit fails, when the validation block or the rows before it span fewer than 2
+    sessions or the block has fewer than DRIFT_WINDOW rows, for a state with no filtered mass
+    (a sanity reject), or when `provenance` has no canonical JSON form; and, with `previous`,
+    when its K or covariance type isn't `candidate`'s, its feature columns or feature-config
+    hash aren't the data's, or SEEDED_RESTART >= config.n_restarts."""
+    if previous is not None:
+        raise NotImplementedError("B7a: the seeded restart")
     scaler, split = _full_scaler(data), _split(data, config)
     rows = data.matrix.values
     train_rows = rows[~split.block]

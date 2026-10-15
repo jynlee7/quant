@@ -67,6 +67,8 @@ source_modules =
     quant.features
     quant.hmm.filter
     quant.hmm.labels
+    quant.hmm.match
+    quant.hmm.drift
     quant.decide
     quant.risk
     quant.execution

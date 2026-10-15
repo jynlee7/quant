@@ -146,6 +146,16 @@ class TradingCalendar:
             raise CalendarError(f"no session after {day} before {CALENDAR_END}")
         return self._days[index]
 
+    def next_open(self, at: datetime) -> datetime:
+        """The open, in UTC, of the first session that opens strictly after `at`: when a refit,
+        promotion or rollback recorded at `at` takes effect (C7, ARCHITECTURE §9.2), never
+        mid-session. During a session, or after its close, that is the next session's open,
+        across weekends and holidays; before a session day's open, that day's open; exactly at
+        an open, the next session's. Raises ClockError for a naive `at`, and CalendarError when
+        `at`'s New York date is outside the calendar or no session opens after it before
+        CALENDAR_END."""
+        raise NotImplementedError("B7a: TradingCalendar.next_open")
+
 
 @cache
 def _xnys() -> TradingCalendar:

@@ -258,6 +258,7 @@ def test_training_calls_only_fit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.failed == ()
 
 
+@pytest.mark.full  # B7: moved out of the fast tier (about 24 s together)
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize("truth_name", ["three_full", "three_diag"])
 def test_training_recovers_a_known_hmm_up_to_relabeling(truth_name: str) -> None:
@@ -298,6 +299,7 @@ def _selected(truth_name: str, n: int = 6000) -> tuple[Any, Any, Any]:
     return data, config, result
 
 
+@pytest.mark.full  # B7: moved out of the fast tier (about 24 s together)
 @pytest.mark.spec("SPEC§4")
 @pytest.mark.parametrize("truth_name", ["three_full", "three_diag"])
 def test_selection_picks_three_states_and_the_generators_covariance_type(truth_name: str) -> None:

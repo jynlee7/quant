@@ -1,0 +1,36 @@
+{
+  "dividends": [
+    {
+      "amount": 1.049604,
+      "cusip": "78462F103",
+      "ex_date": "2016-03-18",
+      "payable_date": "2016-04-29",
+      "record_date": "2016-03-22",
+      "symbol": "SPY"
+    },
+    {
+      "amount": 1.245568,
+      "cusip": "78462F103",
+      "ex_date": "2018-06-15",
+      "payable_date": "2018-07-31",
+      "record_date": "2018-06-18",
+      "symbol": "SPY"
+    },
+    {
+      "amount": 1.888834,
+      "cusip": "78462F103",
+      "ex_date": "2026-09-18",
+      "payable_date": "2026-10-30",
+      "record_date": "2026-09-18",
+      "symbol": "SPY"
+    }
+  ],
+  "note": "SPY dividends that Alpaca's corporate-actions feed lacks (docs/VERIFY.md, 'Corporate actions: SPY dividends'). Filled from State Street's spreadsheet, as the owner approved at CP1 on 2026-10-15. The source gives no declaration date, so the ex-date stands in (ARCHITECTURE 6.2). All 40 dividends the feed does hold match the spreadsheet to 6 decimals.",
+  "source": {
+    "name": "State Street Global Advisors, SPDR ETF Historical Distributions",
+    "page": "https://www.ssga.com/us/en/intermediary/resources/documents/etf-dividend-distributions",
+    "retrieved": "2026-10-15",
+    "sha256": "b162dd17027d1128f2209e312b0f634960daa78319dafe0ab821ab0b7e77ce23",
+    "url": "https://www.ssga.com/library-content/products/fund-data/etfs/us/spdr-etf-historical-distributions.xlsx"
+  }
+}

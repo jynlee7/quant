@@ -24,6 +24,15 @@ share count the same way, so it maps to a split of `new_rate / old_rate`, never 
 Actions are fetched again on every backfill. One stored before with the same values changes
 nothing. One that differs is a revision, which history can't make (ARCHITECTURE §6.2): it is
 left as stored and reported in `ActionSync.conflicts`, and the others are still stored.
+
+**The dividend supplement** (B7, the owner's call at CP1): the feed misses SPY's dividends with
+ex-dates 2016-03-18, 2018-06-15 and 2026-09-18 (docs/VERIFY.md). They come from State Street's
+"ETF Historical Distributions" spreadsheet, as the committed file `config/dividend_supplement.json`
+(`load_dividend_supplement`). The source gives no declaration date, so each row is a Dividend
+declared on its ex-date with `declared_in_feed=False`, exactly like a feed dividend without one.
+The backfill stores the supplement after the feed, under the same stamp
+(`quant.data.backfill.backfill`'s `supplement`). A row that differs from a stored dividend is a
+conflict, reported in the supplement's `ActionSync.conflicts`, never an overwrite.
 """
 
 from __future__ import annotations
@@ -32,10 +41,14 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from pathlib import Path
+from typing import Any, Final
 
 from quant.core.errors import DataError
 from quant.data.market_db import BarStore, Stamp
+
+# The committed supplement, relative to the repo root (the CLI's default).
+SUPPLEMENT_PATH: Final = Path("config/dividend_supplement.json")
 
 
 @dataclass(frozen=True)
@@ -176,3 +189,67 @@ def _positive(value: Any) -> float:
     if not math.isfinite(number) or number <= 0:
         raise DataError("corporate action rate must be finite and positive")
     return number
+
+
+@dataclass(frozen=True)
+class SupplementSource:
+    """Where the supplement's rows come from: the publisher's `name`, the `page` that links the
+    file, the file's `url` (both https), the day it was `retrieved`, and the `sha256` of the
+    retrieved file's bytes (64 lowercase hex characters)."""
+
+    name: str
+    page: str
+    url: str
+    retrieved: date
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SupplementRow:
+    """One dividend as the source lists it. `amount` is cash per share."""
+
+    symbol: str
+    cusip: str
+    ex_date: date
+    record_date: date
+    payable_date: date
+    amount: float
+
+
+@dataclass(frozen=True)
+class DividendSupplement:
+    """The parsed supplement file: its source, its note, and its rows in the file's order,
+    sorted by (ex_date, symbol)."""
+
+    source: SupplementSource
+    note: str
+    rows: tuple[SupplementRow, ...]
+
+    @property
+    def actions(self) -> CorporateActions:
+        """The rows as corporate actions: one Dividend per row, in ex-date order, `Dividend(
+        symbol, ex_date, amount, declared=ex_date, declared_in_feed=False)` (the ex-date stands
+        in for the missing declaration date, ARCHITECTURE §6.2), and no splits."""
+        raise NotImplementedError("B7a: DividendSupplement.actions")
+
+
+def load_dividend_supplement(path: Path) -> DividendSupplement:
+    """Parse the supplement file at `path` (`config/dividend_supplement.json`).
+
+    The file is JSON, read with `quant.core.canonical.canonical_loads` (duplicate keys, NaN and
+    infinities refused; any whitespace and key order accepted, so it stays reviewable). Its
+    top-level object has exactly the keys:
+
+    - "source": an object with exactly "name", "page", "url", "retrieved" (an ISO date) and
+      "sha256" (64 lowercase hex characters); "page" and "url" start with "https://";
+    - "note": a non-empty string;
+    - "dividends": a non-empty list of objects with exactly "symbol", "cusip", "ex_date",
+      "record_date", "payable_date" (ISO dates) and "amount" (a JSON number, finite and > 0).
+      Within a row ex_date <= record_date <= payable_date. The rows are sorted strictly by
+      (ex_date, symbol), so no (symbol, ex_date) appears twice.
+
+    Strings must be non-empty. Raises DataError naming the problem for an unreadable file
+    (OSError), text that isn't such JSON, a missing or extra key, a value of the wrong type, a
+    bad date or amount, or rows out of order. Nothing else is accepted, so an edit to the file
+    either keeps this shape or fails loudly."""
+    raise NotImplementedError("B7a: load_dividend_supplement")
