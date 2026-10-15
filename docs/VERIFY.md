@@ -25,16 +25,20 @@ Run it with:
 
 ## 3. SIP delay against D2's 16 minutes (ARCH §18)
 
-- **Status:** **pending: run `.venv/bin/python spikes/alpaca_probe.py --live` during regular hours.**
-- **Checked so far:** 2026-10-15, 04:09 New York time, market closed.
+- **Status:** **D2 holds.**
+- **Checked:** 2026-10-15, 04:09 New York time (market closed), and live from 10:05 to 10:25 New York time (`var/probe/alpaca_probe-live-20261015T140508Z.json`, gitignored).
 - **Method (`--live`):** for 20 minutes, every 30 s, ask for `feed=sip`, `adjustment=raw` minute bars from the last 30 minutes, with no `end`. For each regular-hours minute that first appears during the run, record the lag from the minute's end to the poll that first returned it. Minutes already there at the first poll are left out, because their lag is only bounded. The 30 s poll can overstate a lag by up to 30 s, so D2 holds if the worst lag is at most 15.5 minutes. The probe also records any minute whose values change after it first appears.
-- **Result so far (closed market):**
+- **Result (live):**
+  - All 40 polls returned 200, with no errors.
+  - 19 minutes first appeared during the run. Their lag from the minute's end was 14.14 to 14.15 minutes (median 14.14). Every poll's newest minute ended 14.1 to 14.6 minutes before the poll, so a minute is served about 14 minutes after it ends, or 15 minutes after it starts, as documented.
+  - No minute changed after it first appeared.
+- **Result (closed market):**
   - With an explicit `end` of now, the bars request returns **403 "subscription does not permit querying recent SIP data"**.
   - With `end` omitted, it returns 200, here with no minutes, because nothing traded in the window it would serve.
   - The documented limit is "latest 15 minutes" for historical data on the Basic plan (https://docs.alpaca.markets/docs/about-market-data-api).
-- **The build:** D2 stands until the live run. Two points for the live path:
+- **The build:** D2's 16 minutes stands, with about 1.4 minutes to spare after a bar's last minute is served (one 20-minute sample in a quiet opening hour). Two points for the live path:
   - a bars request whose `end` is less than 15 minutes old fails with 403, so the engine's request at τ = close + 16 min must end at the bar's close, never at "now";
-  - if the live run shows a worst lag over 15.5 minutes, the delay is one config value: propose the new value at CP1, and don't work around it (PLAN B6).
+  - the margin comes from one sample, so B13's engine should log each bar's serve lag (open item), and a drift past the margin will show up before it costs a decision.
 
 ## 4. Rate limits against the backfill (ARCH §18)
 

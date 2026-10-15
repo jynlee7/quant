@@ -2,6 +2,146 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B6 · Real data and the first model (done 2026-10-15, tag `b06-done`)
+
+You put the Alpaca paper keys in on 2026-10-15, and B6 was built the same day on `b06-data`, in two parts:
+
+- **B6a:** the code.
+- **B6b:** the real runs, the first model and CP1.
+
+Claude agents wrote the reds, the probe and the review fixes. Codex wrote both greens; B6b's was committed by the orchestrator after Codex hit its usage limit.
+
+**Built**
+
+- **`core.settings`:** loads `.env` and calls `register_secret` on each key before anything can log (B1's open item, I6).
+  - It refuses a missing variable, `TRADING_MODE` other than `paper`, and a file other users can read (mode 600). A bad line is refused by its number, without echoing it.
+  - With no path it reads the environment, as systemd injects it.
+- **`data.alpaca_data`:** the market-data client, on alpaca-py's data API only. `alpaca.trading` stays in the execution adapter (K4).
+  - **Requests:** SIP minutes ask for `feed=sip` and `adjustment=raw` explicitly. A bars request never ends inside the feed delay, because the free plan answers 403 there.
+  - **Pagination, timeouts and limits:** it pages with `page_token`. Every call has a 5 s connect and 30 s read timeout, and its requests are spaced under the rate limit.
+  - **429s:** waits are on the Clock. It honours Retry-After (as seconds or an HTTP date), then X-RateLimit-Reset, then backs off up to 60 s, within a 120 s budget. alpaca-py's own retry is switched off through its public `retry_exception_codes`.
+  - **Other reads:** the latest IEX quote and trade, the calendar, and corporate actions from the v1 feed and the trading host's announcements.
+- **`data.actions`:** dividends and splits.
+  - **Declaration dates:** the feed never has one, and announcements start only at 2020-09. A missing declaration date, or one after the ex-date, falls back to the ex-date, so a dividend is never known early.
+  - **Splits:** a split, or a stock dividend recorded as one, halts trading through `ActionSync.halt`.
+  - **Changes:** an action that changed under HISTORY is reported in `ActionSync.conflicts`, and the others still store.
+- **`data.backfill` and `quant data backfill`:** resumable from 2016-01-01.
+  - **Resume:** market.db migration 2 adds `backfilled_sessions`, and a resume skips only recorded sessions. A partial session is fetched again; where history can't revise it, it is completed as NOW at the end of the run and reported.
+  - **Calls and stamps:** one ingest call per session (B2's open item), using HISTORY only before live trading first reads the store.
+  - **End:** it never goes past the last session whose close plus the feed delay has passed, whatever `--end` says.
+- **`data.quality` and `quant data quality`:** missing sessions, minute gaps, every missing or incomplete hourly slot, move flags and half days. The run fails while a gap is unexplained. `config/data_gaps.json` holds the explanations.
+- **`BarStore`:** a public `high_water`, plus `minute_times` and `has_minutes`, which carry no prices. The raw `latest_minutes` read from B6a's green was removed in review, so prices are read only through a view.
+- **`PointInTimeView.flags`:** flags follow the minute rules: `t < τ`, `available_at < τ`, and the latest version known before as_of. The store's own flag read ignored availability.
+- **`jobs.first_model` and `quant model select` (D4, CP1):**
+  - **The read:** FIT only. `fit_window` refuses any span past 2018-12-31 before anything is read. A second guard refuses any bar on or after DEV's start, and any session missing bars at fit_end is refused, not dropped.
+  - **Training:** it reads through the view at `as_of = fit_end`, starts the feature stream at the start of FIT, and runs B4's r1 selection.
+  - **Outputs:** the artifact goes in `var/artifacts/models/<hash>/` (`.npz` without pickles, plus JSON), and the report in canonical JSON and Markdown. Provenance holds the commit (worktrees included), the lockfile hash and a dirty flag.
+- **`spikes/alpaca_probe.py` and `docs/VERIFY.md`:** the ARCH §18 checks (below).
+- **The truncation harness (B5's open items):**
+  - its world can be built from a market.db, and the full tier runs 200 cuts on real FIT bars beside the synthetic 200;
+  - a new `ActionsLayer` reads minutes, dividends, splits and flags;
+  - the world raises flags, and the garbage now covers dividends, splits, flags and a minute revision known exactly at the cut.
+
+**The real data** (`var/market.db`, gitignored):
+
+- **The backfill:** 2,711 sessions, 2016-01-04 → 2026-10-14, in 14.5 minutes, with 0 skipped, 0 empty, no NOW sessions and no action conflicts.
+- **Minutes:** 1,053,406 of 1,053,510 expected, with 21 half days and 0 move flags.
+- **Nine gaps, all explained:**
+  - four March 2020 market-wide circuit-breaker halts (14 min each);
+  - five holes in Alpaca's SIP history, where paginated trades show none in the window: 2016-02-02 (9 min), 2019-08-12 (30 min), 2021-05-05 (5 min) and 2023-06-05 (4 min).
+- **Incomplete hourly bars:** three, all in DEV. FIT's bars are all complete.
+
+**What the probe found** (`docs/VERIFY.md`):
+
+| Check | Result |
+|---|---|
+| SIP delay (D2) | holds: live, 19 new minutes were served 14.1–14.2 minutes after they ended, all 40 polls returned 200, and none changed after it appeared |
+| Historical SIP | complete: 390 minutes, or 210 on half days, from 2016 to last week |
+| Rate limit | 200 a minute on both hosts; the backfill is about 2,711 requests |
+| Dividends | the feed misses 2016-03-18, 2018-06-15 and 2026-09-18, and has no declaration dates; announcements start at 2020-09, and five are declared after their ex-date |
+| Paper dividends | Alpaca's docs say paper doesn't simulate them, so parity must add them |
+| A second paper account | your question |
+
+**The first model** (CP1):
+
+- **Result:** K = 5 with diagonal covariance, on 4,840 FIT rows, selected in about 56 s, with the best validation mean of the 8 candidates. All 8 passed the sanity checks.
+- **States:**
+  - STRESS: −61% a year, 12% volatility, 0.7 sessions;
+  - CRASH: −29%, 23%, 6.5 sessions;
+  - three CALM_UP states: +36%/6%, +21%/11% and +19%/6%.
+- **Report:** in `var/artifacts/reports/`, rerun at the merge commit so its provenance names it.
+
+**Tests:** 116 new fast tests (1,011 fast in all), plus the real-bar and synthetic 200-cut full tests.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| Fast gate | 98 s (1,011 tests) |
+| Full-tier truncation (49 tests) | 228 s: real-bar 200 cuts 125 s, synthetic 200 cuts 67 s |
+| Backfill | 14.5 min |
+| First-model selection | about 56 s |
+
+**Review:** two rounds, one per sub-step, each with the code-review skill and Codex, or a Claude stand-in when Codex was at its limit. Each finding got a red test, then a fix.
+
+- **B6a** (3f47ae4, c64349d), 13 findings and the probe's 403:
+  - a resume that skipped partial sessions;
+  - an explicit `--end` past the available data;
+  - a settings test that passed without registration;
+  - fully missing hours not listed;
+  - no HTTP timeout;
+  - a public raw minute read;
+  - 429s that gave up before the reset;
+  - refetched actions that broke every later run;
+  - stock dividends;
+  - a bare KeyError;
+  - alpaca-py's private retry;
+  - full reads on resume;
+  - the declaration-date doc note.
+- **B6b** (d46509f, da17257), 18 findings:
+  - leaks the harness couldn't see: flags and splits revisions, and minutes known exactly at as_of;
+  - the synthetic 200 cuts dropped;
+  - features started at the span rather than at FIT;
+  - the fixture model reading at a late knowledge time and duplicating the training rows;
+  - CLI store errors;
+  - worktree provenance;
+  - FIT-only resting on one check;
+  - silently dropped late sessions;
+  - garbage read through the view under test;
+  - the fit window's rendering.
+
+Not fixed, with reasons:
+
+- **Half of B6b's S10:** `_model_rows` was already cached.
+- **FIT-only through the ledger:** the fit reads with the operate purpose, as ARCH §6.3 says. The policy never refuses an operate read, so a refused span is the job's own PolicyError, and nothing goes to the ledger.
+- **Two planted leaks the harness can't see, and needn't:** dropping the minute's own `known_at` in the flags EXISTS changes nothing, because the version subquery enforces it. Dropping `raised = 1` is a correctness bug, not lookahead, and a unit test covers it.
+
+The fixes weren't reviewed again. Each has its test, and the full gate passes.
+
+**Deviations** (documents updated in this merge)
+
+- **ARCHITECTURE v1.9:**
+  - §6.1: how the backfill ends, resumes and completes partial sessions as NOW; the 403; timeouts and 429 waits; stock dividends halting.
+  - §6.2: the ex-date standing in for missing declaration dates; announcements from 2020-09; a late declaration counting as missing; the three dividends the feed misses; live dividend sync reading the announcements; refetched actions; the flags rule.
+- **CLAUDE.md and PLAN's "builds on" line** say ARCHITECTURE v1.9.
+- **The B5 fixture model's fit ends** are now New York midnights, so its hash changed. No test pins it.
+
+**Open items**
+
+- **You, at CP1:**
+  - how to fill the FIT dividends the feed misses (2016-03-18, 2018-06-15). The probe proposes a small committed file from State Street's SPY history, checked by you;
+  - whether your login can open a second paper account (AD3, by B13).
+- **B11:**
+  - credit a dividend on its ex-date, though it is known only at the end of that day;
+  - treat the three incomplete DEV bars as rule 6 does live.
+- **B13 and B14:**
+  - live dividend sync reads the announcements;
+  - the engine wires `ActionSync.halt`;
+  - a live bars request ends at the bar's close, never at now;
+  - the engine logs each bar's serve lag, because D2's margin of about 1.4 minutes rests on one 20-minute sample.
+- **The fast-tier budget:** 98 of 120 s. B4's HMM training tests (about 32 s) are the first candidates to move to `full`.
+- **Keys:** they were pasted into the chat. Regenerate them in the Alpaca dashboard and edit `.env` by hand (SPEC §0.3).
+
 ## B5 · The truncation harness (done 2026-10-14, tag `b05-done`)
 
 B5 began on `b05-truncation` after B9 merged, as you asked on 2026-10-14. A Claude agent wrote the red commit and the review fixes, and Codex wrote the green.
