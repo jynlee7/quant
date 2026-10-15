@@ -108,6 +108,12 @@ MIGRATIONS: tuple[Migration, ...] = (
                 recorded_at INTEGER NOT NULL
             )""",
             *(
+                f"""CREATE TRIGGER {table}_no_replace BEFORE INSERT ON {table}
+                WHEN EXISTS (SELECT 1 FROM {table} WHERE seq = NEW.seq)
+                BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END"""  # noqa: S608 -- fixed schema names
+                for table in ("pointers", "refit_events", "freeze_events")
+            ),
+            *(
                 f"""CREATE TRIGGER {table}_no_{verb} BEFORE {verb.upper()} ON {table}
                 BEGIN SELECT RAISE(ABORT, '{table} is append-only'); END"""
                 for table in ("pointers", "refit_events", "freeze_events")

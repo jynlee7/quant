@@ -3,11 +3,10 @@
 An evening job. The live scheduler (B13) and the backtest (B11) call the same function at the
 same simulated times, each with the refit's instant `at` read from its Clock (K6).
 
-1. **Due** (`refit_due`): every REFIT_DAYS calendar days, counted from the *active* model's
-   last data day, the New York date of the last instant of its fit window, `(fit_end - 1 µs)`
-   in New York. The refit is due when the cutoff's New York date is at least REFIT_DAYS days
-   later. So a skipped evening refits on the next one, and DST can't move the cadence. A job
-   that isn't due records nothing (`refit` returns None).
+1. **Due** (`refit_due`): every REFIT_DAYS New York calendar days, counted from the
+   later of the active model's last data day (`fit_end - 1 µs`) and the latest refit event's
+   cutoff day, whether ACTIVATED, FROZEN or REJECTED. A skipped evening refits on the next
+   one; DST can't move the cadence. A job that isn't due records nothing (returns None).
 2. **The cutoff** (`refit_cutoff`): the latest CUTOFF_ET (17:00 New York) at or before `at`:
    the bars available at 17:00 (ARCHITECTURE §7.3).
 3. **The rows** (`refit_data`): an expanding window [current.fit_start, cutoff), read only
@@ -37,31 +36,27 @@ The calibration artifact a pass also builds (ARCHITECTURE §7.3 step 5) is B7b's
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
-import numpy as np
 import structlog
 
 from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.clock import ensure_utc
-from quant.core.epoch import to_us
 from quant.core.errors import ModelError
 from quant.data.market_db import BarStore
-from quant.data.policy import FIT_START, DataPolicy, Purpose
+from quant.data.policy import DataPolicy
 from quant.features.menu import FeatureConfig
-from quant.features.stream import compute_features
 from quant.hmm.drift import DriftReport, DriftThresholds, refit_drift
 from quant.hmm.labels import LabelThresholds
 from quant.hmm.match import StateMatch, inherit_labels, match_states
 from quant.hmm.model import HmmModel, save_model
 from quant.hmm.select import Candidate, SanityReport
 from quant.hmm.train import TrainConfig, TrainingData, train_candidate
+from quant.jobs._rows import training_rows
 from quant.store.ops import OpsStore, RefitEvent, RefitOutcomeKind
 
 # Spec §5: a refit every 30 calendar days.
@@ -85,11 +80,14 @@ def refit_cutoff(at: datetime) -> datetime:
     return cutoff.astimezone(UTC)
 
 
-def refit_due(current: HmmModel, at: datetime) -> bool:
-    """Whether a refit is due at `at` under the active model `current` (module docstring, step
-    1): `refit_cutoff(at)`'s New York date minus `current`'s last data day (the New York date
-    of `current.fit_end - 1 µs`) is at least REFIT_DAYS days. ClockError for a naive `at`."""
+def refit_due(current: HmmModel, at: datetime, *, last_refit: datetime | None = None) -> bool:
+    """Whether a refit is due at `at` (module docstring, step 1): `refit_cutoff(at)`'s New
+    York date minus the later of `current`'s last data day (the New York date of
+    `current.fit_end - 1 µs`) and `last_refit`'s New York date (the latest refit event's
+    cutoff, whatever its outcome) is at least REFIT_DAYS days. ClockError for a naive time."""
     last = (current.fit_end - timedelta(microseconds=1)).astimezone(NEW_YORK).date()
+    if last_refit is not None:
+        last = max(last, ensure_utc(last_refit).astimezone(NEW_YORK).date())
     return (refit_cutoff(at).astimezone(NEW_YORK).date() - last).days >= REFIT_DAYS
 
 
@@ -113,26 +111,19 @@ def refit_data(
     Equal for any two stores that agree on what was known before the cutoff: a bar, revision or
     session known at or after it never changes the rows. Raises ModelError (from TrainingData)
     when fewer than two warm rows remain, ClockError for a naive time, and ModelError when
-    start >= cutoff."""
+    start >= cutoff. Raises DataError naming any sessions missing hourly bars in the view."""
     start, cutoff = ensure_utc(start), ensure_utc(cutoff)
     if start >= cutoff:
         raise ModelError("refit window must have positive length")
-    origin = datetime.combine(FIT_START, time(), tzinfo=NEW_YORK).astimezone(UTC)
-    bars = store.view(cutoff, as_of=cutoff, policy=policy).hourly(
-        symbol, purpose=Purpose.OPERATE, since=origin
-    )
-    matrix = compute_features(bars, features).window(start, cutoff)
-    by_open = {
-        to_us(bar.t_open): (math.log(bar.close / previous.close), bar.session.toordinal())
-        for previous, bar in pairwise(bar for bar in bars if bar.complete)
-    }
-    return TrainingData(
-        matrix,
-        np.array([by_open[int(t)][0] for t in matrix.t_open], dtype=np.float64),
-        np.array([by_open[int(t)][1] for t in matrix.t_open], dtype=np.int64),
-        start,
-        cutoff,
-        features.config_hash(),
+    return training_rows(
+        store,
+        symbol,
+        start=start,
+        end=cutoff,
+        first=start.astimezone(NEW_YORK).date(),
+        last=cutoff.astimezone(NEW_YORK).date(),
+        features=features,
+        policy=policy,
     )
 
 
@@ -191,7 +182,7 @@ def run_refit(
     `data.fit_end > at` (rows from the future); the feature columns or feature-config hash
     aren't `current`'s; or ops.db's model pointer at `at` doesn't name `current`
     (`ops.current("model", at)`), so a refit is always of the active model. ClockError for a
-    naive `at`. Training's own ModelError is a REJECTED outcome, not an exception.
+    naive `at`. ModelError from training, matching or drift is a REJECTED outcome.
 
     Training goes through this module's `train_candidate` name (`train_candidate(data,
     Candidate(K, covariance type of current), thresholds=..., config=..., provenance=...,
@@ -228,16 +219,21 @@ def run_refit(
         )
         sanity = result.sanity
         reasons = sanity.reasons
+        if reasons:
+            kind = RefitOutcomeKind.REJECTED
+        else:
+            match = match_states(current, result.model)
+            model = inherit_labels(result.model, match, previous=previous)
+            report = refit_drift(current, model, match, drift)
+            reasons = report.reasons
+            kind = RefitOutcomeKind.ACTIVATED if report.passed else RefitOutcomeKind.FROZEN
     except ModelError as exc:
         reasons = (str(exc),)
-    if reasons:
         kind = RefitOutcomeKind.REJECTED
-    else:
-        match = match_states(current, result.model)
-        model = inherit_labels(result.model, match, previous=previous)
-        report = refit_drift(current, model, match, drift)
-        reasons = report.reasons
-        kind = RefitOutcomeKind.ACTIVATED if report.passed else RefitOutcomeKind.FROZEN
+        model = None
+        match = None
+        report = None
+    if model is not None:
         directory = save_model(model, artifacts / "models")
     event = ops.record_refit(
         at=at,
@@ -284,7 +280,8 @@ def refit(
     false; otherwise `run_refit(refit_data(store, symbol, start=current.fit_start,
     cutoff=refit_cutoff(at), features=features, policy=policy), current, at=at, ...)` with the
     other arguments passed through."""
-    if not refit_due(current, at):
+    events = ops.refit_events()
+    if not refit_due(current, at, last_refit=events[-1].cutoff if events else None):
         return None
     data = refit_data(
         store,

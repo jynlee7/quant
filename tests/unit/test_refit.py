@@ -343,7 +343,6 @@ def test_the_refit_reads_through_the_view_at_its_cutoff_and_nothing_later() -> N
     assert rows(garbage).data_hash() == data.data_hash()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("SPEC§5", "ARCH§7.3", "ARCH§6.2", "I1")
 def test_a_session_the_view_lacks_at_the_cutoff_is_refused_not_dropped() -> None:
     # B7a review (code-review #3): refit_data dropped first_model's whole-session check, so a
@@ -611,7 +610,6 @@ def test_the_evening_job_refits_only_when_due(tmp_path: Path) -> None:
     assert len(ops.refit_events()) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("SPEC§5", "C5", "ARCH§7.3")
 @pytest.mark.parametrize("trained", [True, False], ids=["trained", "rejected"])
 @pytest.mark.parametrize(
@@ -704,7 +702,6 @@ def test_after_a_rejected_refit_the_next_runs_on_day_30(
     assert len(ops.refit_events()) == 2
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=ModelError)
 @pytest.mark.spec("SPEC§5", "ARCH§7.3")
 @pytest.mark.parametrize("step", ["match_states", "inherit_labels", "refit_drift"])
 def test_a_model_error_after_training_is_a_rejected_refit(

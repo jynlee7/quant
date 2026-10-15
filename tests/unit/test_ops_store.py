@@ -223,7 +223,6 @@ def test_ops_history_is_append_only(table: str, verb: str, tmp_path: Path) -> No
         reopened.close()
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
 @pytest.mark.spec("ARCH§9.1", "ARCH§9.2", "C5")
 @pytest.mark.parametrize("table", ["pointers", "refit_events", "freeze_events"])
 @pytest.mark.parametrize("verb", ["INSERT OR REPLACE", "REPLACE"])

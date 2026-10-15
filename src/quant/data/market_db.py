@@ -608,6 +608,8 @@ class BarStore:
         value: float,
         declared: date,
         known_at: Stamp,
+        *,
+        allow_revision: bool = True,
     ) -> None:
         what = f"{table} for {symbol} on {ex_date}"
         if declared > ex_date:
@@ -621,13 +623,25 @@ class BarStore:
             elif tuple(row[2:]) == values:
                 return
             else:
+                if not allow_revision:
+                    raise DataError(f"{what}: revisions are not allowed")
                 version, known = row[0] + 1, stamping.revision(what, row[1])
             self._conn.execute(insert, (symbol, ex_date.isoformat(), version, *values, known))
 
     def put_dividend(
-        self, symbol: str, *, ex_date: date, amount: float, declared: date, known_at: Stamp
+        self,
+        symbol: str,
+        *,
+        ex_date: date,
+        amount: float,
+        declared: date,
+        known_at: Stamp,
+        allow_revision: bool = True,
     ) -> None:
-        self._put_action("dividends", symbol, ex_date, amount, declared, known_at)
+        """Store a dividend; allow_revision=False refuses changes under either stamp."""
+        self._put_action(
+            "dividends", symbol, ex_date, amount, declared, known_at, allow_revision=allow_revision
+        )
 
     def put_split(
         self, symbol: str, *, ex_date: date, ratio: float, declared: date, known_at: Stamp

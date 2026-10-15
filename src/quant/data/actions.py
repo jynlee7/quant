@@ -157,13 +157,18 @@ def actions_from_announcements(payload: Any) -> CorporateActions:
 
 
 def store_actions(
-    store: BarStore, symbol: str, actions: CorporateActions, *, known_at: Stamp
+    store: BarStore,
+    symbol: str,
+    actions: CorporateActions,
+    *,
+    known_at: Stamp,
+    allow_revision: bool = True,
 ) -> ActionSync:
     """Store `symbol`'s dividends and splits (`BarStore.put_dividend`, `put_split`), stamped as
     `known_at` says. Storing the same actions twice changes nothing. An action the store
     refuses, such as a changed one under HISTORY, is left as stored and reported in
     `ActionSync.conflicts`; the others are still stored. Every split is surfaced, so it
-    halts."""
+    halts. With allow_revision=False, differing dividends are conflicts under either stamp."""
     dividends = [d for d in actions.dividends if d.symbol == symbol]
     splits = tuple(s for s in actions.splits if s.symbol == symbol)
     conflicts: list[str] = []
@@ -171,7 +176,12 @@ def store_actions(
     for d in dividends:
         try:
             store.put_dividend(
-                symbol, ex_date=d.ex_date, amount=d.amount, declared=d.declared, known_at=known_at
+                symbol,
+                ex_date=d.ex_date,
+                amount=d.amount,
+                declared=d.declared,
+                known_at=known_at,
+                allow_revision=allow_revision,
             )
             stored += 1
         except DataError as exc:

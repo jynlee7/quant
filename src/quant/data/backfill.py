@@ -144,7 +144,7 @@ def backfill(
             ),
             (),
         )
-        supplemented = store_actions(store, symbol, selected, known_at=stamp)
+        supplemented = store_actions(store, symbol, selected, known_at=stamp, allow_revision=False)
     for day, minutes in deferred:
         store.ingest_minutes(symbol, minutes, known_at=NOW, source=SOURCE)
         store.mark_backfilled(symbol, day, len(minutes))

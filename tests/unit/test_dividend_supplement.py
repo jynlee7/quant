@@ -230,7 +230,6 @@ def test_a_supplement_row_that_differs_from_the_feeds_is_a_conflict_not_an_overw
     assert dividends_known(store, AFTER) == [(EX, 1.0)]  # the feed's row stands
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("ARCH§6.2")
 def test_a_supplement_row_that_differs_is_a_conflict_under_now_too(minutes: Any) -> None:
     # B7a review (Codex R1): once the store has a NOW stamp, the backfill stamps NOW, and a NOW
