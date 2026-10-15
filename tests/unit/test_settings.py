@@ -21,6 +21,9 @@ from quant.core.settings import load_settings
 KEY_ID = "settings-key-id-7f3a9c0b"
 SECRET = "settings-secret-5e1d8b2a4c6f"
 BOT_TOKEN = "settings-bot-token-91c4e7aa"
+# The keys systemd injects through the environment, in the environment test.
+ENV_KEY_ID = KEY_ID + "-env"
+ENV_SECRET = SECRET + "-env"
 
 
 def write_env(directory: Path, text: str, *, mode: int = 0o600) -> Path:
@@ -102,11 +105,11 @@ def test_keys_read_from_the_file_are_redacted_in_logs(tmp_path: Path, stream: io
 
 @pytest.mark.spec("I6", "ARCH§2")
 def test_keys_injected_by_the_environment_are_registered_too(stream: io.StringIO) -> None:
-    environ = {"ALPACA_API_KEY": KEY_ID + "-env", "ALPACA_SECRET_KEY": SECRET + "-env"}
+    environ = {"ALPACA_API_KEY": ENV_KEY_ID, "ALPACA_SECRET_KEY": ENV_SECRET}
     settings = load_settings(None, environ={**environ, "TRADING_MODE": "paper"})
     structlog.get_logger("test").info("loaded", note=settings.alpaca.secret_key)
     text = stream.getvalue()
-    assert SECRET + "-env" not in text
+    assert ENV_SECRET not in text
     assert REDACTED in text
 
 
@@ -146,3 +149,28 @@ def test_an_env_file_other_users_can_read_is_refused(tmp_path: Path, mode: int) 
 def test_a_missing_env_file_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"\.env"):
         load_settings(tmp_path / ".env", environ={})
+
+
+# X3 (B6a review): the two redaction tests above must fail when the loader doesn't register. The
+# registry is process-global, so a key an earlier test registered, or a prefix of one, would
+# redact the value and hide a loader that registers nothing.
+@pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
+@pytest.mark.spec("I6")
+@pytest.mark.parametrize("source", ["file", "environment"])
+def test_without_registration_the_same_keys_would_reach_the_log(
+    tmp_path: Path, stream: io.StringIO, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    monkeypatch.setattr("quant.core.settings.register_secret", lambda value: None)
+    if source == "file":
+        settings = load_settings(write_env(tmp_path, env_text()), environ={})
+        keys = (KEY_ID, SECRET)
+    else:
+        environ = {"ALPACA_API_KEY": ENV_KEY_ID, "ALPACA_SECRET_KEY": ENV_SECRET}
+        settings = load_settings(None, environ={**environ, "TRADING_MODE": "paper"})
+        keys = (ENV_KEY_ID, ENV_SECRET)
+    structlog.get_logger("test").info(
+        "loaded", note=f"id {settings.alpaca.key_id} secret {settings.alpaca.secret_key}"
+    )
+    text = stream.getvalue()
+    for key in keys:
+        assert key in text

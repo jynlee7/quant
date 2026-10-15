@@ -86,13 +86,20 @@ class Seen:
     headers: Mapping[str, str]
     url: str
     at: datetime | None  # the fake's clock when the request arrived
+    timeout: Any  # the timeout requests handed the transport: None means it could wait forever
 
 
 @dataclass(frozen=True)
 class Reply:
-    body: str
+    """One answer. With `until`, it is served again for every request that arrives before that
+    time on the fake's clock, then the next reply is. With `error`, the transport raises it, as
+    requests does on a timeout or a dropped connection."""
+
+    body: str = ""
     status: int = 200
     headers: Mapping[str, str] = field(default_factory=dict)
+    until: datetime | None = None
+    error: Exception | None = None
 
 
 class AlpacaFake:
@@ -130,12 +137,21 @@ class AlpacaFake:
             headers=dict(request.headers),
             url=request.url,
             at=None if self._clock is None else self._clock.now(),
+            timeout=getattr(request, "req_kwargs", {}).get("timeout"),
         )
         self.seen.append(seen)
         queue = self._queues.get(parts.path)
+        while queue and queue[0].until is not None:
+            if seen.at is None:
+                raise AssertionError("a reply served until a time needs the fake's clock")
+            if seen.at < queue[0].until:
+                break
+            queue.popleft()
         if not queue:
             raise AssertionError(f"unexpected request: {request.method} {parts.path}")
-        reply = queue.popleft()
+        reply = queue[0] if queue[0].until is not None else queue.popleft()
+        if reply.error is not None:
+            raise reply.error
         headers = {"Content-Type": "application/json", **reply.headers}
         return reply.status, headers, reply.body
 
@@ -156,6 +172,7 @@ class FakeSource:
     actions: CorporateActions = field(default_factory=lambda: CorporateActions((), ()))
     fail_on: date | None = None
     fetched: list[date] = field(default_factory=list)
+    asked_actions: list[tuple[date, date]] = field(default_factory=list)
     calendar: TradingCalendar = field(default_factory=TradingCalendar.xnys)
 
     def session_minutes(self, symbol: str, day: date) -> MinuteFrame:
@@ -167,6 +184,7 @@ class FakeSource:
         return self.minutes.select((t >= to_us(session.open)) & (t < to_us(session.close)))
 
     def corporate_actions(self, symbol: str, start: date, end: date) -> CorporateActions:
+        self.asked_actions.append((start, end))
         return CorporateActions(
             tuple(d for d in self.actions.dividends if start <= d.ex_date <= end),
             tuple(s for s in self.actions.splits if start <= s.ex_date <= end),
