@@ -24,7 +24,8 @@ from structlog.testing import capture_logs
 
 from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.clock import SimClock
-from quant.core.errors import ClockError, ModelError
+from quant.core.epoch import to_us
+from quant.core.errors import ClockError, DataError, ModelError
 from quant.core.regime import Label
 from quant.features.menu import r1_features
 from quant.features.scaler import Scaler
@@ -342,6 +343,29 @@ def test_the_refit_reads_through_the_view_at_its_cutoff_and_nothing_later() -> N
     assert rows(garbage).data_hash() == data.data_hash()
 
 
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("SPEC§5", "ARCH§7.3", "ARCH§6.2", "I1")
+def test_a_session_the_view_lacks_at_the_cutoff_is_refused_not_dropped() -> None:
+    # B7a review (code-review #3): refit_data dropped first_model's whole-session check, so a
+    # session written after the cutoff was a silent hole in the refit's window.
+    from quant.jobs.refit import refit_cutoff, refit_data
+
+    w = world()
+    cutoff = refit_cutoff(ny(2016, 12, 1, 17, 30))
+    store = truncated_store(w, cutoff + timedelta(days=60))
+    store._conn.execute(
+        "UPDATE hourly_bars SET known_at = ? WHERE session = '2016-07-06'",
+        (to_us(cutoff + timedelta(days=30)),),
+    )
+    try:
+        refit_data(store, "SPY", start=w.model.fit_start, cutoff=cutoff, features=r1_features())
+    except DataError as exc:
+        message = str(exc)
+    else:
+        message = ""
+    assert "2016-07-06" in message, "a session missing at the cutoff was dropped silently"
+
+
 # --- The outcomes ---------------------------------------------------------------------------
 
 
@@ -533,7 +557,12 @@ def test_a_refit_of_the_wrong_window_or_model_is_refused_before_training(
     else:
         active = drifted(current)
     ops, _ = _ops(at, active)
-    with pytest.raises(ModelError):
+    if fault == "future rows":
+        # B7a review (Codex R3): no pointer exists back at run_at, so without this the pointer
+        # check refused the job and the `fit_end > at` guard went untested.
+        (pointer,) = ops.pointers("model")
+        monkeypatch.setattr(ops, "current", lambda kind, when: pointer)
+    with pytest.raises(ModelError, match="expanding past window"):
         _run(data, current, run_at, ops, tmp_path)
     assert ops.refit_events() == ()
     assert not (tmp_path / "models").exists()
@@ -580,6 +609,131 @@ def test_the_evening_job_refits_only_when_due(tmp_path: Path) -> None:
             outcome.cutoff,
         )
     assert len(ops.refit_events()) == 1
+
+
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("SPEC§5", "C5", "ARCH§7.3")
+@pytest.mark.parametrize("trained", [True, False], ids=["trained", "rejected"])
+@pytest.mark.parametrize(
+    "again",
+    [ny(2016, 11, 30, 21, 0), ny(2016, 12, 1, 17, 30), ny(2016, 12, 29, 17, 30)],
+    ids=["same evening", "next evening", "day 29"],
+)
+def test_after_any_refit_the_next_is_due_30_days_on(
+    trained: bool, again: datetime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B7a review (code-review #2, #4): counting from the active model's data alone, a refit was
+    # due again the same evening (a rerun before the new pointer governs) and every evening
+    # after a FROZEN or REJECTED one. SPEC §5: every 30 calendar days; "the next refit" (C5).
+    import quant.jobs.refit as job
+    from quant.hmm.drift import r1_drift_thresholds
+
+    w = world()
+    current = w.model  # its data ends 2016-10-31
+    if not trained:
+
+        def reject(*args: Any, **kwargs: Any) -> Any:
+            raise ModelError("no filtered mass")
+
+        monkeypatch.setattr(job, "train_candidate", reject)
+
+    def evening(at: datetime, ops: Any) -> Any:
+        return job.refit(
+            w.store,
+            current,
+            at=at,
+            symbol="SPY",
+            features=r1_features(),
+            ops=ops,
+            artifacts=tmp_path,
+            config=tiny_config(),
+            thresholds=r1_thresholds(),
+            drift=r1_drift_thresholds(),
+            provenance=PROVENANCE,
+            workers=1,
+        )
+
+    due = ny(2016, 11, 30, 17, 30)
+    ops, clock = _ops(due, current)
+    assert evening(due, ops) is not None
+    clock.advance_to(again)
+    try:
+        repeated = evening(again, ops)
+    except ModelError:
+        repeated = "refused"
+    assert repeated is None, "a refit ran again before 30 days had passed"
+    assert len(ops.refit_events()) == 1
+
+
+@pytest.mark.spec("SPEC§5", "C5", "ARCH§7.3")
+def test_after_a_rejected_refit_the_next_runs_on_day_30(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The guard beside the cadence fix (B7a review): 30 days after a refit, the next one runs.
+    import quant.jobs.refit as job
+    from quant.hmm.drift import r1_drift_thresholds
+
+    def reject(*args: Any, **kwargs: Any) -> Any:
+        raise ModelError("no filtered mass")
+
+    monkeypatch.setattr(job, "train_candidate", reject)
+    w = world()
+
+    def evening(at: datetime, ops: Any) -> Any:
+        return job.refit(
+            w.store,
+            w.model,
+            at=at,
+            symbol="SPY",
+            features=r1_features(),
+            ops=ops,
+            artifacts=tmp_path,
+            config=tiny_config(),
+            thresholds=r1_thresholds(),
+            drift=r1_drift_thresholds(),
+            provenance=PROVENANCE,
+            workers=1,
+        )
+
+    due = ny(2016, 11, 30, 17, 30)
+    ops, clock = _ops(due, w.model)
+    assert evening(due, ops) is not None
+    later = ny(2016, 12, 30, 17, 30)
+    clock.advance_to(later)
+    assert evening(later, ops) is not None
+    assert len(ops.refit_events()) == 2
+
+
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=ModelError)
+@pytest.mark.spec("SPEC§5", "ARCH§7.3")
+@pytest.mark.parametrize("step", ["match_states", "inherit_labels", "refit_drift"])
+def test_a_model_error_after_training_is_a_rejected_refit(
+    step: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B7a review (code-review #5): only training's ModelError became REJECTED; one from matching
+    # or drift (a singular raw covariance, a non-finite divergence) escaped with no event and
+    # no alert.
+    import quant.jobs.refit as job
+    from quant.jobs.refit import REJECT_EVENT
+    from quant.store.ops import RefitOutcomeKind
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise ModelError("covariance is not positive definite")
+
+    monkeypatch.setattr(job, step, fail)
+    current = first_model()
+    at = ny(2017, 6, 30, 17, 30)
+    ops, _ = _ops(at, current)
+    with capture_logs() as logs:
+        outcome = _run(cut(_bars(), 270), current, at, ops, tmp_path)
+    assert outcome.kind is RefitOutcomeKind.REJECTED
+    assert outcome.model is None
+    assert "positive definite" in " ".join(outcome.reasons)
+    (event,) = ops.refit_events()
+    assert (event.outcome, event.artifact) == (RefitOutcomeKind.REJECTED, None)
+    assert [p.artifact for p in ops.pointers("model")] == [current.artifact_hash()]
+    assert not (tmp_path / "models").exists() or not any((tmp_path / "models").iterdir())
+    assert any(entry["event"] == REJECT_EVENT and entry["log_level"] == "warning" for entry in logs)
 
 
 @pytest.mark.spec("SPEC§5")

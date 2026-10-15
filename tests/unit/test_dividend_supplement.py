@@ -29,7 +29,7 @@ from quant.data.actions import (
     load_dividend_supplement,
 )
 from quant.data.backfill import backfill
-from quant.data.market_db import HISTORY, BarStore
+from quant.data.market_db import HISTORY, NOW, BarStore
 from quant.data.policy import Purpose
 from tests.support.alpaca import FakeSource
 from tests.support.bars import SYMBOL, synthetic_days
@@ -228,6 +228,31 @@ def test_a_supplement_row_that_differs_from_the_feeds_is_a_conflict_not_an_overw
     assert len(result.supplement.conflicts) == 1
     assert "2016-03-18" in result.supplement.conflicts[0]
     assert dividends_known(store, AFTER) == [(EX, 1.0)]  # the feed's row stands
+
+
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("ARCH§6.2")
+def test_a_supplement_row_that_differs_is_a_conflict_under_now_too(minutes: Any) -> None:
+    # B7a review (Codex R1): once the store has a NOW stamp, the backfill stamps NOW, and a NOW
+    # write may revise a dividend. The supplement must still never revise the feed's row.
+    clock = SimClock(AFTER)
+    store = BarStore.memory(clock=clock)
+    store.put_dividend(SYMBOL, ex_date=EX, amount=1.0, declared=EX, known_at=NOW)
+    feed = CorporateActions((Dividend(SYMBOL, EX, 1.0, EX, False),), ())
+    result = backfill(
+        store,
+        FakeSource(minutes, feed),
+        SYMBOL,
+        FIRST,
+        LAST,
+        clock=clock,
+        supplement=supplement((EX, AMOUNT)),
+    )
+    assert result.stamp is NOW
+    assert result.supplement.dividends == 0
+    assert len(result.supplement.conflicts) == 1
+    assert "2016-03-18" in result.supplement.conflicts[0]
+    assert dividends_known(store, store.high_water or AFTER) == [(EX, 1.0)]
 
 
 @pytest.mark.spec("ARCH§6.2")

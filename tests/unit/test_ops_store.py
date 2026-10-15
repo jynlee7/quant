@@ -223,6 +223,45 @@ def test_ops_history_is_append_only(table: str, verb: str, tmp_path: Path) -> No
         reopened.close()
 
 
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
+@pytest.mark.spec("ARCH§9.1", "ARCH§9.2", "C5")
+@pytest.mark.parametrize("table", ["pointers", "refit_events", "freeze_events"])
+@pytest.mark.parametrize("verb", ["INSERT OR REPLACE", "REPLACE"])
+def test_ops_history_cant_be_replaced_in_place(table: str, verb: str, tmp_path: Path) -> None:
+    # B7a review (Codex R2): REPLACE deletes the conflicting row without firing DELETE
+    # triggers (recursive_triggers is off), so it rewrote history past the append-only rule.
+    from quant.store.ops import FreezeCause, OpsStore, RefitOutcomeKind
+
+    clock = SimClock(ny(2017, 6, 29, 17, 0))
+    path = tmp_path / "ops.db"
+    store = OpsStore.open(path, clock=clock)
+    store.activate("model", H0, reason="first model")
+    store.record_refit(
+        at=clock.now(),
+        cutoff=clock.now(),
+        outcome=RefitOutcomeKind.FROZEN,
+        artifact=H1,
+        previous=H0,
+        reasons=("transition 0->1 moved",),
+    )
+    store.record_freeze(FreezeCause.LIVE_DRIFT, "35-bar mean below the baseline")
+    store.close()
+    before = sqlite3.connect(path)
+    try:
+        rows = before.execute(f"SELECT * FROM {table} ORDER BY seq").fetchall()  # noqa: S608
+    finally:
+        before.close()
+
+    raw = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"), raw:
+            raw.execute(f"{verb} INTO {table} SELECT * FROM {table} WHERE seq = 1")  # noqa: S608
+        after = raw.execute(f"SELECT * FROM {table} ORDER BY seq").fetchall()  # noqa: S608
+    finally:
+        raw.close()
+    assert after == rows
+
+
 @pytest.mark.spec("ARCH§9.2", "K6")
 def test_stamps_never_go_back_when_the_clock_does() -> None:
     from quant.store.ops import FreezeCause
