@@ -29,3 +29,11 @@ covers = [
 
 [steps.B5]
 covers = ["I1", "I2", "T-NL1", "T-NL2"]
+
+# B6a (settings, the data client, the backfill, the quality report) claims these; B6b adds the
+# ids of the probe, the real backfill and the first model (D4, SPEC§4, ARCH§18's probe items).
+[steps.B6]
+covers = [
+    "D1", "D2", "I5", "I6", "C1", "C8", "K6", "SPEC§2", "PLAN§3",
+    "ARCH§2", "ARCH§5", "ARCH§6.1", "ARCH§6.2", "ARCH§6.3", "ARCH§18",
+]
