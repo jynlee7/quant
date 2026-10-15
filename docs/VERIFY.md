@@ -21,7 +21,8 @@ Run it with:
 - **Checked:** 2026-10-15.
 - **Method:** Alpaca's docs and forum. The API can't answer this without opening an account, so the probe doesn't try.
 - **Result:** the paper-trading page describes "Open New Paper Account" and "Delete Account" under Account Settings, but states no limit. A forum reply from Alpaca says each login may hold 3 paper accounts and 1 live account (https://forum.alpaca.markets/t/feature-request-more-paper-trading-accounts/18125, not official documentation).
-- **The build:** **owner question.** Can your login open a second paper account for `.env.test`? Until one exists, the trading account stands in for the test account (pack status, CP3).
+- **Owner's answer (2026-10-15):** their login can hold up to 3 paper accounts. They opened a second one, and `.env.test` now authenticates as a separate, ACTIVE paper account, not the trading account.
+- **The build:** integration tests run on `.env.test`'s account, never the trading account's (AD3). `.env.test` has no `TRADING_MODE`, as `.env.example` says, so `load_settings` refuses it as is; B13 must settle how the test settings are loaded.
 
 ## 3. SIP delay against D2's 16 minutes (ARCH §18)
 
