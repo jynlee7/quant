@@ -18,8 +18,8 @@ import typer
 
 from quant.cli.data import DEFAULT_DB
 from quant.core.clock import WallClock
-from quant.core.errors import ModelError, PolicyError
-from quant.data.market_db import BarStore
+from quant.core.errors import DataError, ModelError, PolicyError
+from quant.data.market_db import MIGRATIONS, BarStore
 from quant.data.policy import FIT_START
 from quant.features.menu import r1_features
 from quant.hmm.labels import r1_thresholds
@@ -65,8 +65,10 @@ def select(
 
     Prints the chosen K and covariance type, the artifact directory, both report paths and the
     selection's run time, and exits 0. Exits 2, saying why and creating nothing, when the span
-    reaches outside FIT (PolicyError) or `--db` is not a file. Exits 1 when selection fails
-    (ModelError), saying why.
+    reaches outside FIT (PolicyError), `--db` is not a file, isn't a SQLite database, or is at a
+    schema version other than this code's (the store is opened read-only, so it is never
+    migrated here: `quant data backfill` migrates an older one), or the store can't give the
+    span's sessions whole (DataError). Exits 1 when selection fails (ModelError), saying why.
     """
     try:
         fit_window(first.date(), last.date())
@@ -77,6 +79,21 @@ def select(
         typer.echo(f"market.db does not exist: {db}", err=True)
         raise typer.Exit(2)
     conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        (version,) = conn.execute("PRAGMA user_version").fetchone()
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        typer.echo(f"market.db can't be read: {db}: {exc}", err=True)
+        raise typer.Exit(2) from None
+    if version != len(MIGRATIONS):
+        conn.close()
+        typer.echo(
+            f"market.db {db} is at schema version {version}, and this code reads version "
+            f"{len(MIGRATIONS)}; it is opened read-only, so `quant data backfill` must migrate "
+            "an older one",
+            err=True,
+        )
+        raise typer.Exit(2)
     try:
         store = BarStore(conn)
         run = select_first_model(
@@ -92,6 +109,9 @@ def select(
             clock=WallClock(),
             workers=workers,
         )
+    except (DataError, PolicyError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
     except ModelError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from None

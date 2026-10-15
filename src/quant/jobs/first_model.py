@@ -11,11 +11,16 @@ report CP1 shows you:
    York midnight starting `first` and New York midnight after `last`, in UTC.
 2. **The rows** (`training_data`) come only through the point-in-time view, as a backtest at
    τ = fit_end would read them: `store.view(fit_end, as_of=fit_end, policy=policy)`, hourly bars
-   opening at or after fit_start, read with purpose OPERATE (a fit is an operating read, like a
-   refit: ARCHITECTURE §6.3). Nothing known at or after fit_end can reach the model, so a store
-   holding later bars (DEV, the lockbox, a revision made today) gives exactly the same rows as
-   one holding only FIT. The bars are featurized by B3's `compute_features` from the span's
-   first bar on, and every warm row is kept (all of them lie in the window by construction).
+   opening at or after FIT's first New York midnight, read with purpose OPERATE (a fit is an
+   operating read, like a refit: ARCHITECTURE §6.3). Nothing known at or after fit_end can
+   reach the model, so a store holding later bars (DEV, the lockbox, a revision made today)
+   gives exactly the same rows as one holding only FIT. The feature stream starts at the start
+   of FIT, as it does live, whatever the span (ARCHITECTURE §4.2: a fit passes the bars from
+   2016-01 and cuts its window with `FeatureMatrix.window`). Two checks stand behind the span's:
+   a bar read from DEV's first session on is refused (PolicyError; OPERATE may read anything, so
+   FIT-only can't rest on `fit_window` alone, B6 review), and every session of the span must
+   give the view all its hourly bars, so a session the store learned after fit_end (written
+   NOW) is refused (DataError), never silently dropped.
 3. **The selection** is `select_and_train` on those rows with the given config, thresholds,
    provenance and workers. Its run time is measured on the injected Clock, read exactly twice,
    just before and just after selection (K6: never the wall clock directly), recorded in the
@@ -27,7 +32,9 @@ report CP1 shows you:
    `<artifacts>/reports/first-model-<artifact_hash>.json`, and a short Markdown rendering
    (`render_markdown`) beside it as `first-model-<artifact_hash>.md`. Both are written to a
    temporary file in the same directory and renamed into place. The run time is in the report,
-   never in the artifact: the artifact hash depends only on data, seeds and config.
+   never in the artifact: the artifact hash depends on the data, seeds, config and provenance
+   (the commit, the lockfile hash and whether the tree was dirty, `code_provenance`), not on
+   when or how long selection ran.
 
 Times are UTC; New York dates appear only at the edges (the span). "Now" comes only from the
 Clock passed in (K6).
@@ -37,8 +44,11 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
+import subprocess
 import tempfile
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -49,11 +59,12 @@ from typing import Any, Final
 import numpy as np
 import structlog
 
-from quant.core.calendar import NEW_YORK
+from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.canonical import canonical_dumps, canonical_loads
 from quant.core.clock import Clock
 from quant.core.epoch import to_us
-from quant.core.errors import ModelError, PolicyError
+from quant.core.errors import DataError, ModelError, PolicyError
+from quant.data.frames import HourlyBar
 from quant.data.market_db import BarStore
 from quant.data.policy import DEV_START, FIT_START, DataPolicy, Purpose
 from quant.features.menu import FeatureConfig
@@ -98,10 +109,13 @@ def training_data(
     - The window is `fit_window(first, last)`, so a span outside FIT raises PolicyError before
       anything is read.
     - The bars are `store.view(fit_end, as_of=fit_end, policy=policy).hourly(symbol,
-      purpose=Purpose.OPERATE, since=fit_start)`: every read names OPERATE, and the policy (the
-      default DataPolicy when None) checks it.
-    - `matrix` is `compute_features(bars, features)`, its rows' available_at all in
-      [fit_start, fit_end).
+      purpose=Purpose.OPERATE, since=<FIT_START's New York midnight>)`: every read names
+      OPERATE, and the policy (the default DataPolicy when None) checks it. A bar of a session
+      on or after DEV_START, or opening at or after fit_end, raises PolicyError. A session of
+      [first, last] whose hourly bars the view doesn't return in full (one the store learned
+      after fit_end, or never held) raises DataError naming the sessions.
+    - `matrix` is `compute_features(bars, features).window(fit_start, fit_end)`: the stream
+      starts at FIT's start, and the rows kept are those available in [fit_start, fit_end).
     - `returns[i]` is row i's bar's raw log return ln(C_t / C_prev), C_prev the close of the
       complete bar before it (the bar the feature stream consumed before it: incomplete bars
       are missing data and skipped, as `compute_features` skips them).
@@ -110,10 +124,18 @@ def training_data(
 
     Raises ModelError (from TrainingData) when fewer than two warm rows remain."""
     start, end = fit_window(first, last)
+    origin = datetime.combine(FIT_START, time(), tzinfo=NEW_YORK).astimezone(UTC)
     bars = store.view(end, as_of=end, policy=policy).hourly(
-        symbol, purpose=Purpose.OPERATE, since=start
+        symbol, purpose=Purpose.OPERATE, since=origin
     )
-    matrix = compute_features(bars, features)
+    late = [bar for bar in bars if bar.session >= DEV_START or bar.t_open >= end]
+    if late:
+        raise PolicyError(
+            f"first model rows must lie inside FIT, before DEV starts on {DEV_START} and before "
+            f"{end.isoformat()}; read a bar of {late[0].session}"
+        )
+    _require_whole_sessions(bars, first, last)
+    matrix = compute_features(bars, features).window(start, end)
     by_open = {
         to_us(bar.t_open): (math.log(bar.close / previous.close), bar.session.toordinal())
         for previous, bar in pairwise(bar for bar in bars if bar.complete)
@@ -126,6 +148,25 @@ def training_data(
         end,
         features.config_hash(),
     )
+
+
+def _require_whole_sessions(bars: list[HourlyBar], first: date, last: date) -> None:
+    """DataError unless every session of [first, last] has all its calendar hourly bars among
+    `bars`, naming the sessions that don't."""
+    calendar = TradingCalendar.xnys()
+    counts = Counter(bar.session for bar in bars)
+    short = [
+        day
+        for day in calendar.sessions(first, last)
+        if counts[day] != len(calendar.session(day).bars)
+    ]
+    if short:
+        shown = ", ".join(day.isoformat() for day in short[:10])
+        raise DataError(
+            f"the view at fit_end lacks hourly bars of {len(short)} session(s) of the span "
+            f"({shown}{', ...' if len(short) > 10 else ''}): known after fit_end, or never "
+            "stored; check the store with `quant data quality`"
+        )
 
 
 @dataclass(frozen=True, eq=False)
@@ -280,8 +321,10 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 
     - a first line `# First model: <symbol>, <span first> to <span last>`;
     - bullets naming the artifact hash in backticks, the choice as `K = <n_states>,
-      <covariance_type> covariance`, the selection rule, the fit window and rows, and the run
-      time as `<selection_seconds formatted .1f> s`;
+      <covariance_type> covariance`, the selection rule, the fit window as the span's days with
+      its exclusive end (`Fit window: 2016-01-01 to 2018-12-31 (end exclusive
+      2019-01-01T05:00Z); <n_rows> rows`, so no reader takes it for a read of DEV's first day),
+      and the run time as `<selection_seconds formatted .1f> s`;
     - a `## Transition matrix` table with one row per state, each entry formatted `.4f`;
     - a `## States` table with one row per state: state, label, v, d, annualized mean return,
       annualized volatility, expected duration in bars and in sessions ("inf" when infinite),
@@ -298,7 +341,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         f"- Artifact: `{report['artifact']['hash']}`",
         f"- K = {chosen['n_states']}, {chosen['covariance_type']} covariance",
         f"- Selection rule: {report['selection']['rule']}",
-        f"- Fit window: {report['fit_window']['start']} to {report['fit_window']['end']}; {report['n_rows']} rows",
+        f"- Fit window: {span['first']} to {span['last']} (end exclusive {_minute(report['fit_window']['end'])}); {report['n_rows']} rows",
         f"- Selection time: {report['selection_seconds']:.1f} s",
         "",
         "## Transition matrix",
@@ -375,31 +418,81 @@ def render_markdown(report: Mapping[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def code_provenance(root: Path) -> dict[str, str | None]:
-    """What the trainer records as `provenance` (ARCHITECTURE §7.2: the code commit and the
-    lockfile hash), read from files, never a subprocess:
+def _minute(stamp: str) -> str:
+    """A canonical UTC timestamp ("2019-01-01T05:00:00Z") to the minute ("2019-01-01T05:00Z")."""
+    return datetime.fromisoformat(stamp).astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ")
 
-    - "commit": the 40-hex commit `root/.git/HEAD` names: the hash itself when HEAD is
-      detached, else the ref it names (`ref: refs/heads/<branch>`), read from
-      `root/.git/<ref>` or, when that file is absent, from `root/.git/packed-refs`. None when
-      `root/.git` is not a directory or the ref can't be resolved to 40 lowercase hex;
+
+def _git_dir(root: Path) -> tuple[Path, Path] | None:
+    """(the git directory, the common directory holding refs and packed-refs) of the checkout
+    at `root`: `root/.git` for both in a plain checkout; for a worktree, whose `.git` is a file
+    `gitdir: <path>`, that path and the directory its `commondir` file names. None when neither
+    exists."""
+    dot = root / ".git"
+    if dot.is_dir():
+        return dot, dot
+    if not dot.is_file():
+        return None
+    text = dot.read_text().strip()
+    if not text.startswith("gitdir: "):
+        return None
+    git = Path(text[8:])
+    git = git if git.is_absolute() else root / git
+    common_file = git / "commondir"
+    common = git
+    if common_file.is_file():
+        named = Path(common_file.read_text().strip())
+        common = named if named.is_absolute() else git / named
+    return (git, common) if git.is_dir() and common.is_dir() else None
+
+
+def _dirty(root: Path) -> bool | None:
+    """Whether the tracked files at `root` differ from HEAD (`git status --porcelain
+    --untracked-files=no`), None when git can't say. git runs with every `GIT_*` variable
+    removed from its environment, as `quant.risk.limits.committed_bytes` does: the commit hook
+    exports GIT_INDEX_FILE and friends, which would point it at another index."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+            env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return bool(result.stdout.strip())
+
+
+def code_provenance(root: Path) -> dict[str, str | bool | None]:
+    """What the trainer records as `provenance` (ARCHITECTURE §7.2: the code commit and the
+    lockfile hash, and whether the tree was dirty):
+
+    - "commit": the 40-hex commit HEAD names, read from files: the git directory is `root/.git`,
+      or in a worktree the directory its `.git` file names (`_git_dir`). HEAD holds the hash
+      itself when detached, else the ref it names (`ref: refs/heads/<branch>`), read from
+      `<common>/<ref>` or, when that file is absent, from `<common>/packed-refs`. None when
+      there is no git directory or the ref can't be resolved to 40 lowercase hex;
+    - "dirty": whether tracked files differ from HEAD (`_dirty`, one `git status` run with the
+      hook's GIT_* variables scrubbed); None when there is no git directory or git can't say;
     - "lockfile_sha256": the SHA-256 in hex of `root/uv.lock`'s bytes, None when it is missing.
     """
-    git = root / ".git"
+    found = _git_dir(root)
     commit = None
-    if git.is_dir() and (git / "HEAD").is_file():
+    if found is not None and (found[0] / "HEAD").is_file():
+        git, common = found
         head = (git / "HEAD").read_text().strip()
         if head.startswith("ref: "):
             ref = head[5:]
-            path = git / ref
+            path = common / ref
             if ref.startswith("refs/") and ".." not in Path(ref).parts:
                 if path.is_file():
                     head = path.read_text().strip()
-                elif (git / "packed-refs").is_file():
+                elif (common / "packed-refs").is_file():
                     head = next(
                         (
                             line.split()[0]
-                            for line in (git / "packed-refs").read_text().splitlines()
+                            for line in (common / "packed-refs").read_text().splitlines()
                             if len(line.split()) == 2 and line.split()[1] == ref
                         ),
                         "",
@@ -409,6 +502,7 @@ def code_provenance(root: Path) -> dict[str, str | None]:
     lock = root / "uv.lock"
     return {
         "commit": commit,
+        "dirty": None if found is None else _dirty(root),
         "lockfile_sha256": hashlib.sha256(lock.read_bytes()).hexdigest()
         if lock.is_file()
         else None,

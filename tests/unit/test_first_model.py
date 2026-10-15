@@ -28,7 +28,7 @@ import quant.jobs.first_model as first_model
 from quant.cli.main import app
 from quant.core.canonical import canonical_dumps, canonical_loads
 from quant.core.epoch import to_us
-from quant.core.errors import ConfigError, DataError, ModelError, PolicyError
+from quant.core.errors import DataError, PolicyError
 from quant.data.policy import DataPolicy, Purpose, ScoringTicket
 from quant.features.menu import r1_features
 from quant.features.stream import compute_features
@@ -419,7 +419,11 @@ def test_quant_model_select_writes_the_model_and_its_report(
         f"first-model-{directory.name}.json",
         f"first-model-{directory.name}.md",
     }
-    assert model.training.info["provenance"] == {"commit": None, "lockfile_sha256": None}
+    assert model.training.info["provenance"] == {
+        "commit": None,
+        "dirty": None,
+        "lockfile_sha256": None,
+    }
     assert _contents(db) == before  # the store is only read
 
 
@@ -444,7 +448,7 @@ def test_quant_model_select_refuses_a_span_past_fit_and_a_missing_store(tmp_path
 
 @pytest.mark.spec("ARCH§7.2")
 def test_code_provenance_reads_the_commit_and_lockfile_from_files(tmp_path: Path) -> None:
-    assert code_provenance(tmp_path) == {"commit": None, "lockfile_sha256": None}
+    assert code_provenance(tmp_path) == {"commit": None, "dirty": None, "lockfile_sha256": None}
     (tmp_path / "uv.lock").write_bytes(b"lock\n")
     git = tmp_path / ".git"
     (git / "refs" / "heads").mkdir(parents=True)
@@ -452,7 +456,8 @@ def test_code_provenance_reads_the_commit_and_lockfile_from_files(tmp_path: Path
     loose, packed = "a" * 40, "b" * 40
     (git / "packed-refs").write_text(f"# pack-refs with: peeled\n{packed} refs/heads/b06-data\n")
     lock = hashlib.sha256(b"lock\n").hexdigest()
-    assert code_provenance(tmp_path) == {"commit": packed, "lockfile_sha256": lock}
+    assert code_provenance(tmp_path)["commit"] == packed
+    assert code_provenance(tmp_path)["lockfile_sha256"] == lock
     (git / "refs" / "heads" / "b06-data").write_text(f"{loose}\n")
     assert code_provenance(tmp_path)["commit"] == loose
     (git / "HEAD").write_text(f"{'c' * 40}\n")  # detached
@@ -464,11 +469,6 @@ def test_code_provenance_reads_the_commit_and_lockfile_from_files(tmp_path: Path
 # --- the B6b review (2026-10-15) ---------------------------------------------------------------
 
 
-def _red(raises: type[BaseException]) -> pytest.MarkDecorator:
-    return pytest.mark.xfail(strict=True, reason="red:B6", raises=raises)
-
-
-@_red(AssertionError)
 @pytest.mark.spec("D4", "SPEC§4", "ARCH§4.2")
 def test_the_feature_stream_starts_at_the_start_of_fit_not_at_the_span() -> None:
     # Review S4: a span starting after FIT's start keeps the rows the stream started at FIT's
@@ -484,7 +484,6 @@ def test_the_feature_stream_starts_at_the_start_of_fit_not_at_the_span() -> None
     assert (data.fit_start, data.fit_end) == (start, end)
 
 
-@_red(ModelError)
 @pytest.mark.spec("D4", "C11", "A2", "ARCH§6.3")
 def test_training_data_refuses_dev_bars_even_if_fit_last_were_wider(
     monkeypatch: pytest.MonkeyPatch,
@@ -499,7 +498,6 @@ def test_training_data_refuses_dev_bars_even_if_fit_last_were_wider(
         )
 
 
-@_red(AssertionError)
 @pytest.mark.spec("D4", "I1", "ARCH§6.2")
 def test_a_fit_session_known_after_fit_end_is_refused_not_dropped() -> None:
     # Review M5: a FIT session written NOW after fit_end is invisible at as_of = fit_end; the rows
@@ -523,7 +521,6 @@ def test_a_fit_session_known_after_fit_end_is_refused_not_dropped() -> None:
     assert "2016-07-06" in message, "a session missing at fit_end was dropped silently"
 
 
-@_red(AssertionError)
 @pytest.mark.spec("D4", "PLAN§3", "C11")
 def test_the_markdown_fit_window_is_half_open(root: Path) -> None:
     # Review M8: the window ends at New York midnight after the span, which no CP1 reader should
@@ -537,14 +534,7 @@ def test_the_markdown_fit_window_is_half_open(root: Path) -> None:
 
 
 @pytest.mark.spec("D4", "PLAN§3")
-@pytest.mark.parametrize(
-    "kind",
-    [
-        pytest.param("older", marks=_red(sqlite3.OperationalError)),
-        pytest.param("newer", marks=_red(ConfigError)),
-        pytest.param("not a database", marks=_red(sqlite3.DatabaseError)),
-    ],
-)
+@pytest.mark.parametrize("kind", ["older", "newer", "not a database"])
 def test_quant_model_select_refuses_a_store_it_cannot_read(tmp_path: Path, kind: str) -> None:
     # Review S7: the read-only store can't be migrated, so a schema this code doesn't read is
     # refused with exit 2 and a reason, never a traceback.
@@ -578,7 +568,6 @@ def test_quant_model_select_refuses_a_store_it_cannot_read(tmp_path: Path, kind:
     assert not artifacts.exists()
 
 
-@_red(AssertionError)
 @pytest.mark.spec("ARCH§7.2")
 def test_code_provenance_follows_a_worktrees_git_file(tmp_path: Path) -> None:
     # Review S8: in a git worktree `.git` is a file naming the worktree's git directory, whose
@@ -624,7 +613,6 @@ def _git(root: Path, *args: str) -> None:
     )
 
 
-@_red(KeyError)
 @pytest.mark.spec("ARCH§7.2")
 def test_code_provenance_notes_a_dirty_tree(tmp_path: Path) -> None:
     # Review S8: an artifact trained from uncommitted code says so.

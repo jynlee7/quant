@@ -54,8 +54,6 @@ from tests.support.truncation import (
 )
 
 SEED = 20160104
-# The B6b review's red tests (2026-10-15): each fails on its finding until the review green.
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=AssertionError)
 
 
 def _one_cut(w: World) -> tuple[datetime, ...]:
@@ -111,7 +109,6 @@ def test_the_actions_layer_records_what_the_view_shows_at_tau() -> None:
     assert record.output["flags"] == tuple((to_us(f.t), f.kind, f.detail) for f in flags)
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "P3")
 def test_the_world_holds_a_raised_flag_the_actions_layer_records() -> None:
     # Review M2/S1: with no flag in the world, every flags read compared empty lists.
@@ -142,9 +139,21 @@ def test_the_garbage_variant_writes_dividends_splits_and_flags() -> None:
     assert np.isnan(dividends[garbage.dividends[1]])
     assert splits[garbage.splits[0]] == 1e9
     assert np.isnan(splits[garbage.splits[1]])
-    # The synthetic dividend the cut can see is revised to -1e9, known at the cut.
+    # The synthetic dividend and split the cut can see are revised to -1e9, known at the cut.
     assert garbage.dividends[2] == date(2016, 9, 16)
     assert dividends[date(2016, 9, 16)] == -1e9
+    assert garbage.splits[2] == date(2016, 10, 14)
+    assert splits[date(2016, 10, 14)] == -1e9
+    # A minute of the half hour before the cut is revised, known exactly at the cut.
+    assert garbage.minute_revised_at_cut is not None
+    assert cut - MINUTE_SPAN <= garbage.minute_revised_at_cut < cut
+    (revised,) = store.versions(SYMBOL, garbage.minute_revised_at_cut)[-1:]
+    assert (revised.known_at, revised.close) == (cut, 1e9)
+    # The planted flag the cut sees is cleared, and its minute revised, after the cut.
+    assert garbage.flag_cleared is not None
+    assert garbage.flag_cleared not in {f.t for f in store.flags(SYMBOL)}
+    assert garbage.flag_cleared in {f.t for f in store.flags(SYMBOL, as_of=cut)}
+    assert store.versions(SYMBOL, garbage.flag_cleared)[-1].known_at > cut
     # The store's own flags, with no availability rule, show every garbage flag.
     standing = {f.t for f in store.flags(SYMBOL)}
     assert set(garbage.flags) <= standing
@@ -195,7 +204,6 @@ def test_actions_known_at_as_of_are_caught_in_actions(
     _assert_caught_in_actions(report)
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_minutes_known_at_as_of_are_caught_in_actions(monkeypatch: pytest.MonkeyPatch) -> None:
     # Review M1: the garbage minute known exactly at the cut lay outside the half hour read.
@@ -210,7 +218,7 @@ def test_minutes_known_at_as_of_are_caught_in_actions(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
-@pytest.mark.parametrize("table", ["dividends", pytest.param("splits", marks=RED)])
+@pytest.mark.parametrize("table", ["dividends", "splits"])
 def test_actions_with_an_unbounded_latest_version_are_caught_in_actions(
     monkeypatch: pytest.MonkeyPatch, table: str
 ) -> None:
@@ -235,7 +243,6 @@ _FLAG_MINUTE_VERSION = (
 )
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 @pytest.mark.parametrize("subquery", [_FLAG_VERSION, _FLAG_MINUTE_VERSION], ids=["flag", "minute"])
 def test_flags_read_with_an_unbounded_latest_version_are_caught_in_actions(
@@ -263,7 +270,6 @@ def test_flags_known_at_as_of_are_caught_in_actions(monkeypatch: pytest.MonkeyPa
     _assert_caught_in_actions(report)
 
 
-@RED
 @pytest.mark.spec("T-NL1", "P3")
 def test_the_garbage_reads_what_the_cut_sees_without_the_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -375,7 +381,6 @@ def _training_rows(data: TrainingData) -> tuple[object, ...]:
     return (m.t_open.tolist(), m.available_at.tolist(), m.values.tolist(), data.returns.tolist())
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4")
 def test_a_world_files_fixture_model_reads_what_was_known_at_its_fit_end(tmp_path: Path) -> None:
     # Review S5: a revision known after fit_end must not reach the fixture model or its scaler.
@@ -399,7 +404,6 @@ def test_a_world_files_fixture_model_reads_what_was_known_at_its_fit_end(tmp_pat
     )
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "D4")
 def test_a_world_files_fixture_rows_are_the_first_models_rows(tmp_path: Path) -> None:
     # Review S6: the fixture takes each return from the previous complete bar, as the first
@@ -424,7 +428,6 @@ def test_a_world_files_fixture_rows_are_the_first_models_rows(tmp_path: Path) ->
     assert _training_rows(fixture) == _training_rows(rows)
 
 
-@RED
 @pytest.mark.spec("T-NL1", "P4")
 def test_a_market_db_holding_revisions_in_the_span_is_refused(tmp_path: Path) -> None:
     # Review S5: the world store reloads one version of each minute as history, so a file with
@@ -448,7 +451,6 @@ def test_a_market_db_holding_revisions_in_the_span_is_refused(tmp_path: Path) ->
     assert "revision" in message, "a market.db with revisions in the span was not refused"
 
 
-@RED
 @pytest.mark.spec("T-NL1")
 def test_a_built_world_has_its_own_store() -> None:
     # Review S10: build_world is uncached, so closing its store must not close world()'s.
