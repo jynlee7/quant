@@ -30,6 +30,7 @@ from quant.core.epoch import from_us, to_us
 from quant.core.errors import ClockError
 from quant.data.frames import HourlyBar, MinuteFrame
 from quant.data.policy import DataPolicy, Purpose, ScoringTicket
+from quant.data.validate import DataFlag
 
 # Every query is a fixed string; values are bound parameters. Each picks the latest version of a
 # row known before as_of with a correlated MAX, an index lookup on the (symbol, time, version)
@@ -62,6 +63,24 @@ _MINUTES = """
       AND version = (SELECT MAX(x.version) FROM minute_bars x
                      WHERE x.symbol = m.symbol AND x.t = m.t AND x.known_at < :as_of)
     ORDER BY t
+"""
+# A flag counts in its latest version known before as_of, when raised, and only on a minute the
+# view itself would return (the _MINUTES rules: t < tau, available_at < tau, the minute's latest
+# version known before as_of), so a flag can't reveal a minute the view hides (B6).
+_FLAGS = """
+    SELECT f.t, f.kind, f.detail FROM data_flags f
+    WHERE f.symbol = :symbol AND f.t >= :start AND f.t < :end
+      AND f.known_at < :as_of AND f.raised = 1
+      AND f.version = (SELECT MAX(x.version) FROM data_flags x
+                       WHERE x.symbol = f.symbol AND x.t = f.t AND x.kind = f.kind
+                         AND x.known_at < :as_of)
+      AND EXISTS (SELECT 1 FROM minute_bars m
+                  WHERE m.symbol = f.symbol AND m.t = f.t AND m.t < :tau
+                    AND m.available_at < :tau AND m.known_at < :as_of
+                    AND m.version = (SELECT MAX(x.version) FROM minute_bars x
+                                     WHERE x.symbol = m.symbol AND x.t = m.t
+                                       AND x.known_at < :as_of))
+    ORDER BY f.t, f.kind
 """
 _ACTIONS = {
     "dividends": """
@@ -220,6 +239,27 @@ class PointInTimeView:
     ) -> list[tuple[date, float]]:
         """(ex_date, ratio) for splits known before as_of."""
         return self._actions("splits", symbol, start, end, purpose)
+
+    def flags(
+        self, symbol: str, start: datetime, end: datetime, *, purpose: Purpose
+    ) -> list[DataFlag]:
+        """The data flags that stand on visible minutes starting in [start, end), ordered by
+        minute, then kind. Built in B6b, for the truncation harness's actions layer (B5 open
+        item); `BarStore.flags` has no availability rule, so it can't serve a decision.
+
+        For each (minute, kind), the flag's latest version known before as_of counts, and only
+        a raised one is returned (a cleared version hides the flag). A flag counts only on a
+        minute the view itself would return: one starting before tau whose latest version known
+        before as_of was available before tau, so a flag can't reveal a minute the view hides.
+        The purpose is checked for the days the read can reach, as `minutes` checks it, and
+        every flag returned goes into the digest (its minute, kind and detail)."""
+        last = _ny_date(min(ensure_utc(end), self.tau) - _US)
+        self._check(purpose, min(_ny_date(start), last), last)
+        rows = self._conn.execute(
+            _FLAGS, {**self._params, "symbol": symbol, "start": to_us(start), "end": to_us(end)}
+        ).fetchall()
+        self._hash.update(canonical_dumps(["flags", symbol, rows]) + b"\n")
+        return [DataFlag(from_us(t), kind, detail) for t, kind, detail in rows]
 
     def digest(self) -> str:
         """SHA-256 over the canonical bytes of every row read so far."""

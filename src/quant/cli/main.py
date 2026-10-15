@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import typer
 
-from quant.cli import ledger
+from quant.cli import data, ledger, model
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
+app.add_typer(data.app, name="data")
 app.add_typer(ledger.app, name="ledger")
+app.add_typer(model.app, name="model")
 
 
 @app.callback()

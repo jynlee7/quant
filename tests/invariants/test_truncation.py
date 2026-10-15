@@ -4,7 +4,9 @@ Clean code must pass all three variants at every cut, and each of PLAN B5's six 
 must be caught, with the failure naming the layer the leak is in (P3: a harness that can't fail
 is caught). Leaks are planted with monkeypatch or a substitute layer registered in place of the
 clean one, never by editing src/. The fast tier draws 50 cuts on synthetic bars; the full tier
-draws 200. The full tier moves to real FIT bars once B6 brings them (BUILD_LOG open item).
+draws 200 on synthetic bars, and 200 on real FIT bars from var/market.db (B6, PLAN P4), which
+skips when it is absent. B6's
+actions layer, last in the default registry, is tested in test_truncation_actions.py.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import math
 import sqlite3
 import statistics
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -41,6 +43,7 @@ from tests.support.truncation import (
     HORIZON,
     LATE_FIT_END,
     MODEL_FIT_END,
+    REAL,
     VIEW_DEPTH,
     FeaturesLayer,
     FilterLayer,
@@ -68,6 +71,7 @@ from tests.support.truncation import (
 SEED = 20160104
 FAST_CUTS = 50  # PLAN P4
 FULL_CUTS = 200
+LAYERS = {"view", "features", "filter", "risk", "actions"}
 # A planted leak shows at any cut after the model starts, so three edges are enough and keep the
 # six leak tests cheap: the model's first decision, the bar after DST ends, a half day's CLOSE.
 LEAK_EDGES = ("model_first", "after_dst", "half_day_close")
@@ -115,21 +119,47 @@ def test_clean_code_passes_every_variant_at_fifty_cuts() -> None:
     report = check_truncation(w, default_registry(w), cuts, seed=SEED)
     assert report.ok, report.explain()
     assert report.cuts == cuts
-    # Every layer was compared, the filter and risk verdicts included, so a pass means something.
-    assert set(report.compared) == {"view", "features", "filter", "risk"}
+    # Every layer was compared, the filter, risk verdicts and actions included, so a pass means
+    # something.
+    assert set(report.compared) == LAYERS
     assert all(count > 0 for count in report.compared.values()), report.compared
 
 
 @pytest.mark.full
-@pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4")
+@pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4", "ARCH§13")
 def test_clean_code_passes_every_variant_at_two_hundred_cuts() -> None:
-    # Synthetic bars until B6 brings real FIT bars (PLAN P4; BUILD_LOG open item).
+    # PLAN P4's 200 cuts on the synthetic world, kept beside the real-bar run (B6b review S3), so
+    # a checkout without var/market.db (a fresh clone, a worktree) still runs them.
     w = world()
     cuts = draw_cuts(w, FULL_CUTS, seed=SEED + 1)
     report = check_truncation(w, default_registry(w), cuts, seed=SEED + 1)
     assert report.ok, report.explain()
     assert len(report.cuts) == FULL_CUTS
-    assert set(report.compared) == {"view", "features", "filter", "risk"}
+    assert set(report.compared) == LAYERS
+    assert all(count > 0 for count in report.compared.values()), report.compared
+
+
+@pytest.mark.full
+@pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4", "ARCH§13")
+def test_clean_code_passes_every_variant_at_two_hundred_cuts_on_real_fit_bars() -> None:
+    # PLAN P4: the full tier runs 200 cuts on real bars, with a fixture model fit on 2016–2017.
+    if REAL.market_db is None or not REAL.market_db.is_file():
+        pytest.skip(
+            f"no market.db at {REAL.market_db}: the full tier's T-NL1 runs on real FIT bars "
+            "(PLAN P4); fill it with `quant data backfill`"
+        )
+    w = world(REAL)
+    # Inside FIT only: DEV stays dark (C11). The model was fit on 2016–2017, before every
+    # decision it serves (T-NL2).
+    assert w.decisions[-1].bar.session <= REAL.data_last < date(2019, 1, 1)
+    assert w.model.fit_start.year == 2016
+    assert w.model.fit_end == REAL.model_fit_end == datetime(2018, 1, 1, 5, tzinfo=UTC)
+    assert w.decisions[0].tau < REAL.model_fit_end < w.edges["model_first"].tau
+    cuts = draw_cuts(w, FULL_CUTS, seed=SEED + 1)
+    report = check_truncation(w, default_registry(w), cuts, seed=SEED + 1)
+    assert report.ok, report.explain()
+    assert len(report.cuts) == FULL_CUTS
+    assert set(report.compared) == LAYERS
     assert all(count > 0 for count in report.compared.values()), report.compared
 
 

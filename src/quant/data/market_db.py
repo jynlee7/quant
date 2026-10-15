@@ -38,7 +38,7 @@ from quant.core.epoch import MINUTE_US, from_us, to_us
 from quant.core.errors import ClockError, DataError
 from quant.core.schedule import Timing
 from quant.data.bars import build_hourly
-from quant.data.frames import HourlyBar, MinuteFrame
+from quant.data.frames import HourlyBar, Ints, MinuteFrame
 from quant.data.policy import DataPolicy, ScoringTicket
 from quant.data.validate import MOVE_KIND, DataFlag, check_minutes, move_flags
 from quant.data.view import PointInTimeView
@@ -124,6 +124,19 @@ MIGRATIONS: tuple[Migration, ...] = (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 stamp INTEGER NOT NULL
             )""",
+        ),
+    ),
+    # The sessions the backfill fetched whole and stored (B6 review): a resume skips only
+    # these, so a session that holds some minutes some other way is still fetched.
+    Migration(
+        2,
+        (
+            """CREATE TABLE backfilled_sessions (
+                symbol TEXT NOT NULL,
+                session TEXT NOT NULL,
+                minutes INTEGER NOT NULL CHECK (minutes >= 1),
+                PRIMARY KEY (symbol, session)
+            ) WITHOUT ROWID""",
         ),
     ),
 )
@@ -410,6 +423,48 @@ class BarStore:
         if known_at is HISTORY:
             return _Stamping(now=None, floor=self._high_water())
         assert_never(known_at)
+
+    @property
+    def high_water(self) -> datetime | None:
+        """Last NOW stamp (write or live view), without issuing a new stamp."""
+        stamp = self._high_water()
+        return None if stamp is None else from_us(stamp)
+
+    def minute_times(self, symbol: str, start: datetime, end: datetime) -> Ints:
+        """The start times (epoch microseconds UTC, sorted) of the minutes stored in [start, end),
+        in any version: which minutes the store holds, for the data-quality report. It carries
+        no prices: those are read only through a view, at a time and for a purpose."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT t FROM minute_bars WHERE symbol = ? AND t >= ? AND t < ? ORDER BY t",
+            (symbol, to_us(start), to_us(end)),
+        ).fetchall()
+        return np.array([row[0] for row in rows], dtype=np.int64)
+
+    def has_minutes(self, symbol: str, start: datetime, end: datetime) -> bool:
+        """Whether any minute is stored in [start, end)."""
+        row = self._conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM minute_bars WHERE symbol = ? AND t >= ? AND t < ?)",
+            (symbol, to_us(start), to_us(end)),
+        ).fetchone()
+        return bool(row[0])
+
+    def is_backfilled(self, symbol: str, session: date) -> bool:
+        """Whether the backfill recorded `session` fetched whole and stored
+        (`mark_backfilled`)."""
+        row = self._conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM backfilled_sessions WHERE symbol = ? AND session = ?)",
+            (symbol, session.isoformat()),
+        ).fetchone()
+        return bool(row[0])
+
+    def mark_backfilled(self, symbol: str, session: date, minutes: int) -> None:
+        """Record that the backfill fetched `session` whole and stored its `minutes` minutes."""
+        with transaction(self._conn):
+            self._conn.execute(
+                "INSERT INTO backfilled_sessions (symbol, session, minutes) VALUES (?, ?, ?)"
+                " ON CONFLICT (symbol, session) DO UPDATE SET minutes = excluded.minutes",
+                (symbol, session.isoformat(), minutes),
+            )
 
     def _high_water(self) -> int | None:
         row = self._conn.execute("SELECT stamp FROM high_water").fetchone()
