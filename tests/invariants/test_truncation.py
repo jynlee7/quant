@@ -90,11 +90,13 @@ def _assert_caught(report: Report, layer: str, kinds: frozenset[str] = MISMATCH)
     assert report.layers == {layer}, report.explain()
     assert {f.kind for f in report.failures} <= kinds, report.explain()
     assert {f.cut for f in report.failures} == set(report.cuts), report.explain()
-    # The comparison reached the leak's layer: it and every layer before it (in registry order)
-    # compared records, so the catch isn't an artifact of comparing nothing.
+    # The comparison reached the leak's layer: every layer before it (in registry order) compared
+    # records, and so did the leak's own layer unless it only ever raised. Layers after it may
+    # have nothing to compare when the leak shows at the first decision.
     names = list(report.compared)
-    upstream = names[: names.index(layer) + 1]
-    assert all(report.compared[name] > 0 for name in upstream), report.compared
+    raised_only = {f.kind for f in report.failures} == {"error"}
+    reached = names[: names.index(layer) + (0 if raised_only else 1)]
+    assert all(report.compared[name] > 0 for name in reached), report.compared
 
 
 def _where(report: Report) -> set[tuple[datetime, Variant, str, datetime | None, str]]:
@@ -189,9 +191,30 @@ def test_the_garbage_variant_really_writes_every_kind_of_garbage() -> None:
     revised = by_open[garbage.revised]
     assert revised.version == 2
     assert revised.known_at == garbage.revision_known_at
+    # A revision known exactly at the cut, of the bar before the cut's (review finding 3).
+    at_the_cut = by_open[garbage.revised_at_cut]
+    assert at_the_cut.version == 2
+    assert at_the_cut.known_at == cut
     at_cut = store.view(cut, as_of=cut).hourly(SYMBOL, purpose=Purpose.OPERATE)
     assert at_cut[-1].t_open == garbage.revised
     assert at_cut[-1].version == 1
+    assert at_cut[-2].t_open == garbage.revised_at_cut
+    assert at_cut[-2].version == 1
+    # Minutes before the cut that aren't available yet, and minutes after it (finding 7).
+    span = (cut - timedelta(minutes=1), cut + timedelta(minutes=10))
+    minutes = store.view(HORIZON, as_of=HORIZON).minutes(SYMBOL, *span, purpose=Purpose.OPERATE)
+    seen = {from_us(int(t)) for t in minutes.t}
+    assert set(garbage.minutes_unavailable) | set(garbage.minutes_after) <= seen
+    assert len(garbage.minutes_after) == 5
+    assert all(t < cut for t in garbage.minutes_unavailable)
+    assert all(t >= cut for t in garbage.minutes_after)
+    close = {from_us(int(t)): c for t, c in zip(minutes.t, minutes.close, strict=True)}
+    assert math.isnan(close[garbage.minutes_after[0]])
+    assert close[garbage.minutes_after[1]] == 1e9
+    assert close[garbage.minutes_after[2]] == -1e9
+    at_cut_minutes = store.view(cut, as_of=cut).minutes(SYMBOL, *span, purpose=Purpose.OPERATE)
+    visible = {from_us(int(t)) for t in at_cut_minutes.t}
+    assert not visible & (set(garbage.minutes_unavailable) | set(garbage.minutes_after))
     # The same seed writes the same garbage.
     assert garbage_store(w, cut, seed=SEED)[1] == garbage
 
@@ -306,12 +329,7 @@ class Smoothed:
                 rows.append(record.output["raw"])
                 taus.append(d.tau)
         posteriors = (
-            smooth(
-                model.params,
-                model.scaler,
-                np.array(rows, dtype=np.float64),
-                columns=model.scaler.columns,
-            )
+            self.posteriors(np.array(rows, dtype=np.float64))
             if rows
             else np.empty((0, model.params.n_states))
         )
@@ -323,8 +341,31 @@ class Smoothed:
                     Record(d.tau, self.name, {"state_probs": smoothed[d.tau]}, provenance)
                 )
             else:
-                records.append(Record(d.tau, self.name, {"model": None}))
+                records.append(Record(d.tau, self.name, {"model": None}, cold=True))
         return records
+
+    def posteriors(self, rows: np.ndarray) -> np.ndarray:
+        model = self._model
+        return smooth(model.params, model.scaler, rows, columns=model.scaler.columns)
+
+
+class PredictProba(Smoothed):
+    """Planted leak 3, as PLAN B5 words it (I2): the filter swapped for hmmlearn's
+    `predict_proba`, run with the fixture model's parameters on its standardized rows. Tests
+    may call hmmlearn's smoother; the I2 scan keeps it out of src/."""
+
+    def posteriors(self, rows: np.ndarray) -> np.ndarray:
+        from hmmlearn.hmm import GaussianHMM
+
+        model, params = self._model, self._model.params
+        hmm = GaussianHMM(n_components=params.n_states, covariance_type="full")
+        hmm.n_features = params.n_features
+        hmm.startprob_ = params.startprob.copy()
+        hmm.transmat_ = params.transmat.copy()
+        hmm.means_ = params.means.copy()
+        hmm.covars_ = params.covars.copy()  # always full, diagonal for a diag model
+        z = model.scaler.standardize(rows, columns=model.scaler.columns)
+        return np.asarray(hmm.predict_proba(z), dtype=np.float64)
 
 
 def _patch_view(monkeypatch: pytest.MonkeyPatch, old: str, new: str) -> None:
@@ -356,6 +397,15 @@ def test_planted_leak_3_a_smoother_in_place_of_the_filter_is_caught_in_filter() 
     w = world()
     registry = default_registry(w).replace(Smoothed(w.model))
     _assert_caught(check_truncation(w, registry, _leak_cuts(w), seed=SEED), "filter")
+
+
+@pytest.mark.spec("I1", "I2", "T-NL1", "P3")
+def test_planted_leak_3_predict_proba_for_the_filter_is_caught_in_filter() -> None:
+    # PLAN B5's own wording of leak 3 (review finding 8). One cut: the eval.smoother variant
+    # above already runs the three edges.
+    w = world()
+    registry = _upto(w, "filter").replace(PredictProba(w.model))
+    _assert_caught(check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED), "filter")
 
 
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
@@ -394,11 +444,12 @@ def test_planted_leak_6_a_model_fit_past_tau_is_caught_by_provenance() -> None:
 
 @pytest.mark.spec("T-NL1", "P3")
 def test_slicing_the_full_run_hides_no_leak() -> None:
-    # The full run is computed once and sliced per cut. Recomputing it per cut must find exactly
-    # the same failures for planted leak 1, so the shortcut can't be what makes a run pass.
+    # The full run is computed once over the whole history and sliced per cut. Recomputing it
+    # afresh at each cut must find exactly the same failures for planted leak 1, so sharing one
+    # run (and the layers' record caches) across cuts can't be what makes a run pass.
     w = world()
     registry = default_registry(w).replace(CenteredAverage(w))
-    cuts = _leak_cuts(w)
+    cuts = _leak_cuts(w)[:2]  # each fresh cut reruns the whole history
     sliced = check_truncation(w, registry, cuts, seed=SEED, slice_full=True)
     fresh = check_truncation(w, registry, cuts, seed=SEED, slice_full=False)
     _assert_caught(sliced, "features", MISMATCH_OR_ERROR)
@@ -411,25 +462,36 @@ def test_slicing_the_full_run_hides_no_leak() -> None:
 # --- review round 1 (B5): each test plants a defect the first harness let through -------------
 
 
+def _first_cut(w: World) -> tuple[datetime, ...]:
+    """The first decision alone: runs (a) and (c) are one decision long, so a test whose defect
+    shows from the first decision on costs little more than the full run."""
+    return (w.edges["first_warm"].tau,)
+
+
+def _upto(w: World, last: str) -> Registry:
+    """The clean registry's layers up to and including `last`: a leak in or before `last` is
+    caught there, and the layers after it would only make the full run slower."""
+    layers = default_registry(w).layers
+    return Registry(layers[: [layer.name for layer in layers].index(last) + 1])
+
+
 def _full_history_scaler(w: World) -> Scaler:
     everything = w.store.view(HORIZON, as_of=HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE)
     matrix = compute_features(everything, w.config)
     return Scaler.fit(matrix, start=from_us(int(matrix.available_at[0])), end=HORIZON)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("T-NL2", "I1", "P3")
 def test_review_1_a_scaler_fit_after_tau_is_caught_by_provenance() -> None:
     # Finding 1/5: a full-history scaler built once, outside the run, is the same object in every
     # variant, so only T-NL2 can see it: the scaled records must name the scaler's window.
     w = world()
-    registry = default_registry(w).replace(FeaturesLayer(w.config, _full_history_scaler(w)))
-    report = check_truncation(w, registry, _leak_cuts(w), seed=SEED)
+    registry = _upto(w, "features").replace(FeaturesLayer(w.config, _full_history_scaler(w)))
+    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED)
     _assert_caught(report, "features", frozenset({"provenance"}))
     assert {f.variant for f in report.failures} == set(Variant)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("T-NL2", "I1")
 def test_review_1_clean_features_scale_only_with_a_scaler_fit_before_tau() -> None:
     w = world()
@@ -437,7 +499,7 @@ def test_review_1_clean_features_scale_only_with_a_scaler_fit_before_tau() -> No
     assert w.scaler.end == w.model.fit_end == MODEL_FIT_END
     assert np.array_equal(w.scaler.mean, w.model.scaler.mean)
     assert np.array_equal(w.scaler.std, w.model.scaler.std)
-    run = run_layers(default_registry(w), Source(w.store, Variant.FULL, None), w.decisions)
+    run = run_layers(_upto(w, "features"), Source(w.store, Variant.FULL, None), w.decisions)
     scaled = [r for r in run.records["features"] if "scaled" in r.output]
     assert scaled
     for record in scaled:
@@ -460,19 +522,17 @@ class _Boom:
         raise RuntimeError("shape mismatch")
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("T-NL1", "P3")
 def test_review_2_a_layer_that_raises_the_same_error_in_every_run_fails() -> None:
     # Finding 2: equal errors counted as agreement, and the layers after it compared nothing.
     w = world()
-    cuts = _leak_cuts(w)[:1]
-    report = check_truncation(w, default_registry(w).replace(_Boom()), cuts, seed=SEED)
+    cuts = _first_cut(w)
+    report = check_truncation(w, _upto(w, "filter").replace(_Boom()), cuts, seed=SEED)
     assert not report.ok, report.compared
     assert "filter" in report.layers, report.explain()
     assert "error" in {f.kind for f in report.failures if f.layer == "filter"}
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_review_3_a_view_knowing_rows_at_as_of_is_caught_in_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -480,17 +540,16 @@ def test_review_3_a_view_knowing_rows_at_as_of_is_caught_in_view(
     # Finding 3: no row was known exactly at a cut, so known_at <= as_of went unseen.
     w = world()
     _patch_view(monkeypatch, "known_at < :as_of", "known_at <= :as_of")
-    report = check_truncation(w, default_registry(w), _leak_cuts(w), seed=SEED)
+    report = check_truncation(w, _upto(w, "view"), _first_cut(w), seed=SEED)
     _assert_caught(report, "view")
     assert {f.variant for f in report.failures} == {Variant.GARBAGE}
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("I1", "I2", "T-NL1", "P3")
 def test_review_4_recomputing_the_full_run_still_catches_the_smoother() -> None:
     # Finding 4: slice_full=False ran (b) only up to τ, where a smoother has no later rows.
     w = world()
-    registry = default_registry(w).replace(Smoothed(w.model))
+    registry = _upto(w, "filter").replace(Smoothed(w.model))
     report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED, slice_full=False)
     _assert_caught(report, "filter")
 
@@ -504,7 +563,6 @@ def _known_at_tables(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("T-NL1")
 def test_review_6_the_truncated_store_drops_later_rows_from_every_table() -> None:
     # Finding 6: dividends, splits and calendar_cache kept rows known after the cut.
@@ -566,7 +624,6 @@ class _MinutesView:
         return records
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_review_7_minutes_read_without_availability_are_caught_in_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -578,9 +635,7 @@ def test_review_7_minutes_read_without_availability_are_caught_in_view(
     monkeypatch.setattr(
         view_module, "_MINUTES", view_module._MINUTES.replace(" AND available_at < :tau", "")
     )
-    report = check_truncation(
-        w, Registry([_MinutesView()]), (w.edges["first_warm"].tau,), seed=SEED
-    )
+    report = check_truncation(w, Registry([_MinutesView()]), _first_cut(w), seed=SEED)
     _assert_caught(report, "view")
     assert {f.variant for f in report.failures} == {Variant.GARBAGE}
 
@@ -611,7 +666,6 @@ def _signed_zero_peek(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(PointInTimeView, "hourly", peeking)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("I1", "T-NL1", "P3")
 def test_review_9_a_lookahead_in_a_signed_zero_is_caught_in_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -620,19 +674,18 @@ def test_review_9_a_lookahead_in_a_signed_zero_is_caught_in_view(
     # record was handed to the truncated one.
     w = world()
     _signed_zero_peek(monkeypatch)
-    report = check_truncation(w, default_registry(w), _leak_cuts(w)[:1], seed=SEED)
+    report = check_truncation(w, _upto(w, "view"), _first_cut(w), seed=SEED)
     _assert_caught(report, "view")
     assert Variant.TRUNCATED in {f.variant for f in report.failures}
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("T-NL1", "T-NL2", "P3")
 def test_review_10_a_filter_that_never_leaves_cold_start_fails() -> None:
     # Finding 10: the filter's {"model": null} cold-start records counted as compared, so a
     # filter that never ran its model passed.
     w = world()
-    registry = default_registry(w).replace(FilterLayer(w.model, activation=HORIZON))
-    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED)
+    registry = _upto(w, "filter").replace(FilterLayer(w.model, activation=HORIZON))
+    report = check_truncation(w, registry, _first_cut(w), seed=SEED)
     assert not report.ok, report.compared
     assert report.layers == {"filter"}, report.explain()
 
@@ -655,18 +708,17 @@ class _MutatingFeatures(FeaturesLayer):
         return records
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("T-NL1", "P3")
 def test_review_11_a_layer_that_mutates_its_records_is_caught_in_features() -> None:
     # Finding 11: the caches gave every run the same mutable Record, so a run's mutation
-    # changed the reference run's record too.
+    # changed the reference run's record too. Records are now read-only, so the layer can't
+    # write: it raises in every run, and a layer that raises fails.
     w = world()
-    registry = default_registry(w).replace(_MutatingFeatures(w.config, w.scaler))
-    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED)
+    registry = _upto(w, "features").replace(_MutatingFeatures(w.config, w.scaler))
+    report = check_truncation(w, registry, _first_cut(w), seed=SEED)
     _assert_caught(report, "features", MISMATCH_OR_ERROR)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=pytest.fail.Exception)
 @pytest.mark.spec("T-NL1")
 def test_review_11_a_record_is_immutable_canonical_bytes() -> None:
     tau = world().decisions[0].tau
@@ -698,7 +750,6 @@ class _PeekingFeatures(FeaturesLayer):
         return super().run(source, decisions, upstream)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
 @pytest.mark.spec("T-NL1", "P3")
 def test_review_12_snapshot_state_outside_the_fast_hash_is_caught_in_features(
     monkeypatch: pytest.MonkeyPatch,
@@ -706,8 +757,8 @@ def test_review_12_snapshot_state_outside_the_fast_hash_is_caught_in_features(
     # Finding 12: the state hash read FeatureStream._state, not snapshot().
     w = world()
     monkeypatch.setattr(truncation_module, "FeatureStream", _PeekingStream)
-    registry = default_registry(w).replace(_PeekingFeatures(w.config, w.scaler))
-    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED)
+    registry = _upto(w, "features").replace(_PeekingFeatures(w.config, w.scaler))
+    report = check_truncation(w, registry, _first_cut(w), seed=SEED)
     _assert_caught(report, "features")
 
 

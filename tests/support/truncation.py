@@ -16,34 +16,50 @@ verdicts on a fixed seeded intent per bar (B9). A later step that touches the de
 adds its layer to `default_registry` (CLAUDE.md rule 4), and B8 replaces the per-layer records
 with DecisionRecords and state hashes (ARCHITECTURE §13).
 
-Records are compared by the canonical-JSON SHA-256 of each (`Record.digest`), never
-approximately. A failure names the cut, the variant, the decision and the **first layer** whose
-record differs there, so a leak is reported where it enters, not in every layer downstream.
+Records are compared by their digests (`Record.digest`), never approximately. A Record is
+immutable: it holds its output as canonical JSON bytes (`Record.payload`), digested when it is
+made, and hands layers downstream a read-only copy parsed back from those bytes. A failure
+names the cut, the variant, the decision and the **first layer** whose record differs there,
+so a leak is reported where it enters, not in every layer downstream. A layer that raises (not
+a per-decision refusal, which is a record) fails the check in any run, since it and every layer
+after it then compare nothing; and a check in which some layer compared no record beyond a
+cold start fails as "vacuous", so a pass always means something.
 
 **Slicing.** The full run (b) is the engine over the whole history, so it runs once, over every
 decision, and each cut compares its records up to τ. Runs (a) and (c) depend on τ by
 definition, so each cut runs them over the decisions up to τ on its own store; a store is a
 SQLite backup of the full one with later rows deleted, which costs about a millisecond.
-`check_truncation(..., slice_full=False)` recomputes (b) per cut instead, and the test of
-planted leak 1 checks that both modes catch the same failures.
+`check_truncation(..., slice_full=False)` recomputes (b) per cut, still over the whole history,
+and the slicing test checks that both modes find the same failures.
 
-**T-NL2.** A record made with a model names it (`Provenance`: the artifact hash and `fit_end`),
-and `provenance_failures` demands fit_end < τ for every such record, in every variant.
+**Caching.** Layers reuse a Record when its inputs are exactly those of one made before,
+across runs, cuts and registries. Keys are exact, never Python `==` on values (where
+0.0 == -0.0 and 1 == 1.0 == True): `cached_record` keys on the output's canonical bytes and
+the record's other fields as exact types, and the view layer on the `repr` of its values,
+built only from exact types (None, bool, int, float, str), whose repr determines type and
+value. Since Records are immutable, a reused one is indistinguishable from one made afresh.
+
+**T-NL2.** A record made with a fitted artifact names it (`Provenance`: the artifact's hash and
+the end of its fit window): the filter's model, and the scaler of the features layer's scaled
+vectors. `provenance_failures` demands fit_end < τ for every such record, in every variant.
 
 Everything here is synthetic, on the real NYSE calendar inside FIT (2016). DEV stays dark.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import random
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
-from functools import cache, cached_property, lru_cache
-from itertools import pairwise
+from functools import cache, lru_cache
+from itertools import chain, pairwise
+from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 import numpy as np
@@ -114,55 +130,187 @@ class Variant(StrEnum):
 
 @dataclass(frozen=True)
 class Provenance:
-    """The model a record was made with: its `HmmModel.artifact_hash()` and `fit_end` (T-NL2)."""
+    """The fitted artifact a record was made with (T-NL2): its hash (`HmmModel.artifact_hash()`
+    for a model, `scaler_hash` for a scaler) and the end of its fit window (`fit_end`, a
+    scaler's `end`)."""
 
-    model: str
+    artifact: str
     fit_end: datetime
 
+    def __post_init__(self) -> None:
+        if type(self.artifact) is not str or not isinstance(self.fit_end, datetime):
+            raise TypeError("a Provenance names its artifact hash (str) and fit_end (datetime)")
 
-@dataclass(frozen=True)
+
+_UNPARSED: Final = object()
+
+
+def _check_fields(layer: object, provenance: object, state: object, cold: object) -> None:
+    """TypeError unless `layer` is a str, `provenance` a Provenance or None, `state` a str or
+    None and `cold` a bool: exact types, so a cache key built from them is exact too."""
+    if (
+        type(layer) is not str
+        or type(cold) is not bool
+        or (state is not None and type(state) is not str)
+        or (provenance is not None and type(provenance) is not Provenance)
+    ):
+        raise TypeError("a Record's layer and state are str, its cold a bool")
+
+
+def _freeze(value: Any) -> Any:
+    """Parsed canonical JSON made read-only: objects as MappingProxyType, arrays as tuples."""
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
 class Record:
-    """One layer's output for one decision.
+    """One layer's output for one decision. Immutable: setting or deleting an attribute raises
+    AttributeError, and `output` is read-only.
 
     - `tau`: the decision time;
     - `layer`: the layer's registered name;
-    - `output`: a value with a canonical JSON form (`quant.core.canonical`): finite floats,
-      string keys. A layer that refuses a decision (FeatureError, ModelError: rule 6) records
+    - `payload`: the output's canonical JSON bytes (`quant.core.canonical.canonical_dumps`),
+      taken when the Record is made. An output without a canonical form raises
+      CanonicalJSONError there, inside the layer, which the harness reports as its failure. A
+      layer that refuses a decision (FeatureError, ModelError: rule 6) records
       `error_output(exc)` rather than raising;
-    - `provenance`: the model behind the record, None for a layer that runs none;
+    - `output`: the payload parsed back, read-only (objects as mappings, arrays as tuples), so
+      what a later layer reads is exactly what is compared;
+    - `provenance`: the fitted artifact behind the record, None for a layer that uses none;
     - `state`: `sha256_hex` of the layer's state after this decision (the FeatureStream's or
-      ForwardFilter's snapshot, the RiskState), None for a stateless layer.
+      ForwardFilter's snapshot, the RiskState), None for a stateless layer;
+    - `cold`: a placeholder for a decision before the layer starts (the filter's cold start).
+      It is compared like any record but doesn't count as one (`Report.compared`).
     """
 
+    __slots__ = ("_digest", "_output", "cold", "layer", "payload", "provenance", "state", "tau")
     tau: datetime
     layer: str
-    output: Any
-    provenance: Provenance | None = None
-    state: str | None = None
+    payload: bytes
+    provenance: Provenance | None
+    state: str | None
+    cold: bool
+    _digest: str
+    _output: Any
 
-    def digest(self) -> str:
-        """`quant.core.canonical.sha256_hex` of {"tau", "layer", "output", "provenance": null or
-        {"model", "fit_end"}, "state"}. Raises CanonicalJSONError for an output without a
-        canonical form, which the harness reports as that layer's failure."""
-        return self._digest
-
-    @cached_property
-    def _digest(self) -> str:
-        return sha256_hex(
+    def __init__(
+        self,
+        tau: datetime,
+        layer: str,
+        output: Any,
+        provenance: Provenance | None = None,
+        state: str | None = None,
+        *,
+        cold: bool = False,
+    ) -> None:
+        _check_fields(layer, provenance, state, cold)
+        payload = canonical_dumps(output)
+        header = canonical_dumps(
             {
-                "tau": self.tau,
-                "layer": self.layer,
-                "output": self.output,
-                "provenance": None if self.provenance is None else asdict(self.provenance),
-                "state": self.state,
+                "tau": tau,
+                "layer": layer,
+                "provenance": None if provenance is None else asdict(provenance),
+                "state": state,
+                "cold": cold,
             }
         )
+        for name, value in (
+            ("tau", tau),
+            ("layer", layer),
+            ("payload", payload),
+            ("provenance", provenance),
+            ("state", state),
+            ("cold", cold),
+            ("_digest", hashlib.sha256(header + b"\n" + payload).hexdigest()),
+            ("_output", _UNPARSED),
+        ):
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(f"a Record is immutable: can't set {name}")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"a Record is immutable: can't delete {name}")
+
+    def __repr__(self) -> str:
+        return f"Record({self.tau.isoformat()}, {self.layer!r}, {self._digest[:12]})"
+
+    @property
+    def output(self) -> Any:
+        if self._output is _UNPARSED:
+            object.__setattr__(self, "_output", _freeze(canonical_loads(self.payload)))
+        return self._output
+
+    def digest(self) -> str:
+        """SHA-256, in hex, of the canonical JSON of {"tau", "layer", "provenance": null or
+        {"artifact", "fit_end"}, "state", "cold"}, a newline, and `payload`. Canonical JSON
+        holds no raw newline, so the split is unambiguous."""
+        return self._digest
 
 
 def error_output(exc: Exception) -> dict[str, str]:
     """The output a layer records for a decision it refuses: {"error": the exception's class
     name, "message": str(exc)}."""
     return {"error": type(exc).__name__, "message": str(exc)}
+
+
+class RecordCache:
+    """Records reused across runs, cuts and registries under exact keys, least recently used
+    first out past `size`. Reuse is safe because a Record is immutable and its key determines
+    its canonical bytes: a hit is indistinguishable from making the Record afresh."""
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._records: OrderedDict[Hashable, Record] = OrderedDict()
+
+    def get(self, key: Hashable) -> Record | None:
+        record = self._records.get(key)
+        if record is not None:
+            self._records.move_to_end(key)
+        return record
+
+    def put(self, key: Hashable, record: Record) -> Record:
+        self._records[key] = record
+        if len(self._records) > self._size:
+            self._records.popitem(last=False)
+        return record
+
+
+# The full run's 620 decisions per layer, many times over.
+_VIEW_RECORDS: Final = RecordCache(4096)
+_RECORDS: Final = RecordCache(16384)
+
+
+def cached_record(
+    tau: datetime,
+    layer: str,
+    output: Any,
+    provenance: Provenance | None = None,
+    state: str | None = None,
+    *,
+    cold: bool = False,
+) -> Record:
+    """`Record(tau, layer, output, provenance, state, cold=cold)`, or the one made before
+    from exactly the same inputs (`_RECORDS`): the key is the output's canonical bytes, the
+    layer, τ and the provenance's fit_end as epoch microseconds, the artifact hash, the state
+    hash and `cold`, each checked to be of an exact type first (`_check_fields`), so equal keys
+    mean equal canonical bytes."""
+    _check_fields(layer, provenance, state, cold)
+    key = (
+        layer,
+        canonical_dumps(output),
+        to_us(tau),
+        None if provenance is None else (provenance.artifact, to_us(provenance.fit_end)),
+        state,
+        cold,
+    )
+    record = _RECORDS.get(key)
+    if record is None:
+        record = _RECORDS.put(key, Record(tau, layer, output, provenance, state, cold=cold))
+    return record
 
 
 # --- layers ----------------------------------------------------------------------------------
@@ -235,13 +383,14 @@ class ViewLayer:
     """B2's view. Per decision: `source.view(d.tau).hourly(SYMBOL, purpose=OPERATE,
     last=VIEW_DEPTH)`, recorded as {"bars": [{"t_open", "t_close", "open", "high", "low",
     "close", "volume", "minutes", "complete", "available_at"} per bar, oldest first],
-    "digest": that view's `digest()`}. Versions and known_at are left out, as the digest leaves
-    them out. Stateless."""
+    "digest": that view's `digest()`}, times as epoch microseconds (`to_us`, as the store keeps
+    them). Versions and known_at are left out, as the digest leaves them out. Stateless.
+
+    Records are reused (`_VIEW_RECORDS`) under an exact key (`_exact_repr` of the layer name,
+    the decision, the digest and every recorded value), never under the view's digest alone:
+    the digest is part of what is under test."""
 
     name: Final = "view"
-
-    def __init__(self) -> None:
-        self._records: dict[tuple[Any, ...], Record] = {}
 
     def run(
         self,
@@ -265,40 +414,83 @@ class ViewLayer:
         for d in decisions:
             view = source.view(d.tau)
             bars = view.hourly(SYMBOL, purpose=Purpose.OPERATE, last=VIEW_DEPTH)
-            values = tuple(tuple(getattr(bar, field) for field in fields) for bar in bars)
-            key = (d.tau, view.digest(), values)
-            if key not in self._records:
-                self._records[key] = Record(
+            values = tuple(
+                (
+                    to_us(bar.t_open),
+                    to_us(bar.t_close),
+                    bar.open,
+                    bar.high,
+                    bar.low,
+                    bar.close,
+                    bar.volume,
+                    bar.minutes,
+                    bar.complete,
+                    to_us(bar.available_at),
+                )
+                for bar in bars
+            )
+            digest = view.digest()
+            key = _exact_repr(self.name, to_us(d.tau), digest, values)
+            record = None if key is None else _VIEW_RECORDS.get(key)
+            if record is None:
+                record = Record(
                     d.tau,
                     self.name,
                     {
                         "bars": [dict(zip(fields, row, strict=True)) for row in values],
-                        "digest": key[1],
+                        "digest": digest,
                     },
                 )
-            records.append(self._records[key])
+                if key is not None:
+                    _VIEW_RECORDS.put(key, record)
+            records.append(record)
         return records
 
 
-def features_output(raw: Any, scaled: Any) -> dict[str, list[float]]:
+def features_output(raw: Any, scaled: Any = None) -> dict[str, list[float]]:
     """The features layer's output: {"raw": the feature vector, "scaled": it standardized},
-    each a list of float64 in the config's column order."""
-    return {"raw": [float(x) for x in raw], "scaled": [float(x) for x in scaled]}
+    each a list of float64 in the config's column order; just {"raw"} when `scaled` is None."""
+    output = {"raw": [float(x) for x in raw]}
+    if scaled is not None:
+        output["scaled"] = [float(x) for x in scaled]
+    return output
+
+
+def scaler_hash(scaler: Scaler) -> str:
+    """`sha256_hex` of a scaler's every field: its Provenance artifact (T-NL2)."""
+    return sha256_hex(
+        {
+            "columns": list(scaler.columns),
+            "mean": scaler.mean,
+            "std": scaler.std,
+            "start": scaler.start,
+            "end": scaler.end,
+            "rows": scaler.rows,
+        }
+    )
 
 
 class FeaturesLayer:
     """B3's features and scaler. One FeatureStream per run, fed through the view:
-    `features_for(stream, source.view(d.tau), SYMBOL, d.bar)` for each decision, then
-    `scaler.transform` with the config's columns. Records `features_output(raw, scaled)`, or
-    `error_output` when features_for or the scaler refuses (a warm-up row is a FeatureError).
-    `state` is the hash of the stream's snapshot. The scaler is fixed: the clean one is fit on
-    the fixture model's window (`World.scaler`)."""
+    `features_for(stream, source.view(d.tau), SYMBOL, d.bar)` for each decision. Before
+    `activation` it records `features_output(raw)`, unscaled and without provenance; from the
+    first decision at or after `activation`, `features_output(raw, scaled)` with `scaled` from
+    `scaler.transform`, and every record carries the scaler's Provenance (`scaler_hash`, its
+    window's `end`). Records `error_output` when features_for or the scaler refuses (a warm-up
+    row is a FeatureError). `state` is the hash of the stream's snapshot (`_feature_state_hash`).
+
+    The scaler is fixed and whatever it is given; the clean one is the fixture model's own,
+    fit on the model's window, and activates with the model (`World.scaler`, ACTIVATION). The
+    layer never checks the scaler's window against τ: that is T-NL2's job, so a scaler fit
+    after the decisions it scales is caught by `provenance_failures`."""
 
     name: Final = "features"
 
-    def __init__(self, config: FeatureConfig, scaler: Scaler) -> None:
-        self.config, self.scaler = config, scaler
-        self._records: dict[tuple[Any, ...], Record] = {}
+    def __init__(
+        self, config: FeatureConfig, scaler: Scaler, *, activation: datetime = ACTIVATION
+    ) -> None:
+        self.config, self.scaler, self.activation = config, scaler, activation
+        self._provenance = Provenance(scaler_hash(scaler), scaler.end)
 
     def run(
         self,
@@ -309,26 +501,25 @@ class FeaturesLayer:
         stream = FeatureStream(self.config)
         records = []
         for d in decisions:
+            scaling = d.tau >= self.activation
             output: dict[str, Any]
             try:
                 raw = features_for(stream, source.view(d.tau), SYMBOL, d.bar)
-                output = features_output(
-                    raw, self.scaler.transform(raw, columns=self.config.columns)
+                scaled = (
+                    self.scaler.transform(raw, columns=self.config.columns) if scaling else None
                 )
+                output = features_output(raw, scaled)
             except (FeatureError, ModelError) as exc:
                 output = error_output(exc)
             state = _feature_state_hash(stream)
-            # Both vectors (or the complete error) and the actual state participate.
-            key = (d.tau, canonical_dumps(output), state)
-            if key not in self._records:
-                self._records[key] = Record(d.tau, self.name, output, state=state)
-            records.append(self._records[key])
+            provenance = self._provenance if scaling else None
+            records.append(cached_record(d.tau, self.name, output, provenance, state))
         return records
 
 
 class FilterLayer:
-    """B4's filter and labels. A decision before `activation` records {"model": null} and no
-    provenance (cold start). From the first decision at or after `activation`, one
+    """B4's filter and labels. A decision before `activation` records {"model": null}, no
+    provenance and `cold` (a cold start, which `Report.compared` doesn't count). From the first decision at or after `activation`, one
     `ForwardFilter(model)` steps on the upstream features record's "raw" row of each decision;
     a decision whose features record is an error records that error and doesn't step. The
     output holds every `FilterOutput` field: "state_probs", "next_state_probs", "label_probs"
@@ -356,7 +547,7 @@ class FilterLayer:
         records = []
         for d, feature in zip(decisions, upstream["features"], strict=True):
             if d.tau < self.activation:
-                records.append(Record(d.tau, self.name, {"model": None}))
+                records.append(cached_record(d.tau, self.name, {"model": None}, cold=True))
                 continue
             output: object = feature.output
             if "raw" in feature.output:
@@ -370,7 +561,7 @@ class FilterLayer:
                 except (FeatureError, ModelError) as exc:
                     output = error_output(exc)
             records.append(
-                Record(d.tau, self.name, output, provenance, sha256_hex(filt.snapshot()))
+                cached_record(d.tau, self.name, output, provenance, sha256_hex(filt.snapshot()))
             )
         return records
 
@@ -424,7 +615,7 @@ class RiskLayer:
                 decisions, upstream["view"], upstream["filter"], strict=True
             ):
                 if not view.output["bars"]:
-                    records.append(Record(d.tau, self.name, {"skipped": "no bar"}))
+                    records.append(cached_record(d.tau, self.name, {"skipped": "no bar"}))
                     continue
                 price = view.output["bars"][-1]["close"]
                 clock.advance_to(d.executes_at + timedelta(seconds=1))
@@ -432,7 +623,7 @@ class RiskLayer:
                 if engine.state.session is None or day > engine.state.session:
                     engine.start_session(day, equity=RISK_EQUITY)
                 label = filtered.output.get("top_label")
-                order = _risk_intent(
+                order = intent(
                     Side.SELL if d.reduce_only else Side.BUY,
                     _risk_quantity(self.seed, d.tau),
                     tau=d.tau,
@@ -460,7 +651,9 @@ class RiskLayer:
                         output[key] = getattr(verdict, key)
                     if isinstance(verdict, RiskApprovedOrder):
                         output.update(flagged=verdict.flagged, halts=verdict.halts)
-                records.append(Record(d.tau, self.name, output, state=sha256_hex(engine.state)))
+                records.append(
+                    cached_record(d.tau, self.name, output, state=sha256_hex(engine.state))
+                )
         return records
 
 
@@ -477,7 +670,9 @@ class World:
     - `config`: r1's FeatureConfig;
     - `decisions`: every decision from the first warm bar's to DATA_LAST's last, in order;
     - `model`: the clean fixture model, `fixture_model(MODEL_FIT_END)`;
-    - `scaler`: the Scaler fit on the model's window, equal to the model's own;
+    - `scaler`: the Scaler fit on the model's window, [the first warm row's available_at,
+      MODEL_FIT_END): the model's own (same mean and std), with its window, so the features
+      layer can name it in Provenance;
     - `edges`: `edge_cuts(decisions)`.
     """
 
@@ -564,13 +759,14 @@ def fixture_model(fit_end: datetime) -> HmmModel:
 
 
 def default_registry(world: World, *, risk_seed: int = 0) -> Registry:
-    """The clean decision path in order: ViewLayer, FeaturesLayer(world.config, world.scaler),
-    FilterLayer(world.model, activation=ACTIVATION), RiskLayer(the committed risk.yaml,
-    seed=risk_seed). Later steps add their layers here (CLAUDE.md rule 4)."""
+    """The clean decision path in order: ViewLayer, FeaturesLayer(world.config, world.scaler,
+    activation=ACTIVATION), FilterLayer(world.model, activation=ACTIVATION), RiskLayer(the
+    committed risk.yaml, seed=risk_seed). Later steps add their layers here (CLAUDE.md
+    rule 4)."""
     return Registry(
         (
             ViewLayer(),
-            FeaturesLayer(world.config, world.scaler),
+            FeaturesLayer(world.config, world.scaler, activation=ACTIVATION),
             FilterLayer(world.model, activation=ACTIVATION),
             RiskLayer(risk_config(), seed=risk_seed),
         )
@@ -626,14 +822,25 @@ def draw_cuts(world: World, n: int, *, seed: int) -> tuple[datetime, ...]:
 # --- the variants' stores --------------------------------------------------------------------
 
 
+def known_at_tables(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Every table of the database with a known_at column, by name."""
+    tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    return tuple(
+        table
+        for table in sorted(tables)
+        if "known_at" in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    )
+
+
 def truncated_store(world: World, cut: datetime) -> BarStore:
     """Variant (a): a backup of `world.conn` into a new in-memory database, with every row known
-    after `cut` deleted (minutes, hourly bars, flags), as a clockless BarStore."""
+    after `cut` deleted from every table that has a known_at column (`known_at_tables`: minutes,
+    hourly bars, dividends, splits, the calendar cache and flags), as a clockless BarStore."""
     conn = sqlite3.connect(":memory:", isolation_level=None)
     world.conn.backup(conn)
-    for table in ("minute_bars", "hourly_bars", "data_flags"):
+    for table in known_at_tables(conn):
         conn.execute(
-            f"DELETE FROM {table} WHERE known_at > ?",  # noqa: S608 — fixed table names above
+            f"DELETE FROM {table} WHERE known_at > ?",  # noqa: S608 — names from sqlite_master
             (to_us(cut),),
         )
     return BarStore(conn)
@@ -645,27 +852,37 @@ class Garbage:
 
     - `revised`: t_open of the bar revised with known_at after the cut;
     - `revision_known_at`: when that revision became known;
+    - `revised_at_cut`: t_open of the bar revised with known_at exactly the cut, which only a
+      view reading known_at <= as_of sees;
     - `nan`, `huge`, `negative`: t_open of the bars written with a NaN close, all prices +1e9,
       and close and low -1e9;
     - `shuffled`: t_open of the bars after the cut written with shuffled values;
     - `unavailable`: t_open of the bars that close before the cut but are available at or after
-      it (one with available_at exactly the cut)."""
+      it (one with available_at exactly the cut);
+    - `minutes_unavailable`: t of the minutes before the cut but available at or after it (one
+      with available_at exactly the cut);
+    - `minutes_after`: t of the minutes at or after the cut, with a NaN close, all prices +1e9,
+      close and low -1e9, then shuffled real values."""
 
     revised: datetime
     revision_known_at: datetime
+    revised_at_cut: datetime
     nan: datetime
     huge: datetime
     negative: datetime
     shuffled: tuple[datetime, ...]
     unavailable: tuple[datetime, ...]
+    minutes_unavailable: tuple[datetime, ...]
+    minutes_after: tuple[datetime, ...]
 
 
 def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, Garbage]:
     """Variant (c): `truncated_store(world, cut)` on a SimClock, plus garbage after the cut,
     drawn by an RNG seeded from (`seed`, `cut`), so a rerun writes the same garbage:
 
-    1. a late revision: `tests.support.bars.revise_close` of the cut's own bar by +0.25, known at
-       cut + 5 minutes (through `ingest_minutes`, as a settle arrives);
+    1. revisions through `ingest_minutes`, as a settle arrives (`tests.support.bars.revise_close`):
+       the bar before the cut's bar by -0.25, known exactly at the cut, and the cut's own bar by
+       +0.25, known at cut + 5 minutes;
     2. raw hourly rows, inserted with SQL, never through `ingest_minutes` (which refuses them)
        or anything the harness tests, each known just before the cut (cut - 1 µs) so that only
        the view's availability rule can hide it:
@@ -673,18 +890,24 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
          one close NaN, one bar's prices all +1e9, one bar's close and low -1e9. SQLite turns
          a NaN REAL into NULL, which the schema refuses, so the NaN is stored as the text 'NaN';
        - a bar with t_close < cut and available_at == cut, and one with t_close < cut <
-         available_at, both at t_opens off the calendar's grid and after the cut's bar's.
+         available_at, both at t_opens off the calendar's grid and after the cut's bar's;
+    3. raw minute rows, known at cut - 1 µs likewise:
+       - two minutes off the grid before the cut (cut - 30 s and cut - 20 s), available at the
+         cut and a second after it;
+       - five minutes from the cut on: a NaN close (as text), all prices +1e9, close and low
+         -1e9, then two with the cut's bar's last values shuffled.
+
+    Dividends, splits and flags get no garbage: no layer reads them yet (B6 open item).
 
     Returns the store and what was written."""
     store = truncated_store(world, cut)
     clock = SimClock(cut)
     store = BarStore(store._conn, clock=clock)
     decision = next(d for d in world.decisions if d.tau == cut)
-    bar = next(
-        b
-        for b in store.view(cut, as_of=cut).hourly(SYMBOL, purpose=Purpose.OPERATE, last=1)
-        if b.t_open == decision.bar.t_open
-    )
+    previous, bar = store.view(cut, as_of=cut).hourly(SYMBOL, purpose=Purpose.OPERATE, last=2)
+    if bar.t_open != decision.bar.t_open:
+        raise ValueError(f"the cut's bar isn't visible at {cut.isoformat()}")
+    revise_close(store, clock, world.minutes, previous, -0.25, at=cut)
     revision_at = cut + timedelta(minutes=5)
     revise_close(store, clock, world.minutes, bar, 0.25, at=revision_at)
     cal = TradingCalendar.xnys()
@@ -739,14 +962,50 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
             cut + timedelta(seconds=i),
             (bar.close, bar.close + 1, bar.close - 1, bar.close),
         )
+
+    def insert_minute(t: datetime, available: datetime, prices: tuple[Any, ...]) -> None:
+        store._conn.execute(
+            "INSERT INTO minute_bars VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'garbage')",
+            (
+                SYMBOL,
+                to_us(t),
+                *prices,
+                100.0,
+                to_us(available),
+                to_us(cut - timedelta(microseconds=1)),
+            ),
+        )
+
+    quiet = (bar.close, bar.close + 1, bar.close - 1, bar.close)
+    minutes_unavailable = (cut - timedelta(seconds=30), cut - timedelta(seconds=20))
+    for i, t in enumerate(minutes_unavailable):
+        insert_minute(t, cut + timedelta(seconds=i), quiet)
+    last = world.minutes.select(world.minutes.t < to_us(bar.t_close))
+    real = [float(last.open[-1]), float(last.high[-1]), float(last.low[-1]), float(last.close[-1])]
+    minutes_after = tuple(cut + timedelta(minutes=i) for i in range(5))
+    for i, t in enumerate(minutes_after):
+        minute: tuple[Any, ...]
+        if i == 0:
+            minute = (bar.close, bar.close + 1, bar.close - 1, "NaN")
+        elif i == 1:
+            minute = (1e9, 1e9, 1e9, 1e9)
+        elif i == 2:
+            minute = (bar.close, bar.close + 1, -1e9, -1e9)
+        else:
+            random.Random(f"{seed}:{cut.isoformat()}:{i}").shuffle(real)
+            minute = tuple(real)
+        insert_minute(t, t + timedelta(minutes=1), minute)
     return store, Garbage(
         bar.t_open,
         revision_at,
+        previous.t_open,
         future[0].t_open,
         future[1].t_open,
         future[2].t_open,
         tuple(b.t_open for b in future),
         unavailable,
+        minutes_unavailable,
+        minutes_after,
     )
 
 
@@ -789,13 +1048,14 @@ def run_layers(registry: Registry, source: Source, decisions: Sequence[Decision]
 class Failure:
     """One way a cut failed.
 
-    - `kind`: "mismatch" (a record's digest differs from the full run's), "error" (one run
-      has no record because the layer raised there: in this variant and not the full run, the
-      reverse, or both but differently), "missing" (one run lacks a record any other way) or
-      "provenance" (fit_end ≥ τ);
+    - `kind`: "mismatch" (a record's digest differs from the full run's), "error" (the layer
+      raised in this variant's run, the full run, or both, even with the same error: it and
+      every layer after it then have no records to compare), "missing" (one run lacks a record
+      any other way), "provenance" (fit_end ≥ τ) or "vacuous" (a check that found nothing else
+      compared no record of this layer beyond a cold start, at any cut);
     - `variant`: the variant compared with the full run; for "provenance", the variant whose
-      record broke it;
-    - `tau`: the decision where it showed.
+      record broke it; FULL for "vacuous";
+    - `tau`: the decision where it showed (None for "vacuous", reported at the last cut).
     - `detail`: for people; tests compare the other fields."""
 
     cut: datetime
@@ -811,7 +1071,9 @@ class Report:
     """The outcome of `check_truncation`.
 
     - `cuts`: the cut times checked, in order (fewer than asked when it stopped at a failure);
-    - `compared`: per layer, how many records were compared, across cuts and variants;
+    - `compared`: per layer in registry order, how many records were compared, across cuts and
+      variants, cold-start records (`Record.cold`) not counted; a record whose digest differs
+      counts, a missing or unmade one doesn't;
     - `failures`: every failure found."""
 
     cuts: tuple[datetime, ...]
@@ -856,47 +1118,48 @@ def provenance_failures(
                     record.layer,
                     record.tau,
                     "provenance",
-                    f"model {record.provenance.model} fit_end={record.provenance.fit_end}",
+                    f"artifact {record.provenance.artifact} fit_end={record.provenance.fit_end}",
                 )
             )
     return failures
 
 
-def compare_runs(reference: Run, other: Run, *, cut: datetime) -> list[Failure]:
+def compare_runs(
+    reference: Run, other: Run, *, cut: datetime
+) -> tuple[list[Failure], dict[str, int]]:
     """`other` against `reference` (the full run), over the decisions up to `cut`: walk the
-    decisions in order and, at each, the layers in registry order. The first record whose
-    digest differs, or that one run lacks, is the comparison's only failure, so it names the
-    layer where the runs first part. A layer that raised has no records, nor have the layers
-    after it, so its failure shows at the run's first decision, kind "error"; two runs whose
-    layer raised the same error (`Run.errors` equal) agree there."""
+    decisions in order and, at each, the layers in order. The first record whose digest
+    differs, or that one run lacks, is the comparison's only failure, so it names the layer
+    where the runs first part. A layer that raised in either run has no records, nor have the
+    layers after it, so it fails at the first decision, kind "error", even when both runs raised
+    the same error: a layer that compares nothing must not pass. A layer's per-decision
+    refusals are records (`error_output`), compared like any other on (decision, layer,
+    message) through the digest.
+
+    Returns the failures (at most one) and, per layer, how many records were compared before
+    the walk stopped, the differing one included and cold-start records not counted."""
     names = tuple(
         dict.fromkeys((*reference.records, *reference.errors, *other.records, *other.errors))
     )
+    compared = dict.fromkeys(names, 0)
     for i, d in enumerate(reference.decisions):
         if d.tau > cut:
             break
         for name in names:
             left_error, right_error = reference.errors.get(name), other.errors.get(name)
             if left_error is not None or right_error is not None:
-                if left_error == right_error:
-                    continue
-                return [
-                    Failure(
-                        cut, other.variant, name, d.tau, "error", f"{left_error} / {right_error}"
-                    )
-                ]
+                detail = f"full: {left_error} / {other.variant}: {right_error}"
+                return [Failure(cut, other.variant, name, d.tau, "error", detail)], compared
             left, right = reference.records.get(name, ()), other.records.get(name, ())
             if i >= len(left) or i >= len(right):
-                return [Failure(cut, other.variant, name, d.tau, "missing", "record missing")]
-            try:
-                equal = left[i].digest() == right[i].digest()
-            except Exception as exc:
-                return [Failure(cut, other.variant, name, d.tau, "error", str(exc))]
-            if not equal:
-                return [
-                    Failure(cut, other.variant, name, d.tau, "mismatch", "canonical hashes differ")
-                ]
-    return []
+                failure = Failure(cut, other.variant, name, d.tau, "missing", "record missing")
+                return [failure], compared
+            if not left[i].cold:
+                compared[name] += 1
+            if left[i].digest() != right[i].digest():
+                failure = Failure(cut, other.variant, name, d.tau, "mismatch", "digests differ")
+                return [failure], compared
+    return [], compared
 
 
 def check_truncation(
@@ -910,27 +1173,27 @@ def check_truncation(
 ) -> Report:
     """T-NL1 and T-NL2 at each cut, in the order given.
 
-    The full run (b) is `run_layers` on `world.store` over every decision, once, and each cut
-    compares its records up to τ (`slice_full`); with `slice_full=False` the full store is run
-    again per cut over the decisions up to τ. At each cut, (a) runs on `truncated_store` and (c)
-    on `garbage_store(seed=seed)` over the decisions up to τ; `compare_runs` checks (a) and (c)
-    against (b), and `provenance_failures` checks the records of all three. With
-    `stop_at_first` it returns at the first cut that fails."""
-    full = (
-        run_layers(registry, Source(world.store, Variant.FULL, None), world.decisions)
-        if slice_full
-        else None
-    )
+    The full run (b) is `run_layers` on `world.store` over every decision of the whole history,
+    once, and each cut compares its records up to τ (`slice_full`); with `slice_full=False` it
+    is run afresh at each cut, still over the whole history, never only up to τ (a smoother
+    would see no later rows there). At each cut, (a) runs on `truncated_store` and (c) on
+    `garbage_store(seed=seed)` over the decisions up to τ; `compare_runs` checks (a) and (c)
+    against (b), and `provenance_failures` checks the records of all three. When nothing else
+    failed, a layer that compared no record (cold starts aside) at any cut fails "vacuous". With
+    `stop_at_first` it returns at the first cut that fails. ValueError for no cuts."""
+    if not cuts:
+        raise ValueError("no cut times to check")
+
+    def full_run() -> Run:
+        return run_layers(registry, Source(world.store, Variant.FULL, None), world.decisions)
+
+    full = full_run() if slice_full else None
     failures: list[Failure] = []
     checked = []
     compared = dict.fromkeys(registry.names, 0)
     for cut in cuts:
         decisions = tuple(d for d in world.decisions if d.tau <= cut)
-        reference = (
-            full
-            if full is not None
-            else run_layers(registry, Source(world.store, Variant.FULL, None), decisions)
-        )
+        reference = full if full is not None else full_run()
         checked.append(cut)
         failures.extend(
             provenance_failures(
@@ -947,32 +1210,32 @@ def check_truncation(
             )
             try:
                 run = run_layers(registry, Source(store, variant, cut), decisions)
-                differences = compare_runs(reference, run, cut=cut)
+                differences, counts = compare_runs(reference, run, cut=cut)
                 failures.extend(differences)
                 failures.extend(
                     provenance_failures(
                         (r for rows in run.records.values() for r in rows), cut=cut, variant=variant
                     )
                 )
-                for index, d in enumerate(decisions):
-                    for name in registry.names:
-                        if differences and (d.tau, name) == (
-                            differences[0].tau,
-                            differences[0].layer,
-                        ):
-                            if differences[0].kind == "mismatch":
-                                compared[name] += 1
-                            break
-                        if index < min(
-                            len(reference.records.get(name, ())), len(run.records.get(name, ()))
-                        ):
-                            compared[name] += 1
-                    if differences and d.tau == differences[0].tau:
-                        break
+                for name, count in counts.items():
+                    compared[name] = compared.get(name, 0) + count
             finally:
                 store.close()
         if failures and stop_at_first:
             break
+    if not failures:
+        failures.extend(
+            Failure(
+                checked[-1],
+                Variant.FULL,
+                name,
+                None,
+                "vacuous",
+                "no record compared beyond a cold start",
+            )
+            for name in registry.names
+            if compared[name] == 0
+        )
     return Report(tuple(checked), compared, tuple(failures))
 
 
@@ -984,10 +1247,20 @@ def _history() -> tuple[MinuteFrame, BarStore]:
     return minutes, store
 
 
+# FeatureStream.snapshot as B3 wrote it: a deep copy of `_state` and nothing more.
+_STREAM_SNAPSHOT: Final = FeatureStream.snapshot
+
+
 def _feature_state_hash(stream: FeatureStream) -> str:
-    # Serialize the actual state, including every field, before caching. Pydantic's
-    # serializer preserves float64 values and signed zero. Read the state immediately
-    # without deepcopying its histories; never retain a mutable reference.
+    """`sha256_hex(stream.snapshot())`, without snapshot()'s deep copy when that is safe.
+
+    The shortcut serializes `stream._state` directly (pydantic keeps float64 values and signed
+    zero), and is taken only when the stream's class uses B3's own `snapshot`, which copies
+    `_state` and nothing else. Any other stream (a subclass, a patched method) is hashed through
+    its public `snapshot()`. The shortcut's equality with the snapshot hash is guarded at every
+    bar of the world by `test_review_12_the_fast_state_hash_is_the_snapshot_hash_at_every_bar`."""
+    if type(stream).snapshot is not _STREAM_SNAPSHOT:
+        return sha256_hex(stream.snapshot())
     return _hash_feature_json(stream._state.model_dump_json())
 
 
@@ -997,11 +1270,27 @@ def _hash_feature_json(payload: str) -> str:
     return sha256_hex(canonical_loads(payload))
 
 
-# Intent construction validates a deterministic decision id. Reuse only exact inputs;
-# the engine and all of its checks still run afresh for every variant.
-_risk_intent = lru_cache(maxsize=4096)(intent)
+def _risk_quantity(seed: int, tau: datetime) -> int:
+    return _quantity(f"{seed}:{tau.isoformat()}")
 
 
 @lru_cache(maxsize=4096)
-def _risk_quantity(seed: int, tau: datetime) -> int:
-    return random.Random(f"{seed}:{tau.isoformat()}").randint(1, 200)
+def _quantity(seed: str) -> int:
+    # Keyed on the exact seed string the draw uses.
+    return random.Random(seed).randint(1, 200)
+
+
+# Types whose repr names the type and the value exactly: a float's repr round-trips (and
+# keeps -0.0), and an int's, a bool's and a str's are distinct from each other's.
+_EXACT_TYPES: Final = frozenset({type(None), bool, int, float, str})
+
+
+def _exact_repr(
+    name: str, tau_us: int, digest: str, rows: tuple[tuple[Any, ...], ...]
+) -> str | None:
+    """`repr` of the arguments as a cache key when every value in `rows` is of an exact type,
+    else None (don't cache). Two equal keys hold the same types and values, so the same
+    canonical JSON: never Python ==, where 0.0 == -0.0 and 1 == 1.0 == True."""
+    if not set(map(type, chain.from_iterable(rows))) <= _EXACT_TYPES:
+        return None
+    return repr((name, tau_us, digest, rows))
