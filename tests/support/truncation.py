@@ -43,7 +43,15 @@ value. Since Records are immutable, a reused one is indistinguishable from one m
 the end of its fit window): the filter's model, and the scaler of the features layer's scaled
 vectors. `provenance_failures` demands fit_end < τ for every such record, in every variant.
 
-Everything here is synthetic, on the real NYSE calendar inside FIT (2016). DEV stays dark.
+**Worlds (B6).** One harness, built from a `WorldSpec`: SYNTHETIC, the fast tier's seeded bars
+on the real NYSE calendar inside FIT (2016), with a few synthetic corporate actions; and REAL,
+the full tier's real FIT bars read from `var/market.db` (PLAN P4, ARCHITECTURE §13), its fixture
+model fit on 2016–2017 so T-NL2 holds from 2018 on. A market.db is only ever opened read-only,
+and read inside FIT. DEV stays dark.
+
+**Actions (B6).** `ActionsLayer` reads what the other layers don't: the view's minutes, its
+dividends and splits, and its move flags. The garbage variant writes garbage into each of those
+tables too, so a read of them that breaks the view's rules is caught.
 """
 
 from __future__ import annotations
@@ -59,13 +67,14 @@ from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from functools import cache, lru_cache
 from itertools import chain, pairwise
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 import numpy as np
 from structlog.testing import capture_logs
 
-from quant.core.calendar import TradingCalendar
+from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
 from quant.core.clock import SimClock
 from quant.core.epoch import from_us, to_us
@@ -73,13 +82,14 @@ from quant.core.errors import FeatureError, ModelError
 from quant.core.orders import Side, TradingMode
 from quant.core.regime import Label
 from quant.core.schedule import Decision, decision_schedule
-from quant.data.frames import MinuteFrame
+from quant.data.frames import HourlyBar, MinuteFrame
 from quant.data.market_db import HISTORY, BarStore
-from quant.data.policy import Purpose
+from quant.data.policy import FIT_START, Purpose
+from quant.data.validate import MOVE_KIND, DataFlag
 from quant.data.view import PointInTimeView
 from quant.features.menu import FeatureConfig, r1_features
 from quant.features.scaler import Scaler
-from quant.features.stream import FeatureStream, compute_features, features_for
+from quant.features.stream import FeatureMatrix, FeatureStream, compute_features, features_for
 from quant.hmm.filter import ForwardFilter
 from quant.hmm.labels import r1_thresholds
 from quant.hmm.model import HmmModel
@@ -117,6 +127,74 @@ VIEW_DEPTH: Final = 16
 RISK_EQUITY: Final = 100_000.0
 # Edge cuts every draw includes (`edge_cuts`).
 EDGES: Final = ("first_warm", "model_first", "after_dst", "half_day_close", "session_first")
+# The synthetic world's corporate actions, loaded as history: (table, ex_date, value, declared).
+SYNTHETIC_ACTIONS: Final = (
+    ("dividends", date(2016, 9, 16), 1.0, date(2016, 9, 8)),
+    ("splits", date(2016, 10, 14), 2.0, date(2016, 9, 30)),
+    ("dividends", date(2016, 12, 16), 1.25, date(2016, 12, 8)),
+)
+# The actions layer's reads around each decision (`ActionsLayer`).
+MINUTE_SPAN: Final = timedelta(minutes=30)
+ACTION_DAYS: Final = timedelta(days=100)
+FLAG_SPAN: Final = timedelta(days=1)
+
+# The full tier's real bars (PLAN P4): the repository's market.db.
+MARKET_DB: Final = Path(__file__).resolve().parents[2] / "var" / "market.db"
+# An as_of that knows every version a market.db holds, for reading one to build a world.
+KNOWS_ALL: Final = datetime(2100, 1, 1, tzinfo=UTC)
+
+
+@dataclass(frozen=True)
+class WorldSpec:
+    """Where a World's bars come from, and when its model starts.
+
+    - `name`: for messages;
+    - `data_first`, `data_last`: the sessions whose minutes the world's store holds;
+    - `model_first`: the first session of the bars the fixture model and the clean scaler are
+      featurized from (their feature stream starts there);
+    - `model_fit_end`: the end of the fixture model's fit window, and the activation: the
+      filter's first record, and the first scaled features, are the first decision after it;
+    - `horizon`: a time after every bar of the world: what a layer that peeks reads at;
+    - `market_db`: None for the synthetic bars (seed DATA_SEED) and SYNTHETIC_ACTIONS.
+      Otherwise a market.db, opened read-only: its minutes of [data_first, data_last] (every
+      session must have some) and its hourly bars from `model_first`, each read through a
+      PointInTimeView at `horizon` that knows every stored version (KNOWS_ALL), and the latest
+      version of each dividend and split whose ex-date lies within ACTION_DAYS of the span,
+      read with SQL because the view doesn't give declaration dates. The minutes and actions
+      are loaded into the world's store as HISTORY; the hourly bars feed the model and the
+      scaler.
+    """
+
+    name: str
+    data_first: date
+    data_last: date
+    model_first: date
+    model_fit_end: datetime
+    horizon: datetime
+    market_db: Path | None = None
+
+    @property
+    def activation(self) -> datetime:
+        return self.model_fit_end
+
+
+# The fast tier's world: synthetic minutes, 2016-06-01 to 2016-12-30.
+SYNTHETIC: Final = WorldSpec(
+    "synthetic", DATA_FIRST, DATA_LAST, DATA_FIRST, MODEL_FIT_END, HORIZON, None
+)
+# The full tier's world (PLAN P4, ARCHITECTURE §13): real FIT bars from 2017-10-02, so the
+# first warm decision falls in late December 2017, to 2018-07-31, which holds the golden window
+# (2018-01 to 2018-04, the February 2018 shock), the start of DST (2018-03-11) and a half day
+# (2018-07-03). The fixture model is fit on 2016–2017. Everything read lies inside FIT.
+REAL: Final = WorldSpec(
+    "real FIT bars",
+    date(2017, 10, 2),
+    date(2018, 7, 31),
+    FIT_START,
+    datetime(2018, 1, 1, tzinfo=UTC),
+    datetime(2018, 8, 10, tzinfo=UTC),
+    MARKET_DB,
+)
 
 
 class Variant(StrEnum):
@@ -657,23 +735,80 @@ class RiskLayer:
         return records
 
 
+class ActionsLayer:
+    """The view's other reads (B6, the B5 open item): minutes, corporate actions and move flags.
+    Per decision, from `source.view(d.tau)`, each with purpose OPERATE, in this order:
+
+    - "minutes": `minutes(SYMBOL, τ - MINUTE_SPAN, τ + MINUTE_SPAN)`: the half hour before τ,
+      asked through a span that reaches past τ, so the view's own rules (t < τ, available_at
+      < τ, known_at < as_of) are what hide later minutes. Recorded as {"t" (epoch µs),
+      "open", "high", "low", "close", "volume"}, lists in time order;
+    - "dividends" and "splits": `dividends` / `splits(SYMBOL, session - ACTION_DAYS, session +
+      ACTION_DAYS)` for the decision bar's session, as [[ISO ex-date, amount or ratio], ...].
+      Ex-dates after τ are asked for too: a declared action is known before it goes ex;
+    - "flags": `flags_of(source, view, d)`, as [[t (epoch µs), kind, detail], ...];
+    - "digest": the view's digest after those reads.
+
+    Stateless, no provenance. A planted leak overrides `flags_of`."""
+
+    name: Final = "actions"
+
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        records = []
+        for d in decisions:
+            view = source.view(d.tau)
+            minutes = view.minutes(
+                SYMBOL, d.tau - MINUTE_SPAN, d.tau + MINUTE_SPAN, purpose=Purpose.OPERATE
+            )
+            first, last = d.bar.session - ACTION_DAYS, d.bar.session + ACTION_DAYS
+            dividends = view.dividends(SYMBOL, first, last, purpose=Purpose.OPERATE)
+            splits = view.splits(SYMBOL, first, last, purpose=Purpose.OPERATE)
+            flags = self.flags_of(source, view, d)
+            output = {
+                "minutes": {
+                    "t": [int(t) for t in minutes.t],
+                    **{
+                        name: [float(x) for x in getattr(minutes, name)]
+                        for name in ("open", "high", "low", "close", "volume")
+                    },
+                },
+                "dividends": [[day.isoformat(), amount] for day, amount in dividends],
+                "splits": [[day.isoformat(), ratio] for day, ratio in splits],
+                "flags": [[to_us(flag.t), flag.kind, flag.detail] for flag in flags],
+                "digest": view.digest(),
+            }
+            records.append(cached_record(d.tau, self.name, output))
+        return records
+
+    def flags_of(self, source: Source, view: PointInTimeView, d: Decision) -> list[DataFlag]:
+        """The move flags the decision sees: `view.flags(SYMBOL, τ - FLAG_SPAN, τ +
+        MINUTE_SPAN)`."""
+        return view.flags(SYMBOL, d.tau - FLAG_SPAN, d.tau + MINUTE_SPAN, purpose=Purpose.OPERATE)
+
+
 # --- the world -------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, eq=False)
 class World:
-    """The fixture every harness run shares, built once per session (`world()`).
+    """The fixture every harness run shares, built once per session and spec (`world(spec)`).
 
-    - `minutes`: the synthetic minutes, DATA_FIRST to DATA_LAST;
-    - `conn`, `store`: an in-memory market.db holding them as HISTORY: the full run's store,
-      and the source every per-cut store is backed up from;
+    - `minutes`: the world's minutes, `spec.data_first` to `spec.data_last`;
+    - `conn`, `store`: an in-memory market.db holding them and the world's corporate actions
+      as HISTORY: the full run's store, and the source every per-cut store is backed up from;
     - `config`: r1's FeatureConfig;
-    - `decisions`: every decision from the first warm bar's to DATA_LAST's last, in order;
-    - `model`: the clean fixture model, `fixture_model(MODEL_FIT_END)`;
+    - `decisions`: every decision from the first warm bar's to `spec.data_last`'s last, in order;
+    - `model`: the clean fixture model, `fixture_model(spec.model_fit_end, spec)`;
     - `scaler`: the Scaler fit on the model's window, [the first warm row's available_at,
-      MODEL_FIT_END): the model's own (same mean and std), with its window, so the features
-      layer can name it in Provenance;
-    - `edges`: `edge_cuts(decisions)`.
+      `spec.model_fit_end`), from the model's own rows: the model's own (same mean and std),
+      with its window, so the features layer can name it in Provenance;
+    - `edges`: `edge_cuts(decisions, activation=spec.activation)`;
+    - `spec`: what the world was built from.
     """
 
     minutes: MinuteFrame
@@ -684,63 +819,101 @@ class World:
     model: HmmModel
     scaler: Scaler
     edges: Mapping[str, Decision]
+    spec: WorldSpec = SYNTHETIC
+
+    @property
+    def activation(self) -> datetime:
+        return self.spec.activation
 
 
 @cache
-def world() -> World:
-    """The shared World, built on first use and cached for the session."""
-    minutes, store = _history()
+def world(spec: WorldSpec = SYNTHETIC) -> World:
+    """The shared World for `spec`, built on first use (`build_world`) and cached for the
+    session."""
+    return build_world(spec)
+
+
+def build_world(spec: WorldSpec) -> World:
+    """A World built from `spec` (uncached). The model and the scaler come from `_model_rows`,
+    the decisions from the world store's own warm rows."""
+    minutes, store = _history(spec)
     config = r1_features()
     matrix = compute_features(
-        store.view(HORIZON, as_of=HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE), config
+        store.view(spec.horizon, as_of=spec.horizon).hourly(SYMBOL, purpose=Purpose.OPERATE),
+        config,
     )
     first = from_us(int(matrix.t_open[0]))
     cal = TradingCalendar.xnys()
     decisions = tuple(
         d
-        for day in cal.sessions(first.date(), DATA_LAST)
+        for day in cal.sessions(first.date(), spec.data_last)
         for d in decision_schedule(cal, day)
         if d.bar.t_open >= first
     )
-    scaler = Scaler.fit(matrix, start=from_us(int(matrix.available_at[0])), end=MODEL_FIT_END)
+    rows, _ = _model_rows(spec)
+    scaler = Scaler.fit(rows, start=from_us(int(rows.available_at[0])), end=spec.model_fit_end)
     return World(
         minutes,
         store._conn,
         store,
         config,
         decisions,
-        fixture_model(MODEL_FIT_END),
+        fixture_model(spec.model_fit_end, spec),
         scaler,
-        edge_cuts(decisions),
+        edge_cuts(decisions, activation=spec.activation),
+        spec,
     )
 
 
 @cache
-def fixture_model(fit_end: datetime) -> HmmModel:
-    """A model fit on the full store's warm feature rows with available_at in [the first warm
-    row's available_at, `fit_end`): `quant.hmm.train.train_candidate` on a TrainingData of
-    those rows (each row's raw log return from the previous consumed bar's close, sessions as
-    ordinals), K=FIXTURE_STATES FIXTURE_COVARIANCE, FIXTURE_RESTARTS restarts from
-    FIXTURE_BASE_SEED, a one-month validation block, r1's label thresholds, workers=1. Cached
-    per `fit_end`."""
-    _, store = _history()
-    config = r1_features()
-    bars = store.view(HORIZON, as_of=HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE)
-    matrix = compute_features(bars, config)
-    first = from_us(int(matrix.available_at[0]))
-    matrix = matrix.window(first, fit_end)
+def _model_rows(spec: WorldSpec) -> tuple[FeatureMatrix, dict[int, tuple[float, int]]]:
+    """The model's featurized bars, every warm row from `spec.model_first` on, and, keyed by
+    each bar's t_open (epoch µs), its raw log return from the previous bar's close and its
+    session's ordinal. The bars are the world store's for a synthetic spec, and the market.db's
+    hourly bars from `spec.model_first` otherwise (`WorldSpec`)."""
+    bars = _model_bars(spec)
     by_open = {
         to_us(b.t_open): (math.log(b.close / previous.close), b.session.toordinal())
         for previous, b in pairwise(bars)
     }
-    data = TrainingData(
+    return compute_features(bars, r1_features()), by_open
+
+
+def _model_bars(spec: WorldSpec) -> list[HourlyBar]:
+    if spec.market_db is None:
+        _, store = _history(spec)
+        return store.view(spec.horizon, as_of=spec.horizon).hourly(SYMBOL, purpose=Purpose.OPERATE)
+    conn = _read_only(spec.market_db)
+    try:
+        view = PointInTimeView(conn, spec.horizon, as_of=KNOWS_ALL)
+        since = TradingCalendar.xnys().session(_first_session(spec.model_first)).open
+        return view.hourly(SYMBOL, purpose=Purpose.OPERATE, since=since)
+    finally:
+        conn.close()
+
+
+def fixture_training_data(fit_end: datetime, spec: WorldSpec = SYNTHETIC) -> TrainingData:
+    """The fixture model's rows: the model's warm feature rows (`_model_rows`) with available_at
+    in [the first warm row's available_at, `fit_end`), each row's raw log return from the
+    previous consumed bar's close, sessions as ordinals, r1's feature-config hash."""
+    matrix, by_open = _model_rows(spec)
+    first = from_us(int(matrix.available_at[0]))
+    matrix = matrix.window(first, fit_end)
+    return TrainingData(
         matrix,
         np.array([by_open[int(t)][0] for t in matrix.t_open], dtype=np.float64),
         np.array([by_open[int(t)][1] for t in matrix.t_open], dtype=np.int64),
         first,
         fit_end,
-        config.config_hash(),
+        r1_features().config_hash(),
     )
+
+
+@cache
+def fixture_model(fit_end: datetime, spec: WorldSpec = SYNTHETIC) -> HmmModel:
+    """A model fit on `fixture_training_data(fit_end, spec)`: `quant.hmm.train.train_candidate`,
+    K=FIXTURE_STATES FIXTURE_COVARIANCE, FIXTURE_RESTARTS restarts from FIXTURE_BASE_SEED, a
+    one-month validation block, r1's label thresholds, workers=1. Cached per (`fit_end`, spec)."""
     config_train = r1_train_config().model_copy(
         update={
             "n_restarts": FIXTURE_RESTARTS,
@@ -748,27 +921,29 @@ def fixture_model(fit_end: datetime) -> HmmModel:
             "validation_months": 1,
         }
     )
+    source = "B5 synthetic" if spec.market_db is None else "B6 market.db"
     return train_candidate(
-        data,
+        fixture_training_data(fit_end, spec),
         Candidate(n_states=FIXTURE_STATES, covariance_type=FIXTURE_COVARIANCE),
         thresholds=r1_thresholds(),
         config=config_train,
-        provenance={"source": "B5 synthetic"},
+        provenance={"source": source},
         workers=1,
     ).model
 
 
 def default_registry(world: World, *, risk_seed: int = 0) -> Registry:
     """The clean decision path in order: ViewLayer, FeaturesLayer(world.config, world.scaler,
-    activation=ACTIVATION), FilterLayer(world.model, activation=ACTIVATION), RiskLayer(the
-    committed risk.yaml, seed=risk_seed). Later steps add their layers here (CLAUDE.md
-    rule 4)."""
+    activation=world.activation), FilterLayer(world.model, activation=world.activation),
+    RiskLayer(the committed risk.yaml, seed=risk_seed), ActionsLayer. Later steps add their
+    layers here (CLAUDE.md rule 4)."""
     return Registry(
         (
             ViewLayer(),
-            FeaturesLayer(world.config, world.scaler, activation=ACTIVATION),
-            FilterLayer(world.model, activation=ACTIVATION),
+            FeaturesLayer(world.config, world.scaler, activation=world.activation),
+            FilterLayer(world.model, activation=world.activation),
             RiskLayer(risk_config(), seed=risk_seed),
+            ActionsLayer(),
         )
     )
 
@@ -776,34 +951,53 @@ def default_registry(world: World, *, risk_seed: int = 0) -> Registry:
 # --- cut times -------------------------------------------------------------------------------
 
 
-def edge_cuts(decisions: Sequence[Decision]) -> dict[str, Decision]:
+def edge_cuts(
+    decisions: Sequence[Decision], *, activation: datetime = ACTIVATION
+) -> dict[str, Decision]:
     """The decisions every draw includes, keyed by EDGES:
 
     - "first_warm": the first decision (the first warm bar's);
-    - "model_first": the first decision after ACTIVATION, the filter's first record;
-    - "after_dst": the first decision after a change of New York's UTC offset (2016-11-07);
-    - "half_day_close": a half day's CLOSE bar (2016-11-25), a reduce-only decision;
+    - "model_first": the first decision after `activation`, the filter's first record;
+    - "after_dst": the first bar of the first session whose open has a different New York UTC
+      offset from the previous session's (2016-11-07 in the synthetic world, 2018-03-12 in the
+      real one);
+    - "half_day_close": the first half day's CLOSE bar, a reduce-only decision (2016-11-25;
+      2018-07-03);
     - "session_first": the first bar of the session after that half day.
 
     KeyError when `decisions` lacks one."""
-
-    def find(day: date, *, closing: bool = False) -> Decision:
-        for d in decisions:
-            if d.bar.session == day and (d.reduce_only if closing else d.bar.index == 0):
-                return d
-        raise KeyError(day)
-
     if not decisions:
         raise KeyError("first_warm")
-    model_first = next((d for d in decisions if d.tau > ACTIVATION), None)
+    model_first = next((d for d in decisions if d.tau > activation), None)
     if model_first is None:
         raise KeyError("model_first")
+    cal = TradingCalendar.xnys()
+    openers = [d for d in decisions if d.bar.index == 0]
+    after_dst = next(
+        (
+            d
+            for previous, d in pairwise(openers)
+            if d.bar.t_open.astimezone(NEW_YORK).utcoffset()
+            != previous.bar.t_open.astimezone(NEW_YORK).utcoffset()
+        ),
+        None,
+    )
+    if after_dst is None:
+        raise KeyError("after_dst")
+    half_day = next(
+        (d for d in decisions if d.reduce_only and cal.session(d.bar.session).is_half_day), None
+    )
+    if half_day is None:
+        raise KeyError("half_day_close")
+    session_first = next((d for d in openers if d.bar.session > half_day.bar.session), None)
+    if session_first is None:
+        raise KeyError("session_first")
     return {
         "first_warm": decisions[0],
         "model_first": model_first,
-        "after_dst": find(date(2016, 11, 7)),
-        "half_day_close": find(date(2016, 11, 25), closing=True),
-        "session_first": find(date(2016, 11, 28)),
+        "after_dst": after_dst,
+        "half_day_close": half_day,
+        "session_first": session_first,
     }
 
 
@@ -862,7 +1056,10 @@ class Garbage:
     - `minutes_unavailable`: t of the minutes before the cut but available at or after it (one
       with available_at exactly the cut);
     - `minutes_after`: t of the minutes at or after the cut, with a NaN close, all prices +1e9,
-      close and low -1e9, then shuffled real values."""
+      close and low -1e9, then shuffled real values;
+    - `dividends`, `splits`: the ex-dates of the garbage actions written (`garbage_store`
+      step 4), in the order written;
+    - `flags`: the minutes of the garbage flags written (step 5), in the order written."""
 
     revised: datetime
     revision_known_at: datetime
@@ -874,6 +1071,9 @@ class Garbage:
     unavailable: tuple[datetime, ...]
     minutes_unavailable: tuple[datetime, ...]
     minutes_after: tuple[datetime, ...]
+    dividends: tuple[date, ...]
+    splits: tuple[date, ...]
+    flags: tuple[datetime, ...]
 
 
 def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, Garbage]:
@@ -895,9 +1095,22 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
        - two minutes off the grid before the cut (cut - 30 s and cut - 20 s), available at the
          cut and a second after it;
        - five minutes from the cut on: a NaN close (as text), all prices +1e9, close and low
-         -1e9, then two with the cut's bar's last values shuffled.
-
-    Dividends, splits and flags get no garbage: no layer reads them yet (B6 open item).
+         -1e9, then two with the cut's bar's last values shuffled;
+    4. raw dividend and split rows (B6), each a new version of its (symbol, ex-date), declared on
+       the cut's session S, none visible to a view at a decision up to the cut:
+       - dividends: ex S + 1 day, amount +1e9, known exactly at the cut (only a view reading
+         known_at <= as_of sees it); ex S + 8 days, amount NaN (as text), known an hour after
+         the cut; and, when the cut's view sees a dividend within ACTION_DAYS of S, a revision
+         of the latest one to -1e9, known exactly at the cut;
+       - splits: ex S + 2 days, ratio +1e9, known exactly at the cut; ex S + 9 days, ratio NaN
+         (as text), known an hour after the cut;
+    5. raw move flags (B6), raised, kind MOVE_KIND, detail "garbage", each a new version of its
+       (symbol, minute, kind):
+       - on both minutes of step 3 before the cut that aren't available yet, and on the second
+         minute after the cut, known at cut - 1 µs (only a read without the availability rule
+         sees them);
+       - on the cut's bar's last minute, which is available, known exactly at the cut (only a
+         read of known_at <= as_of sees it).
 
     Returns the store and what was written."""
     store = truncated_store(world, cut)
@@ -995,6 +1208,51 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
             random.Random(f"{seed}:{cut.isoformat()}:{i}").shuffle(real)
             minute = tuple(real)
         insert_minute(t, t + timedelta(minutes=1), minute)
+
+    session = decision.bar.session
+
+    def insert_action(table: str, ex_date: date, value: Any, known: datetime) -> None:
+        (version,) = store._conn.execute(
+            f"SELECT COALESCE(MAX(version), 0) + 1 FROM {table}"  # noqa: S608 — fixed names
+            " WHERE symbol = ? AND ex_date = ?",
+            (SYMBOL, ex_date.isoformat()),
+        ).fetchone()
+        store._conn.execute(
+            f"INSERT INTO {table} VALUES (?, ?, ?, ?, ?, ?)",  # noqa: S608 — fixed names
+            (SYMBOL, ex_date.isoformat(), version, value, session.isoformat(), to_us(known)),
+        )
+
+    later = cut + timedelta(hours=1)
+    dividends = [
+        (session + timedelta(days=1), 1e9, cut),
+        (session + timedelta(days=8), "NaN", later),
+    ]
+    seen = store.view(cut, as_of=cut).dividends(
+        SYMBOL, session - ACTION_DAYS, session + ACTION_DAYS, purpose=Purpose.OPERATE
+    )
+    if seen:
+        dividends.append((seen[-1][0], -1e9, cut))
+    splits = [(session + timedelta(days=2), 1e9, cut), (session + timedelta(days=9), "NaN", later)]
+    for table, rows in (("dividends", dividends), ("splits", splits)):
+        for ex_date, value, known in rows:
+            insert_action(table, ex_date, value, known)
+
+    def insert_flag(t: datetime, known: datetime) -> None:
+        (version,) = store._conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM data_flags"
+            " WHERE symbol = ? AND t = ? AND kind = ?",
+            (SYMBOL, to_us(t), MOVE_KIND),
+        ).fetchone()
+        store._conn.execute(
+            "INSERT INTO data_flags VALUES (?, ?, ?, ?, 1, 'garbage', ?)",
+            (SYMBOL, to_us(t), MOVE_KIND, version, to_us(known)),
+        )
+
+    early = cut - timedelta(microseconds=1)
+    flags = [(t, early) for t in (*minutes_unavailable, minutes_after[1])]
+    flags.append((bar.t_close - timedelta(minutes=1), cut))
+    for t, known in flags:
+        insert_flag(t, known)
     return store, Garbage(
         bar.t_open,
         revision_at,
@@ -1006,6 +1264,9 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
         unavailable,
         minutes_unavailable,
         minutes_after,
+        tuple(ex_date for ex_date, _, _ in dividends),
+        tuple(ex_date for ex_date, _, _ in splits),
+        tuple(t for t, _ in flags),
     )
 
 
@@ -1027,12 +1288,16 @@ class Run:
 def run_layers(registry: Registry, source: Source, decisions: Sequence[Decision]) -> Run:
     """Run every layer in order over `decisions`, each given the records of the layers before
     it. ValueError when a layer returns records that aren't one per decision, in order, with
-    its name; an exception a layer raises is caught into `Run.errors`."""
+    its name; an exception a layer raises is caught into `Run.errors`, except
+    NotImplementedError: a stub not yet built (a red step) is no verdict on the layer, so it
+    propagates and the red test reports it as red."""
     records: dict[str, tuple[Record, ...]] = {}
     errors: dict[str, str] = {}
     for layer in registry.layers:
         try:
             result = layer.run(source, decisions, records)
+        except NotImplementedError:
+            raise
         except Exception as exc:
             errors[layer.name] = f"{type(exc).__name__}: {exc}"
             break
@@ -1240,11 +1505,89 @@ def check_truncation(
 
 
 @cache
-def _history() -> tuple[MinuteFrame, BarStore]:
-    minutes = synthetic_days(DATA_FIRST, DATA_LAST, seed=DATA_SEED)
+def _history(spec: WorldSpec = SYNTHETIC) -> tuple[MinuteFrame, BarStore]:
+    """The world's minutes, and an in-memory store holding them and its corporate actions as
+    HISTORY (`WorldSpec`)."""
     store = BarStore.memory()
-    store.ingest_minutes(SYMBOL, minutes, known_at=HISTORY, source="synthetic")
+    if spec.market_db is None:
+        minutes = synthetic_days(spec.data_first, spec.data_last, seed=DATA_SEED)
+        actions = list(SYNTHETIC_ACTIONS)
+        source = "synthetic"
+    else:
+        minutes, actions = _market_db_history(spec, spec.market_db)
+        source = "market.db"
+    store.ingest_minutes(SYMBOL, minutes, known_at=HISTORY, source=source)
+    for table, ex_date, value, declared in actions:
+        if table == "dividends":
+            store.put_dividend(
+                SYMBOL, ex_date=ex_date, amount=value, declared=declared, known_at=HISTORY
+            )
+        else:
+            store.put_split(
+                SYMBOL, ex_date=ex_date, ratio=value, declared=declared, known_at=HISTORY
+            )
     return minutes, store
+
+
+def _read_only(path: Path) -> sqlite3.Connection:
+    """A read-only connection to the market.db at `path`: building a world never writes it."""
+    if not path.is_file():
+        raise FileNotFoundError(f"no market.db at {path}")
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+
+
+def _first_session(day: date) -> date:
+    """`day` when it is a session, else the next session after it."""
+    cal = TradingCalendar.xnys()
+    return day if cal.is_session(day) else cal.next_session(day)
+
+
+def _market_db_history(
+    spec: WorldSpec, path: Path
+) -> tuple[MinuteFrame, list[tuple[str, date, float, date]]]:
+    """The minutes of [spec.data_first, spec.data_last] in the market.db at `path`, read through
+    a PointInTimeView at `spec.horizon` that knows every stored version, and the latest version
+    of each dividend and split whose ex-date lies within ACTION_DAYS of that span, as
+    (table, ex_date, value, declared). ValueError, naming the missing sessions, when a session
+    of the span has no minutes there: the backfill isn't done."""
+    cal = TradingCalendar.xnys()
+    days = cal.sessions(spec.data_first, spec.data_last)
+    conn = _read_only(path)
+    try:
+        view = PointInTimeView(conn, spec.horizon, as_of=KNOWS_ALL)
+        minutes = view.minutes(
+            SYMBOL,
+            cal.session(days[0]).open,
+            cal.session(days[-1]).close,
+            purpose=Purpose.OPERATE,
+        )
+        present = {from_us(int(t)).astimezone(NEW_YORK).date() for t in minutes.t}
+        missing = [day for day in days if day not in present]
+        if missing:
+            raise ValueError(
+                f"{path} lacks {len(missing)} of the {len(days)} sessions from {days[0]} to "
+                f"{days[-1]} (first: {missing[0]}); finish `quant data backfill`"
+            )
+        actions: list[tuple[str, date, float, date]] = []
+        for table, column in (("dividends", "amount"), ("splits", "ratio")):
+            rows = conn.execute(
+                f"SELECT ex_date, {column}, declared FROM {table} a"  # noqa: S608 — fixed names
+                " WHERE symbol = ? AND ex_date >= ? AND ex_date <= ?"
+                f" AND version = (SELECT MAX(x.version) FROM {table} x"
+                " WHERE x.symbol = a.symbol AND x.ex_date = a.ex_date) ORDER BY ex_date",
+                (
+                    SYMBOL,
+                    (spec.data_first - ACTION_DAYS).isoformat(),
+                    (spec.data_last + ACTION_DAYS).isoformat(),
+                ),
+            ).fetchall()
+            actions.extend(
+                (table, date.fromisoformat(ex), float(value), date.fromisoformat(declared))
+                for ex, value, declared in rows
+            )
+        return minutes, actions
+    finally:
+        conn.close()
 
 
 # FeatureStream.snapshot as B3 wrote it: a deep copy of `_state` and nothing more.

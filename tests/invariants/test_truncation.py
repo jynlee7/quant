@@ -4,7 +4,8 @@ Clean code must pass all three variants at every cut, and each of PLAN B5's six 
 must be caught, with the failure naming the layer the leak is in (P3: a harness that can't fail
 is caught). Leaks are planted with monkeypatch or a substitute layer registered in place of the
 clean one, never by editing src/. The fast tier draws 50 cuts on synthetic bars; the full tier
-draws 200. The full tier moves to real FIT bars once B6 brings them (BUILD_LOG open item).
+draws 200 on real FIT bars from var/market.db (B6, PLAN P4), and skips when it is absent. B6's
+actions layer, last in the default registry, is tested in test_truncation_actions.py.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import math
 import sqlite3
 import statistics
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
 import pytest
@@ -41,6 +42,7 @@ from tests.support.truncation import (
     HORIZON,
     LATE_FIT_END,
     MODEL_FIT_END,
+    REAL,
     VIEW_DEPTH,
     FeaturesLayer,
     FilterLayer,
@@ -68,6 +70,10 @@ from tests.support.truncation import (
 SEED = 20160104
 FAST_CUTS = 50  # PLAN P4
 FULL_CUTS = 200
+LAYERS = {"view", "features", "filter", "risk", "actions"}
+# B6 registers its actions layer in the default registry, whose view.flags read is B6's stub:
+# every test that runs the whole default registry is red until B6 is green.
+RED_B6 = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
 # A planted leak shows at any cut after the model starts, so three edges are enough and keep the
 # six leak tests cheap: the model's first decision, the bar after DST ends, a half day's CLOSE.
 LEAK_EDGES = ("model_first", "after_dst", "half_day_close")
@@ -106,6 +112,7 @@ def _where(report: Report) -> set[tuple[datetime, Variant, str, datetime | None,
 # --- clean code ------------------------------------------------------------------------------
 
 
+@RED_B6
 @pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4", "ARCH§13", "ARCH§4.2")
 def test_clean_code_passes_every_variant_at_fifty_cuts() -> None:
     w = world()
@@ -115,21 +122,34 @@ def test_clean_code_passes_every_variant_at_fifty_cuts() -> None:
     report = check_truncation(w, default_registry(w), cuts, seed=SEED)
     assert report.ok, report.explain()
     assert report.cuts == cuts
-    # Every layer was compared, the filter and risk verdicts included, so a pass means something.
-    assert set(report.compared) == {"view", "features", "filter", "risk"}
+    # Every layer was compared, the filter, risk verdicts and actions included, so a pass means
+    # something.
+    assert set(report.compared) == LAYERS
     assert all(count > 0 for count in report.compared.values()), report.compared
 
 
 @pytest.mark.full
-@pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4")
-def test_clean_code_passes_every_variant_at_two_hundred_cuts() -> None:
-    # Synthetic bars until B6 brings real FIT bars (PLAN P4; BUILD_LOG open item).
-    w = world()
+@RED_B6
+@pytest.mark.spec("I1", "T-NL1", "T-NL2", "P4", "ARCH§13")
+def test_clean_code_passes_every_variant_at_two_hundred_cuts_on_real_fit_bars() -> None:
+    # PLAN P4: the full tier runs 200 cuts on real bars, with a fixture model fit on 2016–2017.
+    if REAL.market_db is None or not REAL.market_db.is_file():
+        pytest.skip(
+            f"no market.db at {REAL.market_db}: the full tier's T-NL1 runs on real FIT bars "
+            "(PLAN P4); fill it with `quant data backfill`"
+        )
+    w = world(REAL)
+    # Inside FIT only: DEV stays dark (C11). The model was fit on 2016–2017, before every
+    # decision it serves (T-NL2).
+    assert w.decisions[-1].bar.session <= REAL.data_last < date(2019, 1, 1)
+    assert w.model.fit_start.year == 2016
+    assert w.model.fit_end == REAL.model_fit_end == datetime(2018, 1, 1, tzinfo=UTC)
+    assert w.decisions[0].tau < REAL.model_fit_end < w.edges["model_first"].tau
     cuts = draw_cuts(w, FULL_CUTS, seed=SEED + 1)
     report = check_truncation(w, default_registry(w), cuts, seed=SEED + 1)
     assert report.ok, report.explain()
     assert len(report.cuts) == FULL_CUTS
-    assert set(report.compared) == {"view", "features", "filter", "risk"}
+    assert set(report.compared) == LAYERS
     assert all(count > 0 for count in report.compared.values()), report.compared
 
 
@@ -376,6 +396,7 @@ def _patch_view(monkeypatch: pytest.MonkeyPatch, old: str, new: str) -> None:
         monkeypatch.setattr(view_module, name, sql.replace(old, new))
 
 
+@RED_B6
 @pytest.mark.spec("I1", "T-NL1", "P3", "SPEC§3")
 def test_planted_leak_1_a_centered_moving_average_is_caught_in_features() -> None:
     w = world()
@@ -384,6 +405,7 @@ def test_planted_leak_1_a_centered_moving_average_is_caught_in_features() -> Non
     _assert_caught(report, "features", MISMATCH_OR_ERROR)
 
 
+@RED_B6
 @pytest.mark.spec("I1", "T-NL1", "P3", "SPEC§3")
 def test_planted_leak_2_a_scaler_fit_on_the_full_history_is_caught_in_features() -> None:
     w = world()
@@ -392,6 +414,7 @@ def test_planted_leak_2_a_scaler_fit_on_the_full_history_is_caught_in_features()
     _assert_caught(report, "features", MISMATCH_OR_ERROR)
 
 
+@RED_B6
 @pytest.mark.spec("I1", "I2", "T-NL1", "P3")
 def test_planted_leak_3_a_smoother_in_place_of_the_filter_is_caught_in_filter() -> None:
     w = world()
@@ -408,6 +431,7 @@ def test_planted_leak_3_predict_proba_for_the_filter_is_caught_in_filter() -> No
     _assert_caught(check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED), "filter")
 
 
+@RED_B6
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_planted_leak_4_a_view_using_at_or_before_tau_is_caught_in_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -419,6 +443,7 @@ def test_planted_leak_4_a_view_using_at_or_before_tau_is_caught_in_view(
     assert {f.variant for f in report.failures} == {Variant.GARBAGE}
 
 
+@RED_B6
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_planted_leak_5_availability_from_t_close_is_caught_in_view(
     monkeypatch: pytest.MonkeyPatch,
@@ -430,6 +455,7 @@ def test_planted_leak_5_availability_from_t_close_is_caught_in_view(
     assert {f.variant for f in report.failures} == {Variant.GARBAGE}
 
 
+@RED_B6
 @pytest.mark.spec("T-NL2", "P3")
 def test_planted_leak_6_a_model_fit_past_tau_is_caught_by_provenance() -> None:
     w = world()
@@ -442,6 +468,7 @@ def test_planted_leak_6_a_model_fit_past_tau_is_caught_by_provenance() -> None:
     assert {f.variant for f in report.failures} == set(Variant)
 
 
+@RED_B6
 @pytest.mark.spec("T-NL1", "P3")
 def test_slicing_the_full_run_hides_no_leak() -> None:
     # The full run is computed once over the whole history and sliced per cut. Recomputing it

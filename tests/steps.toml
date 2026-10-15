@@ -30,10 +30,12 @@ covers = [
 [steps.B5]
 covers = ["I1", "I2", "T-NL1", "T-NL2"]
 
-# B6a (settings, the data client, the backfill, the quality report) claims these; B6b adds the
-# ids of the probe, the real backfill and the first model (D4, SPEC§4, ARCH§18's probe items).
+# B6a (settings, the data client, the backfill, the quality report) claims the first two lines;
+# B6b adds the first model on FIT (D4, SPEC§4, ARCH§7.2), the full tier's T-NL1 on real FIT bars
+# (P4, ARCH§13), and the harness's minutes, actions and flags (I1, T-NL1, T-NL2, P3).
 [steps.B6]
 covers = [
     "D1", "D2", "I5", "I6", "C1", "C8", "K6", "SPEC§2", "PLAN§3",
     "ARCH§2", "ARCH§5", "ARCH§6.1", "ARCH§6.2", "ARCH§6.3", "ARCH§18",
+    "D4", "SPEC§4", "C11", "A2", "I1", "T-NL1", "T-NL2", "P3", "P4", "ARCH§7.2", "ARCH§13",
 ]
