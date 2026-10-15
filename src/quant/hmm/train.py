@@ -477,7 +477,17 @@ def seed_params(previous: HmmModel, scaler: ScalerParams) -> GaussianParams:
     exactly those expressions, so each covariance stays exactly symmetric and a diag model's
     stays diagonal. Raises ModelError when `scaler.columns` aren't the previous model's, or the
     result isn't a valid GaussianParams."""
-    raise NotImplementedError("B7a: seed_params")
+    if previous.scaler.columns != scaler.columns:
+        raise ModelError("seed feature columns differ")
+    p, old = previous.params, previous.scaler
+    ratio = old.std / scaler.std
+    return GaussianParams(
+        p.covariance_type,
+        p.startprob.copy(),
+        p.transmat.copy(),
+        ((p.means * old.std + old.mean) - scaler.mean) / scaler.std,
+        p.covars * np.outer(ratio, ratio),
+    )
 
 
 def train_candidate(
@@ -500,8 +510,14 @@ def train_candidate(
     (a sanity reject), or when `provenance` has no canonical JSON form; and, with `previous`,
     when its K or covariance type isn't `candidate`'s, its feature columns or feature-config
     hash aren't the data's, or SEEDED_RESTART >= config.n_restarts."""
-    if previous is not None:
-        raise NotImplementedError("B7a: the seeded restart")
+    if previous is not None and (
+        previous.params.n_states != candidate.n_states
+        or previous.params.covariance_type != candidate.covariance_type
+        or previous.scaler.columns != data.matrix.columns
+        or previous.feature_config_hash != data.feature_config_hash
+        or config.n_restarts <= SEEDED_RESTART
+    ):
+        raise ModelError("previous model is incompatible with refit")
     scaler, split = _full_scaler(data), _split(data, config)
     rows = data.matrix.values
     train_rows = rows[~split.block]
@@ -509,7 +525,13 @@ def train_candidate(
         _required(fit)
         for fit in _fit_blocks(
             (
-                _Block(rows, scaler, candidate, "full"),
+                _Block(
+                    rows,
+                    scaler,
+                    candidate,
+                    "full",
+                    seed_params(previous, scaler) if previous else None,
+                ),
                 _Block(train_rows, split.scaler, candidate, "validation"),
             ),
             data.matrix.columns,
@@ -520,7 +542,9 @@ def train_candidate(
     with threadpool_limits(limits=1):
         score = _validation_score(data, split, validation, config)
         report = _validation_report(score, validation, split, data, config)
-        return _build_result(data, scaler, full, thresholds, config, provenance, report, None, None)
+        return _build_result(
+            data, scaler, full, thresholds, config, provenance, report, None, None, previous
+        )
 
 
 def select_and_train(
@@ -594,6 +618,7 @@ class _Block:
     scaler: ScalerParams
     candidate: Candidate
     fit: FitName
+    seed: GaussianParams | None = None
 
 
 @dataclass(frozen=True)
@@ -626,6 +651,7 @@ def _restart(block: _Block, config: TrainConfig, index: int) -> _RestartResult |
     try:
         with threadpool_limits(limits=1):
             z = block.scaler.standardize(block.rows, columns=block.scaler.columns)
+            seeded = block.seed if index == SEEDED_RESTART else None
             estimator = GaussianHMM(
                 n_components=block.candidate.n_states,
                 covariance_type=block.candidate.covariance_type,
@@ -634,9 +660,18 @@ def _restart(block: _Block, config: TrainConfig, index: int) -> _RestartResult |
                 tol=config.tol,
                 random_state=seed,
                 implementation="log",
-                init_params="stmc",
+                init_params="" if seeded is not None else "stmc",
                 params="stmc",
             )
+            if seeded is not None:
+                estimator.startprob_ = seeded.startprob.copy()
+                estimator.transmat_ = seeded.transmat.copy()
+                estimator.means_ = seeded.means.copy()
+                estimator.covars_ = (
+                    np.diagonal(seeded.covars, axis1=1, axis2=2).copy()
+                    if seeded.covariance_type == "diag"
+                    else seeded.covars.copy()
+                )
             estimator.fit(z)
             covariance = np.asarray(estimator.covars_, dtype=np.float64)
             params = GaussianParams(
@@ -868,6 +903,7 @@ def _build_result(
     validation_report: dict[str, Any],
     selection: Selection | None,
     selection_report: dict[str, Any] | None,
+    previous: HmmModel | None = None,
 ) -> TrainResult:
     with threadpool_limits(limits=1):
         sanity = selection_rules.sanity_check(fit.params, fit.trace.state_probs)
@@ -889,6 +925,9 @@ def _build_result(
         "loglik": fit.loglik,
         "bic": selection_rules.bic(fit.loglik, p, len(data.matrix)),
         "restarts": {
+            "seeded": {"index": SEEDED_RESTART, "previous": previous.artifact_hash()}
+            if previous
+            else None,
             "near_best": fit.choice.near_best,
             "stable": fit.choice.stable,
             "iterations": fit.iterations,

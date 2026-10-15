@@ -28,8 +28,15 @@ This module never imports hmmlearn or eval (K3): it reads stored parameters only
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import math
+import re
+from dataclasses import dataclass, replace
 
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import linear_sum_assignment
+
+from quant.core.errors import ModelError
 from quant.data.frames import Floats
 from quant.hmm.labels import LabelTable
 from quant.hmm.model import GaussianParams, HmmModel, ScalerParams
@@ -58,17 +65,32 @@ class StateMatch:
     inherited: LabelTable
 
     def __post_init__(self) -> None:
-        raise NotImplementedError("B7a: StateMatch checks")
+        k = len(self.old_of_new)
+        if (
+            not isinstance(self.old_of_new, tuple)
+            or sorted(self.old_of_new) != list(range(k))
+            or any(type(i) is not int for i in self.old_of_new)
+            or not isinstance(self.divergence, np.ndarray)
+            or self.divergence.dtype != np.float64
+            or self.divergence.shape != (k, k)
+            or not np.isfinite(self.divergence).all()
+            or len(self.derived.states) != k
+            or len(self.inherited.states) != k
+        ):
+            raise ModelError("invalid state match")
+        matrix = self.divergence.copy()
+        matrix.flags.writeable = False
+        object.__setattr__(self, "divergence", matrix)
 
     @property
     def new_of_old(self) -> tuple[int, ...]:
         """The inverse permutation: old state i is played by new state `new_of_old[i]`."""
-        raise NotImplementedError("B7a: StateMatch.new_of_old")
+        return tuple(self.old_of_new.index(i) for i in range(len(self.old_of_new)))
 
     @property
     def cost(self) -> float:
         """The matched pairs' total divergence, math.fsum of divergence[old_of_new[j], j]."""
-        raise NotImplementedError("B7a: StateMatch.cost")
+        return math.fsum(self.divergence[o, j] for j, o in enumerate(self.old_of_new))
 
 
 def raw_gaussians(params: GaussianParams, scaler: ScalerParams) -> tuple[Floats, Floats]:
@@ -76,7 +98,9 @@ def raw_gaussians(params: GaussianParams, scaler: ScalerParams) -> tuple[Floats,
     * scaler.std + scaler.mean` and `params.covars * numpy.outer(scaler.std, scaler.std)`,
     exactly those expressions (module docstring). ModelError when the scaler's width isn't the
     model's."""
-    raise NotImplementedError("B7a: raw_gaussians")
+    if len(scaler.columns) != params.n_features:
+        raise ModelError("scaler width differs")
+    return params.means * scaler.std + scaler.mean, params.covars * np.outer(scaler.std, scaler.std)
 
 
 def symmetric_kl(mean_a: Floats, cov_a: Floats, mean_b: Floats, cov_b: Floats) -> float:
@@ -84,13 +108,49 @@ def symmetric_kl(mean_a: Floats, cov_a: Floats, mean_b: Floats, cov_b: Floats) -
     docstring). The inverses come from Cholesky factors (scipy.linalg). Raises ModelError for
     mismatched shapes, a value that isn't finite, a covariance that isn't positive definite,
     or a result that isn't finite."""
-    raise NotImplementedError("B7a: symmetric_kl")
+    d = mean_a.size
+    if (
+        mean_a.shape != (d,)
+        or mean_b.shape != (d,)
+        or cov_a.shape != (d, d)
+        or cov_b.shape != (d, d)
+        or not all(np.isfinite(x).all() for x in (mean_a, mean_b, cov_a, cov_b))
+        or not np.array_equal(cov_a, cov_a.T)
+        or not np.array_equal(cov_b, cov_b.T)
+    ):
+        raise ModelError("invalid Gaussian shapes or values")
+    try:
+        ia = cho_solve(cho_factor(cov_a), np.eye(d))
+        ib = cho_solve(cho_factor(cov_b), np.eye(d))
+    except ValueError as exc:
+        raise ModelError("covariance is not positive definite") from exc
+    delta = mean_a - mean_b
+    value = float(
+        0.5 * (np.trace(ib @ cov_a) + np.trace(ia @ cov_b) + delta @ (ia + ib) @ delta) - d
+    )
+    if not math.isfinite(value):
+        raise ModelError("nonfinite divergence")
+    return max(0.0, value)
 
 
 def divergence_matrix(old: HmmModel, new: HmmModel) -> Floats:
     """(K, K): entry [i, j] is `symmetric_kl` between old state i and new state j, both in raw
     units (`raw_gaussians` with each model's own scaler). Raises as `match_states` does."""
-    raise NotImplementedError("B7a: divergence_matrix")
+    if (
+        old.params.n_states != new.params.n_states
+        or old.scaler.columns != new.scaler.columns
+        or old.feature_config_hash != new.feature_config_hash
+    ):
+        raise ModelError("models disagree on states or features")
+    om, oc = raw_gaussians(old.params, old.scaler)
+    nm, nc = raw_gaussians(new.params, new.scaler)
+    return np.array(
+        [
+            [symmetric_kl(a, ac, b, bc) for b, bc in zip(nm, nc, strict=True)]
+            for a, ac in zip(om, oc, strict=True)
+        ],
+        dtype=np.float64,
+    )
 
 
 def match_states(old: HmmModel, new: HmmModel) -> StateMatch:
@@ -102,7 +162,17 @@ def match_states(old: HmmModel, new: HmmModel) -> StateMatch:
     A model whose states are a permutation of `old`'s Gaussians in raw units (whatever its
     scaler) is matched back exactly, labels included. Raises ModelError when the two models
     differ in K, in feature columns or in feature-config hash."""
-    raise NotImplementedError("B7a: match_states")
+    matrix = divergence_matrix(old, new)
+    rows, cols = linear_sum_assignment(matrix)
+    pairs = tuple(int(rows[np.flatnonzero(cols == j)[0]]) for j in range(len(cols)))
+    inherited = LabelTable(
+        thresholds=new.labels.thresholds,
+        states=tuple(
+            state.model_copy(update={"label": old.labels.label_of(pairs[j])})
+            for j, state in enumerate(new.labels.states)
+        ),
+    )
+    return StateMatch(pairs, matrix, new.labels, inherited)
 
 
 def inherit_labels(new: HmmModel, match: StateMatch, *, previous: str) -> HmmModel:
@@ -114,4 +184,19 @@ def inherit_labels(new: HmmModel, match: StateMatch, *, previous: str) -> HmmMod
     the rule-derived one) is unchanged. Raises ModelError when `match.derived` isn't
     `new.labels` (equal by value), `info` already has "match", or `previous` isn't 64
     lowercase hex characters."""
-    raise NotImplementedError("B7a: inherit_labels")
+    if (
+        match.derived != new.labels
+        or "match" in new.training.info
+        or re.fullmatch(r"[0-9a-f]{64}", previous) is None
+    ):
+        raise ModelError("invalid inherited label provenance")
+    info = dict(new.training.info)
+    info["match"] = {
+        "previous": previous,
+        "old_of_new": match.old_of_new,
+        "divergence": match.divergence.tolist(),
+        "derived": [s.label.value for s in match.derived.states],
+    }
+    return replace(
+        new, labels=match.inherited, training=new.training.model_copy(update={"info": info})
+    )

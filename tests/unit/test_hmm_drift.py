@@ -28,7 +28,6 @@ from tests.support.hmm import (
     label_table,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 LABELS = [Label.CALM_UP, Label.STRESS]
 
 # The old model: two states over two features, identity scaler (so standardized = raw).
@@ -103,7 +102,6 @@ def _down(x: float) -> float:
     return float(np.nextafter(x, -math.inf))
 
 
-@RED
 @pytest.mark.spec("D6", "SPEC§5")
 def test_r1_drift_thresholds_are_spec_five() -> None:
     import pydantic
@@ -118,7 +116,6 @@ def test_r1_drift_thresholds_are_spec_five() -> None:
             DriftThresholds(transition=bad, duration=0.5, mean=0.5)
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "D6")
 def test_an_unchanged_refit_passes() -> None:
     report = _drift(two_state())
@@ -151,7 +148,6 @@ EDGES = {
 }
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "D6")
 @pytest.mark.parametrize("rule", sorted(EDGES))
 def test_each_refit_drift_rule_fires_just_past_its_threshold_and_not_at_it(rule: str) -> None:
@@ -164,14 +160,12 @@ def test_each_refit_drift_rule_fires_just_past_its_threshold_and_not_at_it(rule:
     assert all(f.new_state in (0, 1) for f in report.findings)
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "D6")
 def test_a_duration_that_becomes_infinite_is_drift() -> None:
     report = _drift(two_state([[0.82, 0.18], [0.0, 1.0]]))
     assert "duration" in {f.rule for f in report.findings}
 
 
-@RED
 @pytest.mark.spec("SPEC§5")
 def test_a_label_that_differs_from_the_one_it_inherited_is_drift() -> None:
     assert _drift(two_state(), identity_match()).passed
@@ -179,7 +173,6 @@ def test_a_label_that_differs_from_the_one_it_inherited_is_drift() -> None:
     assert [(f.rule, f.new_state) for f in report.findings] == [("label", 1)]
 
 
-@RED
 @pytest.mark.spec("SPEC§5")
 def test_drift_compares_matched_states_not_indices() -> None:
     from quant.hmm.match import StateMatch
@@ -196,7 +189,6 @@ def test_drift_compares_matched_states_not_indices() -> None:
     assert not _drift(swapped).passed  # paired by index, everything moved
 
 
-@RED
 @pytest.mark.spec("SPEC§5")
 def test_mean_drift_is_measured_in_the_previous_models_standardized_units() -> None:
     old_scaler = ScalerParams(identity_columns(2), _f([0.0, 0.0]), _f([2.0, 1.0]))
@@ -228,7 +220,6 @@ def _monitor(threshold: float) -> Any:
     return LiveDriftMonitor(two_state(training=_record(threshold)))
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.5")
 def test_the_live_monitor_reads_full_windows_only() -> None:
     monitor = _monitor(-1.0)
@@ -247,7 +238,6 @@ def test_the_live_monitor_reads_full_windows_only() -> None:
     assert not reading.fired
 
 
-@RED
 @pytest.mark.spec("ARCH§7.5")
 def test_the_live_mean_is_an_exactly_rounded_sum_over_35() -> None:
     values = [1e16, 1.0, -1e16] + [0.0] * 32  # a naive running sum loses the 1.0
@@ -259,7 +249,6 @@ def test_the_live_mean_is_an_exactly_rounded_sum_over_35() -> None:
     assert reading.mean == expected
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.5")
 def test_the_live_monitor_fires_strictly_below_its_threshold() -> None:
     values = [-3.0 + 0.01 * i for i in range(35)]
@@ -273,7 +262,6 @@ def test_the_live_monitor_fires_strictly_below_its_threshold() -> None:
     assert above_reading.fired
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.5", "SPEC§6")
 def test_a_model_swap_resets_the_window() -> None:
     first = two_state(training=_record(-1.0))
@@ -297,7 +285,6 @@ def test_a_model_swap_resets_the_window() -> None:
     )
 
 
-@RED
 @pytest.mark.spec("ARCH§7.5")
 @pytest.mark.parametrize("fault", ["no validation", "window", "threshold"])
 def test_the_live_monitor_needs_the_models_drift_baseline(fault: str) -> None:
@@ -313,7 +300,6 @@ def test_the_live_monitor_needs_the_models_drift_baseline(fault: str) -> None:
         LiveDriftMonitor(two_state(training=record))
 
 
-@RED
 @pytest.mark.spec("ARCH§7.5")
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
 def test_the_live_monitor_refuses_a_loglik_that_isnt_finite(value: float) -> None:

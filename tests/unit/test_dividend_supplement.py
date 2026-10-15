@@ -37,7 +37,6 @@ from tests.support.bars import SYMBOL, synthetic_days
 ROOT = Path(__file__).resolve().parents[2]
 COMMITTED = ROOT / SUPPLEMENT_PATH
 OPERATE = Purpose.OPERATE
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 
 # The supplement row in this span is 2016-03-18; the backfill covers the week.
 FIRST, LAST = date(2016, 3, 14), date(2016, 3, 18)
@@ -76,7 +75,6 @@ def dividends_known(store: BarStore, at: datetime) -> list[tuple[date, float]]:
 # --- The committed file -----------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2", "SPEC§2")
 def test_the_committed_supplement_holds_exactly_state_streets_three_rows() -> None:
     loaded = load_dividend_supplement(COMMITTED)
@@ -102,7 +100,6 @@ def test_the_committed_supplement_holds_exactly_state_streets_three_rows() -> No
     )
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2")
 def test_supplement_rows_are_dividends_with_the_ex_date_standing_in_for_the_declaration() -> None:
     actions = load_dividend_supplement(COMMITTED).actions
@@ -164,7 +161,6 @@ def _bad_documents() -> dict[str, Any]:
     }
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2")
 @pytest.mark.parametrize("fault", sorted(_bad_documents()))
 def test_a_malformed_supplement_is_refused(fault: str, tmp_path: Path) -> None:
@@ -174,7 +170,6 @@ def test_a_malformed_supplement_is_refused(fault: str, tmp_path: Path) -> None:
         load_dividend_supplement(path)
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2")
 def test_a_missing_supplement_file_is_refused(tmp_path: Path) -> None:
     with pytest.raises(DataError):
@@ -184,7 +179,6 @@ def test_a_missing_supplement_file_is_refused(tmp_path: Path) -> None:
 # --- The backfill applies it ------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2", "SPEC§2")
 def test_the_backfill_stores_the_supplement_after_the_feed_under_the_same_stamp(
     minutes: Any,
@@ -214,7 +208,6 @@ def test_the_backfill_stores_the_supplement_after_the_feed_under_the_same_stamp(
     assert (EX, AMOUNT) in dividends_known(store, later)
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2")
 def test_a_supplement_row_that_differs_from_the_feeds_is_a_conflict_not_an_overwrite(
     minutes: Any,
@@ -237,7 +230,6 @@ def test_a_supplement_row_that_differs_from_the_feeds_is_a_conflict_not_an_overw
     assert dividends_known(store, AFTER) == [(EX, 1.0)]  # the feed's row stands
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2")
 def test_a_supplement_row_equal_to_the_feeds_changes_nothing(minutes: Any) -> None:
     feed = CorporateActions((Dividend(SYMBOL, EX, AMOUNT, EX, False),), ())
@@ -255,7 +247,6 @@ def test_a_supplement_row_equal_to_the_feeds_changes_nothing(minutes: Any) -> No
     assert dividends_known(store, AFTER) == [(EX, AMOUNT)]
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2")
 def test_supplement_rows_of_another_symbol_are_left_out(minutes: Any) -> None:
     store = BarStore.memory()
@@ -272,7 +263,6 @@ def test_supplement_rows_of_another_symbol_are_left_out(minutes: Any) -> None:
     assert dividends_known(store, AFTER) == []
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2", "ARCH§6.1")
 def test_the_backfill_command_stores_the_committed_supplement(
     minutes: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -307,7 +297,6 @@ def test_the_backfill_command_stores_the_committed_supplement(
         store.close()
 
 
-@RED
 @pytest.mark.spec("ARCH§6.2")
 def test_the_backfill_command_refuses_a_malformed_supplement_before_opening_the_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

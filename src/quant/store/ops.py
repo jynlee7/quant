@@ -51,16 +51,22 @@ store (K6).
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, cast
+
+import structlog
 
 from quant.core.calendar import TradingCalendar
-from quant.core.clock import Clock
-from quant.store.sqlite import Migration
+from quant.core.canonical import canonical_dumps, canonical_loads
+from quant.core.clock import Clock, ensure_utc
+from quant.core.epoch import from_us, to_us
+from quant.core.errors import DataError
+from quant.store.sqlite import Migration, connect, migrate, transaction
 
 PointerKind = Literal["model", "calibration", "release"]
 POINTER_KINDS: Final[tuple[PointerKind, ...]] = ("model", "calibration", "release")
@@ -188,20 +194,22 @@ class OpsStore:
     def __init__(self, conn: sqlite3.Connection, *, clock: Clock) -> None:
         """Wrap an open connection and apply MIGRATIONS (`quant.store.sqlite.migrate`, named
         DATABASE). Every stamp comes from `clock`."""
-        raise NotImplementedError("B7a: OpsStore")
+        self._conn = conn
+        self._clock = clock
+        migrate(conn, MIGRATIONS, name=DATABASE)
 
     @classmethod
     def open(cls, path: Path, *, clock: Clock) -> OpsStore:
         """The store at `path`, created if missing: `connect(path, synchronous="FULL")`."""
-        raise NotImplementedError("B7a: OpsStore.open")
+        return cls(connect(path, synchronous="FULL"), clock=clock)
 
     @classmethod
     def memory(cls, *, clock: Clock) -> OpsStore:
         """An in-memory store, for tests and backtests."""
-        raise NotImplementedError("B7a: OpsStore.memory")
+        return cls(connect(":memory:", synchronous="FULL"), clock=clock)
 
     def close(self) -> None:
-        raise NotImplementedError("B7a: OpsStore.close")
+        self._conn.close()
 
     # --- pointers -------------------------------------------------------------------------
 
@@ -217,7 +225,10 @@ class OpsStore:
         (XNYS when None), the stamp being this write's `recorded_at`. Raises DataError for a
         kind outside POINTER_KINDS, an artifact that isn't 64 lowercase hex characters, or an
         empty reason."""
-        raise NotImplementedError("B7a: OpsStore.activate")
+        self._validate_pointer(kind, artifact, reason)
+        with transaction(self._conn):
+            stamp = self._stamp()
+            return self._pointer(kind, artifact, reason, stamp, calendar)
 
     def rollback(
         self,
@@ -231,17 +242,42 @@ class OpsStore:
         at the next open after the recording, as `activate` (C7). Raises DataError, as
         `activate` does, and when `artifact` never appeared in `kind`'s history or is the
         artifact of its latest row (there is nothing to roll back to)."""
-        raise NotImplementedError("B7a: OpsStore.rollback")
+        self._validate_pointer(kind, artifact, reason)
+        with transaction(self._conn):
+            history = self.pointers(kind)
+            if (
+                not history
+                or history[-1].artifact == artifact
+                or not any(p.artifact == artifact for p in history)
+            ):
+                raise DataError("rollback requires an older artifact in this pointer history")
+            return self._pointer(kind, artifact, reason, self._stamp(), calendar)
 
     def pointers(self, kind: PointerKind) -> tuple[Pointer, ...]:
         """`kind`'s whole history in `seq` order. DataError for an unknown kind."""
-        raise NotImplementedError("B7a: OpsStore.pointers")
+        self._kind(kind)
+        return tuple(
+            Pointer(r[0], r[1], r[2], from_us(r[3]), from_us(r[4]), r[5])
+            for r in self._conn.execute(
+                "SELECT * FROM pointers WHERE kind = ? ORDER BY seq", (kind,)
+            )
+        )
 
     def current(self, kind: PointerKind, at: datetime) -> Pointer | None:
         """The pointer of `kind` governing at `at`: the highest-`seq` row with `effective_at <=
         at`, None before the first takes effect. ClockError for a naive `at`, DataError for an
         unknown kind."""
-        raise NotImplementedError("B7a: OpsStore.current")
+        self._kind(kind)
+        instant = to_us(at)
+        row = self._conn.execute(
+            "SELECT * FROM pointers WHERE kind = ? AND effective_at <= ? ORDER BY seq DESC LIMIT 1",
+            (kind, instant),
+        ).fetchone()
+        return (
+            None
+            if row is None
+            else Pointer(row[0], row[1], row[2], from_us(row[3]), from_us(row[4]), row[5])
+        )
 
     # --- refits and the freeze ------------------------------------------------------------
 
@@ -264,29 +300,155 @@ class OpsStore:
         `artifact` isn't 64 lowercase hex characters; `artifact` is None for ACTIVATED or
         FROZEN, or given for REJECTED; `reasons` is empty for FROZEN or REJECTED, or not empty
         for ACTIVATED, or holds an empty string. ClockError for a naive `at` or `cutoff`."""
-        raise NotImplementedError("B7a: OpsStore.record_refit")
+        at, cutoff = ensure_utc(at), ensure_utc(cutoff)
+        self._hash(previous)
+        if artifact is not None:
+            self._hash(artifact)
+        if (
+            not isinstance(outcome, RefitOutcomeKind)
+            or cutoff > at
+            or (artifact is None) != (outcome is RefitOutcomeKind.REJECTED)
+            or (not reasons) != (outcome is RefitOutcomeKind.ACTIVATED)
+            or any(not isinstance(r, str) or not r.strip() for r in reasons)
+        ):
+            raise DataError("invalid refit outcome, cutoff, artifact or reasons")
+        with transaction(self._conn):
+            stamp = self._stamp()
+            effective = None
+            detail = f"refit at {at.isoformat()}"
+            if outcome is RefitOutcomeKind.ACTIVATED:
+                pointer = self._pointer("model", cast(str, artifact), detail, stamp, calendar)
+                effective = pointer.effective_at
+                if self.frozen(effective):
+                    self._freeze(False, UnfreezeCause.REFIT_PASSED.value, detail, effective, stamp)
+            elif outcome is RefitOutcomeKind.FROZEN:
+                self._freeze(True, FreezeCause.REFIT_DRIFT.value, "; ".join(reasons), stamp, stamp)
+            cursor = self._conn.execute(
+                "INSERT INTO refit_events (at, cutoff, outcome, artifact, previous, reasons, effective_at, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    to_us(at),
+                    to_us(cutoff),
+                    outcome.value,
+                    artifact,
+                    previous,
+                    canonical_dumps(reasons),
+                    None if effective is None else to_us(effective),
+                    to_us(stamp),
+                ),
+            )
+            return RefitEvent(
+                cast(int, cursor.lastrowid),
+                at,
+                cutoff,
+                outcome,
+                artifact,
+                previous,
+                reasons,
+                effective,
+                stamp,
+            )
 
     def refit_events(self) -> tuple[RefitEvent, ...]:
         """Every refit event, in `seq` order."""
-        raise NotImplementedError("B7a: OpsStore.refit_events")
+        return tuple(
+            RefitEvent(
+                r[0],
+                from_us(r[1]),
+                from_us(r[2]),
+                RefitOutcomeKind(r[3]),
+                r[4],
+                r[5],
+                tuple(canonical_loads(r[6])),
+                None if r[7] is None else from_us(r[7]),
+                from_us(r[8]),
+            )
+            for r in self._conn.execute("SELECT * FROM refit_events ORDER BY seq")
+        )
 
     def record_freeze(self, cause: FreezeCause, detail: str) -> FreezeEvent:
         """Freeze entries from this write's stamp on (`effective_at` = `recorded_at`). DataError
         for an empty detail."""
-        raise NotImplementedError("B7a: OpsStore.record_freeze")
+        if not isinstance(cause, FreezeCause) or not isinstance(detail, str) or not detail.strip():
+            raise DataError("freeze requires a cause and detail")
+        with transaction(self._conn):
+            stamp = self._stamp()
+            return self._freeze(True, cause.value, detail, stamp, stamp)
 
     def acknowledge_drift(self, note: str) -> FreezeEvent:
         """The manual unfreeze (spec §5): an unfreeze event, UnfreezeCause.MANUAL_ACK, detail
         `note`, effective at this write's stamp, and a structlog warning "drift acknowledged"
         with `note` and `seq`. DataError, writing nothing, for an empty note or when entries
         aren't frozen at the stamp (there is nothing to acknowledge)."""
-        raise NotImplementedError("B7a: OpsStore.acknowledge_drift")
+        if not isinstance(note, str) or not note.strip():
+            raise DataError("acknowledgement requires a note")
+        with transaction(self._conn):
+            stamp = self._stamp()
+            if not self.frozen(stamp):
+                raise DataError("entries are not frozen")
+            event = self._freeze(False, UnfreezeCause.MANUAL_ACK.value, note, stamp, stamp)
+        structlog.get_logger().warning("drift acknowledged", note=note, seq=event.seq)
+        return event
 
     def freeze_events(self) -> tuple[FreezeEvent, ...]:
         """Every freeze and unfreeze event, in `seq` order."""
-        raise NotImplementedError("B7a: OpsStore.freeze_events")
+        return tuple(
+            FreezeEvent(r[0], bool(r[1]), r[2], r[3], from_us(r[4]), from_us(r[5]))
+            for r in self._conn.execute("SELECT * FROM freeze_events ORDER BY seq")
+        )
 
     def frozen(self, at: datetime) -> bool:
         """Whether new entries are frozen at `at` (module docstring: the last event, in `seq`
         order, among those with `effective_at <= at`). ClockError for a naive `at`."""
-        raise NotImplementedError("B7a: OpsStore.frozen")
+        row = self._conn.execute(
+            "SELECT frozen FROM freeze_events WHERE effective_at <= ? ORDER BY seq DESC LIMIT 1",
+            (to_us(at),),
+        ).fetchone()
+        return bool(row[0]) if row is not None else False
+
+    @staticmethod
+    def _kind(kind: PointerKind) -> None:
+        if kind not in POINTER_KINDS:
+            raise DataError("unknown pointer kind")
+
+    @staticmethod
+    def _hash(artifact: str) -> None:
+        if not isinstance(artifact, str) or re.fullmatch(r"[0-9a-f]{64}", artifact) is None:
+            raise DataError("artifact must be a lowercase SHA-256")
+
+    def _validate_pointer(self, kind: PointerKind, artifact: str, reason: str) -> None:
+        self._kind(kind)
+        self._hash(artifact)
+        if not isinstance(reason, str) or not reason.strip():
+            raise DataError("pointer requires a reason")
+
+    def _stamp(self) -> datetime:
+        # Called under BEGIN IMMEDIATE: also sees stamps written by other connections.
+        row = self._conn.execute(
+            "SELECT MAX(recorded_at) FROM (SELECT recorded_at FROM pointers UNION ALL SELECT recorded_at FROM refit_events UNION ALL SELECT recorded_at FROM freeze_events)"
+        ).fetchone()
+        now = to_us(self._clock.now())
+        return from_us(max(now, row[0]) if row[0] is not None else now)
+
+    def _pointer(
+        self,
+        kind: PointerKind,
+        artifact: str,
+        reason: str,
+        stamp: datetime,
+        calendar: TradingCalendar | None,
+    ) -> Pointer:
+        effective = (calendar or TradingCalendar.xnys()).next_open(stamp)
+        cursor = self._conn.execute(
+            "INSERT INTO pointers (kind, artifact, effective_at, recorded_at, reason) VALUES (?, ?, ?, ?, ?)",
+            (kind, artifact, to_us(effective), to_us(stamp), reason),
+        )
+        return Pointer(cast(int, cursor.lastrowid), kind, artifact, effective, stamp, reason)
+
+    def _freeze(
+        self, frozen: bool, cause: str, detail: str, effective: datetime, stamp: datetime
+    ) -> FreezeEvent:
+        cursor = self._conn.execute(
+            "INSERT INTO freeze_events (frozen, cause, detail, effective_at, recorded_at) VALUES (?, ?, ?, ?, ?)",
+            (int(frozen), cause, detail, to_us(effective), to_us(stamp)),
+        )
+        return FreezeEvent(cast(int, cursor.lastrowid), frozen, cause, detail, effective, stamp)

@@ -37,22 +37,31 @@ The calibration artifact a pass also builds (ARCHITECTURE §7.3 step 5) is B7b's
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import UTC, datetime, time, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
-from quant.core.calendar import TradingCalendar
+import numpy as np
+import structlog
+
+from quant.core.calendar import NEW_YORK, TradingCalendar
+from quant.core.clock import ensure_utc
+from quant.core.epoch import to_us
+from quant.core.errors import ModelError
 from quant.data.market_db import BarStore
-from quant.data.policy import DataPolicy
+from quant.data.policy import FIT_START, DataPolicy, Purpose
 from quant.features.menu import FeatureConfig
-from quant.hmm.drift import DriftReport, DriftThresholds
+from quant.features.stream import compute_features
+from quant.hmm.drift import DriftReport, DriftThresholds, refit_drift
 from quant.hmm.labels import LabelThresholds
-from quant.hmm.match import StateMatch
-from quant.hmm.model import HmmModel
-from quant.hmm.select import SanityReport
-from quant.hmm.train import TrainConfig, TrainingData, train_candidate  # noqa: F401 (run_refit's)
+from quant.hmm.match import StateMatch, inherit_labels, match_states
+from quant.hmm.model import HmmModel, save_model
+from quant.hmm.select import Candidate, SanityReport
+from quant.hmm.train import TrainConfig, TrainingData, train_candidate
 from quant.store.ops import OpsStore, RefitEvent, RefitOutcomeKind
 
 # Spec §5: a refit every 30 calendar days.
@@ -69,14 +78,19 @@ def refit_cutoff(at: datetime) -> datetime:
     """The refit's data cutoff, in UTC: CUTOFF_ET on `at`'s New York date when `at` is at or
     after it, else CUTOFF_ET on the day before (module docstring, step 2). ClockError for a
     naive `at`."""
-    raise NotImplementedError("B7a: refit_cutoff")
+    local = ensure_utc(at).astimezone(NEW_YORK)
+    cutoff = datetime.combine(local.date(), CUTOFF_ET, tzinfo=NEW_YORK)
+    if local < cutoff:
+        cutoff -= timedelta(days=1)
+    return cutoff.astimezone(UTC)
 
 
 def refit_due(current: HmmModel, at: datetime) -> bool:
     """Whether a refit is due at `at` under the active model `current` (module docstring, step
     1): `refit_cutoff(at)`'s New York date minus `current`'s last data day (the New York date
     of `current.fit_end - 1 µs`) is at least REFIT_DAYS days. ClockError for a naive `at`."""
-    raise NotImplementedError("B7a: refit_due")
+    last = (current.fit_end - timedelta(microseconds=1)).astimezone(NEW_YORK).date()
+    return (refit_cutoff(at).astimezone(NEW_YORK).date() - last).days >= REFIT_DAYS
 
 
 def refit_data(
@@ -100,7 +114,26 @@ def refit_data(
     session known at or after it never changes the rows. Raises ModelError (from TrainingData)
     when fewer than two warm rows remain, ClockError for a naive time, and ModelError when
     start >= cutoff."""
-    raise NotImplementedError("B7a: refit_data")
+    start, cutoff = ensure_utc(start), ensure_utc(cutoff)
+    if start >= cutoff:
+        raise ModelError("refit window must have positive length")
+    origin = datetime.combine(FIT_START, time(), tzinfo=NEW_YORK).astimezone(UTC)
+    bars = store.view(cutoff, as_of=cutoff, policy=policy).hourly(
+        symbol, purpose=Purpose.OPERATE, since=origin
+    )
+    matrix = compute_features(bars, features).window(start, cutoff)
+    by_open = {
+        to_us(bar.t_open): (math.log(bar.close / previous.close), bar.session.toordinal())
+        for previous, bar in pairwise(bar for bar in bars if bar.complete)
+    }
+    return TrainingData(
+        matrix,
+        np.array([by_open[int(t)][0] for t in matrix.t_open], dtype=np.float64),
+        np.array([by_open[int(t)][1] for t in matrix.t_open], dtype=np.int64),
+        start,
+        cutoff,
+        features.config_hash(),
+    )
 
 
 @dataclass(frozen=True, eq=False)
@@ -163,7 +196,71 @@ def run_refit(
     Training goes through this module's `train_candidate` name (`train_candidate(data,
     Candidate(K, covariance type of current), thresholds=..., config=..., provenance=...,
     workers=..., previous=current)`), which the tests replace to plant a sanity reject."""
-    raise NotImplementedError("B7a: run_refit")
+    at = ensure_utc(at)
+    previous = current.artifact_hash()
+    pointer = ops.current("model", at)
+    if (
+        data.fit_start != current.fit_start
+        or data.fit_end <= current.fit_end
+        or data.fit_end > at
+        or data.matrix.columns != current.scaler.columns
+        or data.feature_config_hash != current.feature_config_hash
+        or pointer is None
+        or pointer.artifact != previous
+    ):
+        raise ModelError("refit requires an expanding past window of the active model")
+    sanity = None
+    model = None
+    directory = None
+    match = None
+    report = None
+    try:
+        result = train_candidate(
+            data,
+            Candidate(
+                n_states=current.params.n_states, covariance_type=current.params.covariance_type
+            ),
+            thresholds=thresholds,
+            config=config,
+            provenance=provenance,
+            workers=workers,
+            previous=current,
+        )
+        sanity = result.sanity
+        reasons = sanity.reasons
+    except ModelError as exc:
+        reasons = (str(exc),)
+    if reasons:
+        kind = RefitOutcomeKind.REJECTED
+    else:
+        match = match_states(current, result.model)
+        model = inherit_labels(result.model, match, previous=previous)
+        report = refit_drift(current, model, match, drift)
+        reasons = report.reasons
+        kind = RefitOutcomeKind.ACTIVATED if report.passed else RefitOutcomeKind.FROZEN
+        directory = save_model(model, artifacts / "models")
+    event = ops.record_refit(
+        at=at,
+        cutoff=data.fit_end,
+        outcome=kind,
+        artifact=None if model is None else model.artifact_hash(),
+        previous=previous,
+        reasons=reasons,
+        calendar=calendar,
+    )
+    logger = structlog.get_logger()
+    if kind is RefitOutcomeKind.ACTIVATED:
+        logger.info(ACTIVATE_EVENT, artifact=event.artifact, effective_at=event.effective_at)
+    else:
+        logger.warning(
+            REJECT_EVENT if kind is RefitOutcomeKind.REJECTED else FREEZE_EVENT,
+            previous=previous,
+            reasons=reasons,
+            artifact=event.artifact,
+        )
+    return RefitOutcome(
+        kind, at, data.fit_end, previous, model, directory, match, report, sanity, reasons, event
+    )
 
 
 def refit(
@@ -187,4 +284,26 @@ def refit(
     false; otherwise `run_refit(refit_data(store, symbol, start=current.fit_start,
     cutoff=refit_cutoff(at), features=features, policy=policy), current, at=at, ...)` with the
     other arguments passed through."""
-    raise NotImplementedError("B7a: refit")
+    if not refit_due(current, at):
+        return None
+    data = refit_data(
+        store,
+        symbol,
+        start=current.fit_start,
+        cutoff=refit_cutoff(at),
+        features=features,
+        policy=policy,
+    )
+    return run_refit(
+        data,
+        current,
+        at=at,
+        ops=ops,
+        artifacts=artifacts,
+        config=config,
+        thresholds=thresholds,
+        drift=drift,
+        provenance=provenance,
+        calendar=calendar,
+        workers=workers,
+    )

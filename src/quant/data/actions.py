@@ -38,13 +38,15 @@ conflict, reported in the supplement's `ActionSync.conflicts`, never an overwrit
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, Final
 
-from quant.core.errors import DataError
+from quant.core.canonical import canonical_loads
+from quant.core.errors import CanonicalJSONError, DataError
 from quant.data.market_db import BarStore, Stamp
 
 # The committed supplement, relative to the repo root (the CLI's default).
@@ -230,7 +232,9 @@ class DividendSupplement:
         """The rows as corporate actions: one Dividend per row, in ex-date order, `Dividend(
         symbol, ex_date, amount, declared=ex_date, declared_in_feed=False)` (the ex-date stands
         in for the missing declaration date, ARCHITECTURE §6.2), and no splits."""
-        raise NotImplementedError("B7a: DividendSupplement.actions")
+        return CorporateActions(
+            tuple(Dividend(r.symbol, r.ex_date, r.amount, r.ex_date, False) for r in self.rows), ()
+        )
 
 
 def load_dividend_supplement(path: Path) -> DividendSupplement:
@@ -252,4 +256,56 @@ def load_dividend_supplement(path: Path) -> DividendSupplement:
     (OSError), text that isn't such JSON, a missing or extra key, a value of the wrong type, a
     bad date or amount, or rows out of order. Nothing else is accepted, so an edit to the file
     either keeps this shape or fails loudly."""
-    raise NotImplementedError("B7a: load_dividend_supplement")
+
+    def obj(value: Any, keys: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != set(keys.split()):
+            raise ValueError("missing or extra keys")
+        return value
+
+    def string(value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("expected nonempty string")
+        return value
+
+    def day(value: Any) -> date:
+        value = string(value)
+        result = date.fromisoformat(value)
+        if result.isoformat() != value:
+            raise ValueError("expected ISO date")
+        return result
+
+    try:
+        document = obj(canonical_loads(path.read_text()), "source note dividends")
+        source = obj(document["source"], "name page url retrieved sha256")
+        for key in ("name", "page", "url", "sha256"):
+            string(source[key])
+        if any(not source[k].startswith("https://") for k in ("page", "url")):
+            raise ValueError("source URLs must use https")
+        if re.fullmatch(r"[0-9a-f]{64}", source["sha256"]) is None:
+            raise ValueError("invalid source sha256")
+        parsed_source = SupplementSource(**(source | {"retrieved": day(source["retrieved"])}))
+        note = string(document["note"])
+        if not isinstance(document["dividends"], list) or not document["dividends"]:
+            raise ValueError("expected nonempty dividends list")
+        rows: list[SupplementRow] = []
+        for value in document["dividends"]:
+            row = obj(value, "symbol cusip ex_date record_date payable_date amount")
+            amount = row["amount"]
+            if type(amount) not in (int, float) or not math.isfinite(amount) or amount <= 0:
+                raise ValueError("invalid dividend amount")
+            parsed = SupplementRow(
+                string(row["symbol"]),
+                string(row["cusip"]),
+                day(row["ex_date"]),
+                day(row["record_date"]),
+                day(row["payable_date"]),
+                float(amount),
+            )
+            if not parsed.ex_date <= parsed.record_date <= parsed.payable_date:
+                raise ValueError("dividend dates out of order")
+            if rows and (rows[-1].ex_date, rows[-1].symbol) >= (parsed.ex_date, parsed.symbol):
+                raise ValueError("dividend rows out of order or duplicated")
+            rows.append(parsed)
+        return DividendSupplement(parsed_source, note, tuple(rows))
+    except (OSError, ValueError, TypeError, OverflowError, CanonicalJSONError) as exc:
+        raise DataError(f"{path}: invalid dividend supplement: {exc}") from exc

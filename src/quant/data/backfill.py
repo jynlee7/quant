@@ -95,8 +95,6 @@ def backfill(
     `supplement`, when given, is stored after the feed's actions as the module docstring says,
     and reported in `BackfillResult.supplement`.
     """
-    if supplement is not None:
-        raise NotImplementedError("B7a: the backfill stores the dividend supplement")
     calendar = calendar or TradingCalendar.xnys()
     timing = timing or Timing()
     now = clock.now()
@@ -136,6 +134,17 @@ def backfill(
         if days
         else ActionSync(0, ())
     )
+    supplemented = ActionSync(0, ())
+    if supplement is not None and days:
+        selected = CorporateActions(
+            tuple(
+                d
+                for d in supplement.actions.dividends
+                if d.symbol == symbol and start <= d.ex_date <= days[-1]
+            ),
+            (),
+        )
+        supplemented = store_actions(store, symbol, selected, known_at=stamp)
     for day, minutes in deferred:
         store.ingest_minutes(symbol, minutes, known_at=NOW, source=SOURCE)
         store.mark_backfilled(symbol, day, len(minutes))
@@ -147,4 +156,5 @@ def backfill(
         actions=actions,
         last=days[-1] if days else None,
         revised=tuple(day for day, _ in deferred),
+        supplement=supplemented,
     )

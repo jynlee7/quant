@@ -29,7 +29,6 @@ from tests.support.hmm import (
     two_diag,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 OLD_LABELS = {
     "three_full": [Label.CHOP, Label.CALM_UP, Label.STRESS],
     "two_diag": [Label.CALM_UP, Label.STRESS],
@@ -94,7 +93,6 @@ CASES = [
 ]
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.3")
 @pytest.mark.parametrize(("name", "perm"), CASES)
 def test_a_permuted_model_is_matched_back_exactly(name: str, perm: tuple[int, ...]) -> None:
@@ -119,7 +117,6 @@ def test_a_permuted_model_is_matched_back_exactly(name: str, perm: tuple[int, ..
     assert match.cost == pytest.approx(0.0, abs=1e-9)
 
 
-@RED
 @pytest.mark.spec("SPEC§5")
 def test_divergence_is_the_symmetric_kl_in_raw_units() -> None:
     from quant.hmm.match import divergence_matrix, raw_gaussians, symmetric_kl
@@ -155,7 +152,6 @@ def test_divergence_is_the_symmetric_kl_in_raw_units() -> None:
     ) == pytest.approx(0.0, abs=1e-12)
 
 
-@RED
 @pytest.mark.spec("SPEC§5")
 @pytest.mark.parametrize("fault", ["states", "columns", "feature hash"])
 def test_models_that_do_not_agree_are_not_matched(fault: str) -> None:
@@ -181,7 +177,6 @@ def test_models_that_do_not_agree_are_not_matched(fault: str) -> None:
         match_states(old, new)
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.2")
 def test_the_stored_refit_carries_inherited_labels_and_records_the_match() -> None:
     from quant.hmm.match import inherit_labels, match_states
@@ -219,7 +214,6 @@ def test_the_stored_refit_carries_inherited_labels_and_records_the_match() -> No
         inherit_labels(stored, match, previous=previous)  # its labels aren't the derived ones
 
 
-@RED
 @pytest.mark.spec("SPEC§5")
 @pytest.mark.parametrize("fault", ["not a permutation", "divergence shape", "table size", "nan"])
 def test_a_state_match_checks_itself(fault: str) -> None:

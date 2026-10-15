@@ -22,7 +22,6 @@ from quant.core.calendar import NEW_YORK, TradingCalendar
 from quant.core.clock import SimClock
 from quant.core.errors import ClockError, DataError
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 XNYS = TradingCalendar.xnys()
 US = timedelta(microseconds=1)
 H0, H1, H2 = "a0" * 32, "a1" * 32, "a2" * 32
@@ -66,7 +65,6 @@ NEXT_OPEN = {
 }
 
 
-@RED
 @pytest.mark.spec("C7", "ARCH§9.2")
 @pytest.mark.parametrize("case", sorted(NEXT_OPEN))
 def test_the_next_open_is_the_first_session_open_strictly_after(case: str) -> None:
@@ -77,7 +75,6 @@ def test_the_next_open_is_the_first_session_open_strictly_after(case: str) -> No
     assert XNYS.next_open(opened - US) == opened
 
 
-@RED
 @pytest.mark.spec("C7")
 def test_the_next_open_needs_an_aware_time() -> None:
     with pytest.raises(ClockError):
@@ -87,7 +84,6 @@ def test_the_next_open_needs_an_aware_time() -> None:
 # --- Pointers ---------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("C7", "ARCH§9.2", "SPEC§5")
 def test_a_pointer_governs_from_the_next_open_across_a_weekend_and_a_holiday() -> None:
     clock = SimClock(ny(2017, 6, 29, 17, 0))  # Thursday evening
@@ -122,7 +118,6 @@ def test_a_pointer_governs_from_the_next_open_across_a_weekend_and_a_holiday() -
     assert len({p.seq for p in history}) == 3
 
 
-@RED
 @pytest.mark.spec("C7", "ARCH§9.2")
 def test_no_pointer_governs_before_the_first_takes_effect() -> None:
     clock = SimClock(ny(2017, 6, 29, 17, 0))
@@ -135,7 +130,6 @@ def test_no_pointer_governs_before_the_first_takes_effect() -> None:
         store.current("model", datetime(2017, 7, 1))  # noqa: DTZ001 (naive on purpose)
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 def test_each_kind_keeps_its_own_history() -> None:
     clock = SimClock(ny(2017, 6, 29, 17, 0))
@@ -152,7 +146,6 @@ def test_each_kind_keeps_its_own_history() -> None:
     assert [p.artifact for p in store.pointers("calibration")] == [H1]
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 @pytest.mark.parametrize("fault", ["kind", "artifact", "uppercase artifact", "reason"])
 def test_a_bad_pointer_is_refused(fault: str) -> None:
@@ -171,7 +164,6 @@ def test_a_bad_pointer_is_refused(fault: str) -> None:
     assert store.pointers("model") == ()
 
 
-@RED
 @pytest.mark.spec("C7", "ARCH§9.2", "SPEC§5")
 def test_rollback_is_one_call_back_to_an_older_version() -> None:
     clock = SimClock(ny(2017, 6, 29, 17, 0))
@@ -190,7 +182,6 @@ def test_rollback_is_one_call_back_to_an_older_version() -> None:
     assert pointer.effective_at == ny(2017, 7, 5, 9, 30)
 
 
-@RED
 @pytest.mark.spec("ARCH§9.1", "ARCH§9.2", "C5")
 @pytest.mark.parametrize("table", ["pointers", "refit_events", "freeze_events"])
 @pytest.mark.parametrize("verb", ["UPDATE", "DELETE"])
@@ -232,7 +223,6 @@ def test_ops_history_is_append_only(table: str, verb: str, tmp_path: Path) -> No
         reopened.close()
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "K6")
 def test_stamps_never_go_back_when_the_clock_does() -> None:
     from quant.store.ops import FreezeCause
@@ -262,7 +252,6 @@ def _refit(
     )
 
 
-@RED
 @pytest.mark.spec("C5", "SPEC§5", "ARCH§7.3")
 def test_a_failed_refit_freezes_entries_and_the_next_passing_one_unfreezes_them_at_its_open() -> (
     None
@@ -313,7 +302,6 @@ def test_a_failed_refit_freezes_entries_and_the_next_passing_one_unfreezes_them_
     ]
 
 
-@RED
 @pytest.mark.spec("C5", "SPEC§5")
 def test_a_passing_refit_without_a_freeze_adds_no_unfreeze() -> None:
     from quant.store.ops import RefitOutcomeKind
@@ -327,7 +315,6 @@ def test_a_passing_refit_without_a_freeze_adds_no_unfreeze() -> None:
     assert [p.artifact for p in store.pointers("model")] == [H0, H1]
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.3")
 def test_a_rejected_refit_is_an_event_and_changes_nothing_else() -> None:
     from quant.store.ops import RefitOutcomeKind
@@ -349,7 +336,6 @@ def test_a_rejected_refit_is_an_event_and_changes_nothing_else() -> None:
     assert not store.frozen(ny(2017, 7, 3, 12, 0))
 
 
-@RED
 @pytest.mark.spec("C5", "SPEC§5")
 def test_a_manual_acknowledgement_unfreezes_at_once_and_is_logged() -> None:
     from quant.store.ops import FreezeCause, UnfreezeCause
@@ -374,7 +360,6 @@ def test_a_manual_acknowledgement_unfreezes_at_once_and_is_logged() -> None:
     assert log["seq"] == event.seq
 
 
-@RED
 @pytest.mark.spec("C5")
 def test_frozen_replays_the_events_in_order() -> None:
     from quant.store.ops import FreezeCause
@@ -436,7 +421,6 @@ def _bad_refits() -> dict[str, dict[str, Any]]:
     }
 
 
-@RED
 @pytest.mark.spec("C5", "ARCH§7.3")
 @pytest.mark.parametrize("fault", BAD_REFITS)
 def test_a_bad_refit_record_is_refused_and_writes_nothing(fault: str) -> None:

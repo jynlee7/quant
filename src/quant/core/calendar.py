@@ -15,6 +15,7 @@ from functools import cache
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from quant.core.clock import ensure_utc
 from quant.core.errors import CalendarError
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -154,7 +155,12 @@ class TradingCalendar:
         an open, the next session's. Raises ClockError for a naive `at`, and CalendarError when
         `at`'s New York date is outside the calendar or no session opens after it before
         CALENDAR_END."""
-        raise NotImplementedError("B7a: TradingCalendar.next_open")
+        at = ensure_utc(at)
+        day = at.astimezone(NEW_YORK).date()
+        self._check_range(day)
+        if self.is_session(day) and self.session(day).open > at:
+            return self.session(day).open
+        return self.session(self.next_session(day)).open
 
 
 @cache

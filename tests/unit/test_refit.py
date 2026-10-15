@@ -37,7 +37,6 @@ from tests.support.hmm import Truth, model_of, three_full
 from tests.support.train import training_data
 from tests.support.truncation import garbage_store, truncated_store, world
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 XNYS = TradingCalendar.xnys()
 US = timedelta(microseconds=1)
 PROVENANCE = {"commit": "0" * 40, "lockfile_sha256": "1" * 64}
@@ -146,7 +145,6 @@ def drifted(model: HmmModel) -> HmmModel:
 # --- The seeded restart (quant.hmm.train) ------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§7.1", "SPEC§5")
 def test_seed_params_carry_the_previous_model_through_raw_units() -> None:
     from quant.hmm.match import raw_gaussians
@@ -168,7 +166,6 @@ def test_seed_params_carry_the_previous_model_through_raw_units() -> None:
         seed_params(previous, ScalerParams(("a", "b"), other.mean, other.std))
 
 
-@RED
 @pytest.mark.spec("ARCH§7.1", "SPEC§5", "I2")
 def test_one_restart_of_a_refit_starts_from_the_previous_models_parameters(
     monkeypatch: pytest.MonkeyPatch,
@@ -232,7 +229,6 @@ def test_one_restart_of_a_refit_starts_from_the_previous_models_parameters(
     assert _train(data).model.training.info["restarts"]["seeded"] is None
 
 
-@RED
 @pytest.mark.spec("ARCH§7.1", "SPEC§5")
 @pytest.mark.parametrize("fault", ["states", "covariance type", "columns", "feature hash"])
 def test_a_seed_that_doesnt_fit_the_refit_is_refused(fault: str) -> None:
@@ -277,7 +273,6 @@ def test_a_seed_that_doesnt_fit_the_refit_is_refused(fault: str) -> None:
 # --- Cadence and cutoff -----------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.3")
 @pytest.mark.parametrize(
     ("at", "cutoff"),
@@ -297,7 +292,6 @@ def test_the_cutoff_is_the_latest_five_pm_in_new_york(at: datetime, cutoff: date
         refit_cutoff(datetime(2019, 3, 31, 18))  # noqa: DTZ001 (naive on purpose)
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.3")
 @pytest.mark.parametrize(
     ("fit_end", "at", "due"),
@@ -324,7 +318,6 @@ def test_a_refit_is_due_thirty_calendar_days_after_the_active_models_data(
 # --- The rows -----------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.3", "ARCH§6.2", "I1")
 def test_the_refit_reads_through_the_view_at_its_cutoff_and_nothing_later() -> None:
     from quant.jobs.refit import refit_cutoff, refit_data
@@ -381,7 +374,6 @@ def _run(data: TrainingData, current: HmmModel, at: datetime, ops: Any, artifact
     )
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "C7", "C5", "ARCH§7.3", "ARCH§9.2")
 @pytest.mark.parametrize(
     ("at", "opens"),
@@ -433,7 +425,6 @@ def test_a_passing_refit_governs_from_the_next_open_and_ends_a_freeze(
     assert any(entry["event"] == ACTIVATE_EVENT for entry in logs)
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "C5", "D6", "ARCH§7.3")
 def test_a_refit_that_fails_a_drift_check_is_stored_not_activated_and_freezes_entries(
     tmp_path: Path,
@@ -476,7 +467,6 @@ def _sanity_failure(current: HmmModel) -> TrainResult:
     return TrainResult(current, report, None)
 
 
-@RED
 @pytest.mark.spec("SPEC§4", "SPEC§5", "ARCH§7.3")
 @pytest.mark.parametrize("how", ["sanity report", "no filtered mass"])
 def test_a_sanity_reject_keeps_the_current_model_and_alerts(
@@ -518,7 +508,6 @@ def test_a_sanity_reject_keeps_the_current_model_and_alerts(
     assert any(entry["event"] == REJECT_EVENT and entry["log_level"] == "warning" for entry in logs)
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.3", "T-NL2")
 @pytest.mark.parametrize(
     "fault", ["start", "not expanding", "future rows", "feature hash", "not the active model"]
@@ -550,7 +539,6 @@ def test_a_refit_of_the_wrong_window_or_model_is_refused_before_training(
     assert not (tmp_path / "models").exists()
 
 
-@RED
 @pytest.mark.spec("SPEC§5", "ARCH§7.3")
 def test_the_evening_job_refits_only_when_due(tmp_path: Path) -> None:
     from quant.hmm.drift import r1_drift_thresholds
@@ -594,7 +582,6 @@ def test_the_evening_job_refits_only_when_due(tmp_path: Path) -> None:
     assert len(ops.refit_events()) == 1
 
 
-@RED
 @pytest.mark.spec("SPEC§5")
 def test_the_stored_refit_keeps_its_rule_derived_labels_beside_the_inherited_ones(
     tmp_path: Path,

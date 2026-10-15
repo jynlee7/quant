@@ -1138,7 +1138,9 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
     store = truncated_store(world, cut)
     clock = SimClock(cut)
     store = BarStore(store._conn, clock=clock)
-    decision = next(d for d in world.decisions if d.tau == cut)
+    # The cut's bar is the latest decision's at or before the cut, so a cut between decisions
+    # (a refit's 17:00 cutoff, B7) works as well as one at a decision.
+    decision = max((d for d in world.decisions if d.tau <= cut), key=lambda d: d.tau)
     previous, bar = store.view(cut, as_of=cut).hourly(SYMBOL, purpose=Purpose.OPERATE, last=2)
     if bar.t_open != decision.bar.t_open:
         raise ValueError(f"the cut's bar isn't visible at {cut.isoformat()}")
