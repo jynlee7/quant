@@ -26,3 +26,6 @@ covers = [
     "SPEC§10", "D7", "D13", "I4", "C2", "C3", "C8",
     "ARCH§4.4", "ARCH§8.1", "ARCH§8.2", "ARCH§8.3", "ARCH§16",
 ]
+
+[steps.B5]
+covers = ["I1", "I2", "T-NL1", "T-NL2"]

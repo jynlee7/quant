@@ -2,6 +2,87 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B5 · The truncation harness (done 2026-10-14, tag `b05-done`)
+
+B5 began on `b05-truncation` after B9 merged, as you asked on 2026-10-14. A Claude agent wrote the red commit and the review fixes, and Codex wrote the green.
+
+**Built**
+
+- **Where it lives:** `tests/support/truncation.py` holds the T-NL1 harness and T-NL2's provenance check. It is test code, because `quant.harness` is the research harness (ARCH §3). `src/` is unchanged.
+- **Layers:** a `Registry` holds them, and later steps add theirs (PLAN §2 rule 4).
+  - **view:** the bars a `PointInTimeView` returns, and its digest.
+  - **features:** `FeatureStream` through the view. It records raw vectors before the model activates, and after that scaled vectors with the scaler's provenance.
+  - **filter:** `ForwardFilter` and the labels, with the model's provenance.
+  - **risk:** B9's open item "T-NL1 through the risk verdicts". Each decision gets a seeded `OrderIntent`, priced from the view's last close, through a fresh `RiskEngine` for each run. The record leaves out the token and the µs ids.
+- **Runs:** for each cut τ, every record up to τ is compared by its canonical SHA-256 across three runs: (a) the store truncated to τ, (b) the full history, and (c) data to τ followed by garbage.
+  - **Truncation:** later rows are deleted from every table that has a `known_at` column.
+  - **Garbage:** NaN and ±1e9 bars and minutes, shuffled bars, and two bars that have closed but aren't available yet (one available exactly at the cut, one just after it). Also two revisions: one known exactly at the cut and one five minutes after it. The raw garbage is written straight into SQLite, so `check_minutes` can't screen it out.
+- **T-NL2:** every record that uses a fitted artifact (the scaler, the model) names it and its fit end, and the check requires `fit_end < τ` strictly.
+- **Strictness:**
+  - Records are immutable canonical bytes.
+  - A layer that raises fails the check, even when every run raises the same error.
+  - A check where some layer compared nothing past its cold start fails as vacuous.
+  - A failure names the first layer where runs differ.
+- **Cuts:** drawn with an explicit seed, always including five edge cuts: the first warm bar, the model's first decision, the bar after a DST change, a half day's CLOSE bar and a session's first bar. The fast tier runs 50 cuts and the full tier 200.
+- **The synthetic world:** minutes from 2016-06-01 to 2016-12-30, all within FIT, so DEV stays dark. The fixture model is K = 2 diag, fit on rows up to 2016-11-01 with `train_candidate(workers=1)`.
+
+**The six planted leaks** (PLAN §4 B5), each caught and named by layer:
+
+| # | Leak | Caught in |
+|---|---|---|
+| 1 | A centered moving-average feature | features |
+| 2 | A scaler fit on the full history | features |
+| 3 | The filter swapped for hmmlearn's `predict_proba`, and separately for `eval.smoother` | filter |
+| 4 | A view that uses ≤ instead of < | view |
+| 5 | Availability taken from `t_close` | view |
+| 6 | A model whose fit window ends after τ (T-NL2) | filter (provenance) |
+
+**Tests:** 26 fast and 1 full in `tests/invariants/test_truncation.py`, for 895 fast in all. They cover:
+- clean code at 50 and 200 cuts;
+- the six leaks;
+- cut drawing, truncation and garbage;
+- T-NL2's strict boundary;
+- slicing the full run hiding no leak;
+- one test for each review finding.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| B5 fast tests | 27.5 s (the 50-cut clean test is 13.5 s) |
+| B5 full tests | 81.3 s (the 200-cut clean test is 54 s) |
+| Fast gate | 89.3 s (895 tests) |
+
+The fast gate now uses about 89 s of its 120 s budget. A plain replay of the harness took about 81 s, so the green shares record caches across runs, keyed on exact canonical bytes. B6–B8 need to watch their fast-tier time.
+
+**Review:** one round, with the code-review skill and Codex. A Claude stand-in reviewer was lost to a session limit. 12 findings, all fixed as red tests (bd4c07b) and then fixes (065b7d9):
+
+1. The clean features layer scaled decisions with a scaler fit after them, and feature records carried no provenance.
+2. Two runs that raised the same error counted as agreeing, and the later layers were skipped.
+3. No row was known exactly at τ, so `known_at <= as_of` went unseen.
+4. `slice_full=False` let the smoother pass.
+5. A full-history scaler built at setup passed (same root as 1).
+6. Truncation left dividends, splits and calendar rows known after τ.
+7. Garbage went into the hourly bars only, so the minutes now get it too.
+8. Leak 3 didn't follow PLAN's `predict_proba` wording, so it's now planted both ways.
+9. The caches keyed on Python equality, for example `0.0 == -0.0`.
+10. `compared > 0` was checked only at 50 cuts, and it counted cold-start records.
+11. Runs shared mutable records, so a mutating leak passed with 716 comparisons (Codex).
+12. The feature-state hash read a private field instead of `snapshot()`. The fast path is now kept only for `FeatureStream`'s own snapshot, guarded by an equality test at every bar (Codex).
+
+The fixes weren't reviewed again. Each has its test, and the full gate passes.
+
+**Deviations:** none from the docs. Where the harness lives and its synthetic world are design calls the docs leave open.
+
+**Open items**
+
+- **B6:**
+  - run the full tier's 200 cuts on real FIT bars (PLAN P4, ARCH §13), since it is synthetic until the backfill;
+  - add garbage for dividends, splits and flags, and a layer that reads the view's `minutes()` and actions.
+- **B7:** register refits and calibration as layers, with their as-of times in T-NL2.
+- **B8:** replace the per-layer records with DecisionRecords and state hashes (ARCH §13), and register `decide()`.
+- **Private internals:** the harness uses the store's private connection to back up and to write raw garbage, and `FeatureStream._state` for the fast state hash. A guard test covers the hash, but a store refactor would need the harness updated.
+
 ## B9 · Risk engine and choke points (done 2026-10-14, tag `b09-done`)
 
 B9 was built in three parts on `b09-risk`, beside B4, and merged before B5–B8 (you agreed on 2026-10-13; PLAN v1.3):
