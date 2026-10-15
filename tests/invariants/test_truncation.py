@@ -9,7 +9,10 @@ draws 200. The full tier moves to real FIT bars once B6 brings them (BUILD_LOG o
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import math
+import sqlite3
 import statistics
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
@@ -18,13 +21,18 @@ import numpy as np
 import pytest
 
 import quant.data.view as view_module
-from quant.core.epoch import from_us
+import tests.support.truncation as truncation_module
+from quant.core.canonical import sha256_hex
+from quant.core.epoch import from_us, to_us
 from quant.core.errors import FeatureError
 from quant.core.schedule import Decision
+from quant.data.frames import HourlyBar
+from quant.data.market_db import HISTORY, BarStore
 from quant.data.policy import Purpose
+from quant.data.view import PointInTimeView
 from quant.eval.smoother import smooth
 from quant.features.scaler import Scaler
-from quant.features.stream import FeatureStream, compute_features, features_for
+from quant.features.stream import FeatureState, FeatureStream, compute_features, features_for
 from quant.hmm.model import HmmModel
 from tests.support.bars import SYMBOL
 from tests.support.truncation import (
@@ -33,13 +41,17 @@ from tests.support.truncation import (
     HORIZON,
     LATE_FIT_END,
     MODEL_FIT_END,
+    VIEW_DEPTH,
+    FeaturesLayer,
     FilterLayer,
     Provenance,
     Record,
+    Registry,
     Report,
     Source,
     Variant,
     World,
+    _feature_state_hash,
     check_truncation,
     default_registry,
     draw_cuts,
@@ -48,6 +60,7 @@ from tests.support.truncation import (
     fixture_model,
     garbage_store,
     provenance_failures,
+    run_layers,
     truncated_store,
     world,
 )
@@ -77,6 +90,11 @@ def _assert_caught(report: Report, layer: str, kinds: frozenset[str] = MISMATCH)
     assert report.layers == {layer}, report.explain()
     assert {f.kind for f in report.failures} <= kinds, report.explain()
     assert {f.cut for f in report.failures} == set(report.cuts), report.explain()
+    # The comparison reached the leak's layer: it and every layer before it (in registry order)
+    # compared records, so the catch isn't an artifact of comparing nothing.
+    names = list(report.compared)
+    upstream = names[: names.index(layer) + 1]
+    assert all(report.compared[name] > 0 for name in upstream), report.compared
 
 
 def _where(report: Report) -> set[tuple[datetime, Variant, str, datetime | None, str]]:
@@ -109,6 +127,8 @@ def test_clean_code_passes_every_variant_at_two_hundred_cuts() -> None:
     report = check_truncation(w, default_registry(w), cuts, seed=SEED + 1)
     assert report.ok, report.explain()
     assert len(report.cuts) == FULL_CUTS
+    assert set(report.compared) == {"view", "features", "filter", "risk"}
+    assert all(count > 0 for count in report.compared.values()), report.compared
 
 
 @pytest.mark.spec("T-NL1", "P4")
@@ -386,3 +406,318 @@ def test_slicing_the_full_run_hides_no_leak() -> None:
     assert _where(sliced) == _where(fresh)
     # The leak shows against the full run itself, not only through the garbage.
     assert Variant.TRUNCATED in {f.variant for f in sliced.failures}
+
+
+# --- review round 1 (B5): each test plants a defect the first harness let through -------------
+
+
+def _full_history_scaler(w: World) -> Scaler:
+    everything = w.store.view(HORIZON, as_of=HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE)
+    matrix = compute_features(everything, w.config)
+    return Scaler.fit(matrix, start=from_us(int(matrix.available_at[0])), end=HORIZON)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("T-NL2", "I1", "P3")
+def test_review_1_a_scaler_fit_after_tau_is_caught_by_provenance() -> None:
+    # Finding 1/5: a full-history scaler built once, outside the run, is the same object in every
+    # variant, so only T-NL2 can see it: the scaled records must name the scaler's window.
+    w = world()
+    registry = default_registry(w).replace(FeaturesLayer(w.config, _full_history_scaler(w)))
+    report = check_truncation(w, registry, _leak_cuts(w), seed=SEED)
+    _assert_caught(report, "features", frozenset({"provenance"}))
+    assert {f.variant for f in report.failures} == set(Variant)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("T-NL2", "I1")
+def test_review_1_clean_features_scale_only_with_a_scaler_fit_before_tau() -> None:
+    w = world()
+    # The clean scaler is the fixture model's own, fit on the model's window.
+    assert w.scaler.end == w.model.fit_end == MODEL_FIT_END
+    assert np.array_equal(w.scaler.mean, w.model.scaler.mean)
+    assert np.array_equal(w.scaler.std, w.model.scaler.std)
+    run = run_layers(default_registry(w), Source(w.store, Variant.FULL, None), w.decisions)
+    scaled = [r for r in run.records["features"] if "scaled" in r.output]
+    assert scaled
+    for record in scaled:
+        assert record.provenance is not None, record.tau
+        assert record.provenance.fit_end < record.tau
+
+
+class _Boom:
+    """A filter that peeks at the whole store, then raises the same error in every run."""
+
+    name = "filter"
+
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        source.view(HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE)
+        raise RuntimeError("shape mismatch")
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("T-NL1", "P3")
+def test_review_2_a_layer_that_raises_the_same_error_in_every_run_fails() -> None:
+    # Finding 2: equal errors counted as agreement, and the layers after it compared nothing.
+    w = world()
+    cuts = _leak_cuts(w)[:1]
+    report = check_truncation(w, default_registry(w).replace(_Boom()), cuts, seed=SEED)
+    assert not report.ok, report.compared
+    assert "filter" in report.layers, report.explain()
+    assert "error" in {f.kind for f in report.failures if f.layer == "filter"}
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
+def test_review_3_a_view_knowing_rows_at_as_of_is_caught_in_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Finding 3: no row was known exactly at a cut, so known_at <= as_of went unseen.
+    w = world()
+    _patch_view(monkeypatch, "known_at < :as_of", "known_at <= :as_of")
+    report = check_truncation(w, default_registry(w), _leak_cuts(w), seed=SEED)
+    _assert_caught(report, "view")
+    assert {f.variant for f in report.failures} == {Variant.GARBAGE}
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("I1", "I2", "T-NL1", "P3")
+def test_review_4_recomputing_the_full_run_still_catches_the_smoother() -> None:
+    # Finding 4: slice_full=False ran (b) only up to τ, where a smoother has no later rows.
+    w = world()
+    registry = default_registry(w).replace(Smoothed(w.model))
+    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED, slice_full=False)
+    _assert_caught(report, "filter")
+
+
+def _known_at_tables(conn: sqlite3.Connection) -> list[str]:
+    tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+    return [
+        table
+        for table in tables
+        if "known_at" in {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    ]
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("T-NL1")
+def test_review_6_the_truncated_store_drops_later_rows_from_every_table() -> None:
+    # Finding 6: dividends, splits and calendar_cache kept rows known after the cut.
+    w = world()
+    cut = w.edges["after_dst"].tau
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    w.conn.backup(conn)
+    store = BarStore(conn)
+    later = cut.date() + timedelta(days=3)
+    store.put_dividend(SYMBOL, ex_date=later, amount=1.0, declared=later, known_at=HISTORY)
+    store.put_split(SYMBOL, ex_date=later, ratio=2.0, declared=later, known_at=HISTORY)
+    conn.execute(
+        "INSERT INTO calendar_cache VALUES ('test', ?, 0, 0, ?)",
+        (later.isoformat(), to_us(cut + timedelta(days=3))),
+    )
+    conn.execute(
+        "INSERT INTO data_flags VALUES (?, ?, 'test', 1, 1, '', ?)",
+        (SYMBOL, to_us(cut), to_us(cut + timedelta(days=3))),
+    )
+    tables = _known_at_tables(conn)
+    assert {"minute_bars", "hourly_bars", "dividends", "splits", "calendar_cache"} <= set(tables)
+    assert {"data_flags"} <= set(tables)
+    truncated = truncated_store(dataclasses.replace(w, conn=conn, store=store), cut)
+    try:
+        for table in tables:
+            (latest,) = truncated._conn.execute(
+                f"SELECT MAX(known_at) FROM {table}"  # noqa: S608 — names from sqlite_master
+            ).fetchone()
+            assert latest is None or latest <= to_us(cut), table
+    finally:
+        truncated.close()
+        store.close()
+
+
+class _MinutesView:
+    """The view layer, also recording the minutes of the hour before τ."""
+
+    name = "view"
+
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        records = []
+        for d in decisions:
+            view = source.view(d.tau)
+            bars = view.hourly(SYMBOL, purpose=Purpose.OPERATE, last=VIEW_DEPTH)
+            minutes = view.minutes(
+                SYMBOL, d.tau - timedelta(hours=1), d.tau, purpose=Purpose.OPERATE
+            )
+            output = {
+                "bars": [{"close": bar.close, "t_open": bar.t_open} for bar in bars],
+                "minutes": {"t": minutes.t, "close": minutes.close},
+                "digest": view.digest(),
+            }
+            records.append(Record(d.tau, self.name, output))
+        return records
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
+def test_review_7_minutes_read_without_availability_are_caught_in_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Finding 7: garbage was written only to hourly_bars, so a minutes query that drops the
+    # availability rule was hidden by known_at in every variant.
+    w = world()
+    assert " AND available_at < :tau" in view_module._MINUTES
+    monkeypatch.setattr(
+        view_module, "_MINUTES", view_module._MINUTES.replace(" AND available_at < :tau", "")
+    )
+    report = check_truncation(
+        w, Registry([_MinutesView()]), (w.edges["first_warm"].tau,), seed=SEED
+    )
+    _assert_caught(report, "view")
+    assert {f.variant for f in report.failures} == {Variant.GARBAGE}
+
+
+def _signed_zero_peek(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plant a lookahead whose only trace is a signed zero: the last bar's volume of a
+    `last=n` read is -0.0 when the store holds a bar after τ, else 0.0. The view's digest
+    hashes the rows before this, so it can't see the sign."""
+    original = PointInTimeView.hourly
+
+    def peeking(
+        self: PointInTimeView,
+        symbol: str,
+        *,
+        purpose: Purpose,
+        since: datetime | None = None,
+        last: int | None = None,
+    ) -> list[HourlyBar]:
+        bars = original(self, symbol, purpose=purpose, since=since, last=last)
+        if last is None or not bars:
+            return bars
+        (later,) = self._conn.execute(
+            "SELECT COUNT(*) FROM hourly_bars WHERE symbol = ? AND t_open > ?",
+            (symbol, to_us(self.tau)),
+        ).fetchone()
+        return [*bars[:-1], dataclasses.replace(bars[-1], volume=-0.0 if later else 0.0)]
+
+    monkeypatch.setattr(PointInTimeView, "hourly", peeking)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("I1", "T-NL1", "P3")
+def test_review_9_a_lookahead_in_a_signed_zero_is_caught_in_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Finding 9: the record caches keyed on Python ==, where 0.0 == -0.0, so the full run's
+    # record was handed to the truncated one.
+    w = world()
+    _signed_zero_peek(monkeypatch)
+    report = check_truncation(w, default_registry(w), _leak_cuts(w)[:1], seed=SEED)
+    _assert_caught(report, "view")
+    assert Variant.TRUNCATED in {f.variant for f in report.failures}
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("T-NL1", "T-NL2", "P3")
+def test_review_10_a_filter_that_never_leaves_cold_start_fails() -> None:
+    # Finding 10: the filter's {"model": null} cold-start records counted as compared, so a
+    # filter that never ran its model passed.
+    w = world()
+    registry = default_registry(w).replace(FilterLayer(w.model, activation=HORIZON))
+    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED)
+    assert not report.ok, report.compared
+    assert report.layers == {"filter"}, report.explain()
+
+
+class _MutatingFeatures(FeaturesLayer):
+    """Writes the close read at HORIZON into each record's first scaled value after the
+    fact: a leak through records the harness shares between runs."""
+
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        records = super().run(source, decisions, upstream)
+        (peek,) = source.view(HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE, last=1)
+        for record in records:
+            if "scaled" in record.output:
+                record.output["scaled"][0] = float(peek.close)
+        return records
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("T-NL1", "P3")
+def test_review_11_a_layer_that_mutates_its_records_is_caught_in_features() -> None:
+    # Finding 11: the caches gave every run the same mutable Record, so a run's mutation
+    # changed the reference run's record too.
+    w = world()
+    registry = default_registry(w).replace(_MutatingFeatures(w.config, w.scaler))
+    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED)
+    _assert_caught(report, "features", MISMATCH_OR_ERROR)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=pytest.fail.Exception)
+@pytest.mark.spec("T-NL1")
+def test_review_11_a_record_is_immutable_canonical_bytes() -> None:
+    tau = world().decisions[0].tau
+    record = Record(tau, "features", {"raw": [1.0, -0.0]})
+    with pytest.raises((TypeError, AttributeError)):
+        record.output["raw"][0] = 2.0
+    with pytest.raises((TypeError, AttributeError)):
+        record.output = {}  # type: ignore[misc]
+
+
+class _PeekingStream(FeatureStream):
+    """A stream whose snapshot carries state outside `_state`: how many bars the store holds."""
+
+    peek = 0
+
+    def snapshot(self) -> FeatureState:
+        state = super().snapshot()
+        return state.model_copy(update={"returns": [*state.returns, float(self.peek)]})
+
+
+class _PeekingFeatures(FeaturesLayer):
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        _PeekingStream.peek = len(source.view(HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE))
+        return super().run(source, decisions, upstream)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B5", raises=AssertionError)
+@pytest.mark.spec("T-NL1", "P3")
+def test_review_12_snapshot_state_outside_the_fast_hash_is_caught_in_features(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Finding 12: the state hash read FeatureStream._state, not snapshot().
+    w = world()
+    monkeypatch.setattr(truncation_module, "FeatureStream", _PeekingStream)
+    registry = default_registry(w).replace(_PeekingFeatures(w.config, w.scaler))
+    report = check_truncation(w, registry, _leak_cuts(w)[:1], seed=SEED)
+    _assert_caught(report, "features")
+
+
+@pytest.mark.spec("T-NL1")
+def test_review_12_the_fast_state_hash_is_the_snapshot_hash_at_every_bar() -> None:
+    # The harness hashes the stream's state without snapshot()'s deep copy. Guard that
+    # shortcut: at every decision of the world it equals sha256_hex(stream.snapshot()).
+    w = world()
+    stream = FeatureStream(w.config)
+    for d in w.decisions:
+        with contextlib.suppress(FeatureError):
+            features_for(stream, w.store.view(d.tau, as_of=d.tau), SYMBOL, d.bar)
+        assert _feature_state_hash(stream) == sha256_hex(stream.snapshot()), d.tau
