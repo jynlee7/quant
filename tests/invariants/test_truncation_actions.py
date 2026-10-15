@@ -45,7 +45,6 @@ from tests.support.truncation import (
 )
 
 SEED = 20160104
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
 
 
 def _one_cut(w: World) -> tuple[datetime, ...]:
@@ -66,7 +65,6 @@ def _assert_caught_in_actions(report: Report) -> None:
 # --- the layer -------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "ARCH§6.2")
 def test_the_actions_layer_is_registered_and_passes_clean() -> None:
     w = world()
@@ -76,7 +74,6 @@ def test_the_actions_layer_is_registered_and_passes_clean() -> None:
     assert report.compared["actions"] > 0
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1")
 def test_the_actions_layer_records_what_the_view_shows_at_tau() -> None:
     # The records hold real content, so a pass isn't the comparison of empty lists.
@@ -106,7 +103,6 @@ def test_the_actions_layer_records_what_the_view_shows_at_tau() -> None:
 # --- the garbage -----------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("T-NL1", "P3")
 def test_the_garbage_variant_writes_dividends_splits_and_flags() -> None:
     # Garbage no read can reach would make variant (c) vacuous for the actions layer.
@@ -147,7 +143,6 @@ def test_the_garbage_variant_writes_dividends_splits_and_flags() -> None:
 # --- one planted leak for each read (P3) -----------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_minutes_read_without_availability_are_caught_in_actions(
     monkeypatch: pytest.MonkeyPatch,
@@ -161,7 +156,6 @@ def test_minutes_read_without_availability_are_caught_in_actions(
     _assert_caught_in_actions(report)
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 @pytest.mark.parametrize("table", ["dividends", "splits"])
 def test_actions_known_at_as_of_are_caught_in_actions(
@@ -189,7 +183,6 @@ class _StoreFlags(ActionsLayer):
         return sorted({*own, *stored}, key=lambda f: (f.t, f.kind))
 
 
-@RED
 @pytest.mark.spec("I1", "T-NL1", "P3", "ARCH§6.2")
 def test_flags_read_without_availability_are_caught_in_actions() -> None:
     w = world()

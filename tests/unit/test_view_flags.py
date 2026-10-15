@@ -24,8 +24,6 @@ from quant.data.synthetic import synthetic_minutes
 from quant.data.validate import MOVE_KIND, DataFlag
 from tests.support.bars import SYMBOL
 
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
-
 DAY = date(2016, 3, 1)  # inside FIT; New York is UTC-5
 OPEN = datetime(2016, 3, 1, 14, 30, tzinfo=UTC)
 CLOSE = datetime(2016, 3, 1, 21, 0, tzinfo=UTC)
@@ -50,7 +48,6 @@ def flagged_store(clock: SimClock | None = None) -> tuple[BarStore, MinuteFrame]
     return store, minutes
 
 
-@RED
 @pytest.mark.spec("I1", "ARCH§6.1", "ARCH§6.2")
 def test_a_flag_shows_once_its_minute_is_available() -> None:
     store, m = flagged_store()
@@ -64,7 +61,6 @@ def test_a_flag_shows_once_its_minute_is_available() -> None:
     assert later.flags(SYMBOL, OPEN, CLOSE, purpose=Purpose.OPERATE) == [flag]
 
 
-@RED
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_a_flag_known_early_on_a_minute_the_view_hides_stays_hidden() -> None:
     store, m = flagged_store()
@@ -84,7 +80,6 @@ def test_a_flag_known_early_on_a_minute_the_view_hides_stays_hidden() -> None:
     ]
 
 
-@RED
 @pytest.mark.spec("I1", "ARCH§6.1", "ARCH§6.2")
 def test_the_latest_version_known_before_as_of_counts() -> None:
     # A settle lifts minute 59 to the new level, so the jump moves into 59, and the flag on 60
@@ -103,7 +98,6 @@ def test_the_latest_version_known_before_as_of_counts() -> None:
     assert [f.t for f in after.flags(SYMBOL, OPEN, CLOSE, purpose=Purpose.OPERATE)] == [m.at(59)]
 
 
-@RED
 @pytest.mark.spec("I1", "ARCH§6.2")
 def test_the_span_is_half_open() -> None:
     store, m = flagged_store()
@@ -114,7 +108,6 @@ def test_the_span_is_half_open() -> None:
     assert view.flags(SYMBOL, t + US, CLOSE, purpose=Purpose.OPERATE) == []
 
 
-@RED
 @pytest.mark.spec("I1", "A2", "ARCH§6.2", "ARCH§6.3")
 def test_a_flags_read_names_its_purpose_and_goes_into_the_digest() -> None:
     store, _ = flagged_store()

@@ -53,8 +53,6 @@ from tests.support.truncation import (
     world,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B6", raises=NotImplementedError)
-
 STEP = timedelta(seconds=7.25)  # each reading of the TickingClock
 PROVENANCE = {"commit": "0" * 40, "lockfile_sha256": "1" * 64}
 
@@ -142,7 +140,6 @@ def root(tmp_path_factory: pytest.TempPathFactory) -> Path:
 # --- the span --------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("D4", "C11", "ARCH§6.3")
 def test_the_fit_window_is_new_york_midnights_inside_fit() -> None:
     assert date(2018, 12, 31) == FIT_LAST
@@ -167,7 +164,6 @@ def test_the_fit_window_is_new_york_midnights_inside_fit() -> None:
 # --- the rows --------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("D4", "I1", "ARCH§6.2", "ARCH§6.3")
 def test_training_data_is_read_through_the_view_to_operate() -> None:
     # The rows are the B5 fixture model's own (the same bars, features, returns and sessions),
@@ -192,7 +188,6 @@ def test_training_data_is_read_through_the_view_to_operate() -> None:
     assert max(read_last for _, _, read_last in policy.reads) <= last
 
 
-@RED
 @pytest.mark.spec("D4", "I1", "C11", "ARCH§6.2")
 def test_training_data_ignores_what_the_store_learned_after_the_span() -> None:
     # A store that knows later bars, and a revision of the span's last bar made after it, gives
@@ -218,7 +213,6 @@ def test_training_data_ignores_what_the_store_learned_after_the_span() -> None:
 # --- selection, the artifact and the report ---------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("D4", "SPEC§4", "ARCH§7.2", "PLAN§3")
 def test_selection_saves_an_artifact_that_loads_without_pickles(root: Path) -> None:
     run = selected(root)
@@ -235,7 +229,6 @@ def test_selection_saves_an_artifact_that_loads_without_pickles(root: Path) -> N
     assert model.training.info["provenance"] == PROVENANCE
 
 
-@RED
 @pytest.mark.spec("D4", "SPEC§4", "PLAN§3")
 def test_the_report_holds_what_cp1_lists(root: Path) -> None:
     run = selected(root)
@@ -274,7 +267,6 @@ def test_the_report_holds_what_cp1_lists(root: Path) -> None:
     }
 
 
-@RED
 @pytest.mark.spec("D4", "SPEC§4", "PLAN§3")
 def test_the_selection_run_time_is_measured_on_the_clock_and_logged(root: Path) -> None:
     run = selected(root)
@@ -293,7 +285,6 @@ def test_the_selection_run_time_is_measured_on_the_clock_and_logged(root: Path) 
     assert str(STEP.total_seconds()) not in canonical_dumps(model.meta()).decode()
 
 
-@RED
 @pytest.mark.spec("D4", "SPEC§4", "PLAN§3")
 def test_the_markdown_report_shows_what_cp1_lists(root: Path) -> None:
     run = selected(root)
@@ -320,7 +311,6 @@ def test_the_markdown_report_shows_what_cp1_lists(root: Path) -> None:
         )
 
 
-@RED
 @pytest.mark.spec("D4", "C11", "A2")
 @pytest.mark.parametrize(
     ("first", "last"),
@@ -380,7 +370,6 @@ def _contents(path: Path) -> dict[str, tuple[object, ...]]:
         conn.close()
 
 
-@RED
 @pytest.mark.spec("D4", "SPEC§4", "PLAN§3")
 def test_quant_model_select_writes_the_model_and_its_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -421,7 +410,6 @@ def test_quant_model_select_writes_the_model_and_its_report(
     assert _contents(db) == before  # the store is only read
 
 
-@RED
 @pytest.mark.spec("D4", "C11")
 def test_quant_model_select_refuses_a_span_past_fit_and_a_missing_store(tmp_path: Path) -> None:
     db, artifacts = _market_db(tmp_path / "market.db"), tmp_path / "artifacts"
@@ -441,7 +429,6 @@ def test_quant_model_select_refuses_a_span_past_fit_and_a_missing_store(tmp_path
 # --- provenance ------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§7.2")
 def test_code_provenance_reads_the_commit_and_lockfile_from_files(tmp_path: Path) -> None:
     assert code_provenance(tmp_path) == {"commit": None, "lockfile_sha256": None}

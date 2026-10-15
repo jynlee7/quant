@@ -8,6 +8,7 @@ selection takes minutes, so run it in the background.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -16,9 +17,14 @@ from typing import Annotated
 import typer
 
 from quant.cli.data import DEFAULT_DB
+from quant.core.clock import WallClock
+from quant.core.errors import ModelError, PolicyError
+from quant.data.market_db import BarStore
 from quant.data.policy import FIT_START
+from quant.features.menu import r1_features
+from quant.hmm.labels import r1_thresholds
 from quant.hmm.train import TrainConfig, r1_train_config
-from quant.jobs.first_model import FIT_LAST
+from quant.jobs.first_model import FIT_LAST, code_provenance, fit_window, select_first_model
 
 DEFAULT_ARTIFACTS = Path("var/artifacts")
 
@@ -62,4 +68,38 @@ def select(
     reaches outside FIT (PolicyError) or `--db` is not a file. Exits 1 when selection fails
     (ModelError), saying why.
     """
-    raise NotImplementedError
+    try:
+        fit_window(first.date(), last.date())
+    except PolicyError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
+    if not db.is_file():
+        typer.echo(f"market.db does not exist: {db}", err=True)
+        raise typer.Exit(2)
+    conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        store = BarStore(conn)
+        run = select_first_model(
+            store,
+            symbol=symbol,
+            first=first.date(),
+            last=last.date(),
+            features=r1_features(),
+            config=train_config(),
+            thresholds=r1_thresholds(),
+            provenance=code_provenance(root),
+            artifacts=artifacts,
+            clock=WallClock(),
+            workers=workers,
+        )
+    except ModelError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    finally:
+        conn.close()
+    chosen = run.result.model.params
+    typer.echo(f"K = {chosen.n_states}, {chosen.covariance_type} covariance")
+    typer.echo(str(run.directory))
+    typer.echo(str(run.report_json))
+    typer.echo(str(run.report_markdown))
+    typer.echo(f"Selection: {run.seconds:.1f} s")

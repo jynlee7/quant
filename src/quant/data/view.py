@@ -235,7 +235,27 @@ class PointInTimeView:
         before as_of was available before tau, so a flag can't reveal a minute the view hides.
         The purpose is checked for the days the read can reach, as `minutes` checks it, and
         every flag returned goes into the digest (its minute, kind and detail)."""
-        raise NotImplementedError
+        last = _ny_date(min(ensure_utc(end), self.tau) - _US)
+        self._check(purpose, min(_ny_date(start), last), last)
+        rows = self._conn.execute(
+            """
+            SELECT f.t, f.kind, f.detail FROM data_flags f
+            WHERE f.symbol = :symbol AND f.t >= :start AND f.t < :end
+              AND f.known_at < :as_of AND f.raised = 1
+              AND f.version = (SELECT MAX(x.version) FROM data_flags x
+                  WHERE x.symbol = f.symbol AND x.t = f.t AND x.kind = f.kind
+                    AND x.known_at < :as_of)
+              AND EXISTS (SELECT 1 FROM minute_bars m
+                  WHERE m.symbol = f.symbol AND m.t = f.t AND m.t < :tau
+                    AND m.available_at < :tau AND m.known_at < :as_of
+                    AND m.version = (SELECT MAX(x.version) FROM minute_bars x
+                        WHERE x.symbol = m.symbol AND x.t = m.t AND x.known_at < :as_of))
+            ORDER BY f.t, f.kind
+            """,
+            {**self._params, "symbol": symbol, "start": to_us(start), "end": to_us(end)},
+        ).fetchall()
+        self._hash.update(canonical_dumps(["flags", symbol, rows]) + b"\n")
+        return [DataFlag(from_us(t), kind, detail) for t, kind, detail in rows]
 
     def digest(self) -> str:
         """SHA-256 over the canonical bytes of every row read so far."""

@@ -35,18 +35,32 @@ Clock passed in (K6).
 
 from __future__ import annotations
 
+import hashlib
+import math
+import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
+import numpy as np
+import structlog
+
+from quant.core.calendar import NEW_YORK
+from quant.core.canonical import canonical_dumps, canonical_loads
 from quant.core.clock import Clock
+from quant.core.epoch import to_us
+from quant.core.errors import ModelError, PolicyError
 from quant.data.market_db import BarStore
-from quant.data.policy import DEV_START, DataPolicy
+from quant.data.policy import DEV_START, FIT_START, DataPolicy, Purpose
 from quant.features.menu import FeatureConfig
+from quant.features.stream import compute_features
 from quant.hmm.labels import LabelThresholds
-from quant.hmm.train import TrainConfig, TrainingData, TrainResult
+from quant.hmm.model import save_model
+from quant.hmm.train import TrainConfig, TrainingData, TrainResult, select_and_train
 
 # FIT's last day: the day before DEV starts (spec §2 splits, D4).
 FIT_LAST: Final = DEV_START - timedelta(days=1)
@@ -61,7 +75,12 @@ def fit_window(first: date, last: date) -> tuple[datetime, datetime]:
     start of `first`, and New York midnight at the start of the day after `last`. So
     (2016-01-01, 2018-12-31) gives (2016-01-01T05:00Z, 2019-01-01T05:00Z). Raises PolicyError
     when first < FIT_START, last > FIT_LAST or last < first (module docstring, step 1)."""
-    raise NotImplementedError
+    if first < FIT_START or last > FIT_LAST or last < first:
+        raise PolicyError(f"first model span must lie inside FIT: {FIT_START} to {FIT_LAST}")
+    return (
+        datetime.combine(first, time(), tzinfo=NEW_YORK).astimezone(UTC),
+        datetime.combine(last + timedelta(days=1), time(), tzinfo=NEW_YORK).astimezone(UTC),
+    )
 
 
 def training_data(
@@ -90,7 +109,23 @@ def training_data(
     - `feature_config_hash` is `features.config_hash()`.
 
     Raises ModelError (from TrainingData) when fewer than two warm rows remain."""
-    raise NotImplementedError
+    start, end = fit_window(first, last)
+    bars = store.view(end, as_of=end, policy=policy).hourly(
+        symbol, purpose=Purpose.OPERATE, since=start
+    )
+    matrix = compute_features(bars, features)
+    by_open = {
+        to_us(bar.t_open): (math.log(bar.close / previous.close), bar.session.toordinal())
+        for previous, bar in pairwise(bar for bar in bars if bar.complete)
+    }
+    return TrainingData(
+        matrix,
+        np.array([by_open[int(t)][0] for t in matrix.t_open], dtype=np.float64),
+        np.array([by_open[int(t)][1] for t in matrix.t_open], dtype=np.int64),
+        start,
+        end,
+        features.config_hash(),
+    )
 
 
 @dataclass(frozen=True, eq=False)
@@ -138,7 +173,40 @@ def select_first_model(
     Raises PolicyError for a span outside FIT before reading the store or creating any file or
     directory; ModelError when selection fails (every candidate set aside or rejected), after
     which no artifact or report is written."""
-    raise NotImplementedError
+    data = training_data(store, symbol, first=first, last=last, features=features, policy=policy)
+    started = clock.now()
+    result = select_and_train(
+        data, thresholds=thresholds, config=config, provenance=provenance, workers=workers
+    )
+    seconds = (clock.now() - started).total_seconds()
+    directory = save_model(result.model, artifacts / "models")
+    report = first_model_report(
+        result, symbol=symbol, first=first, last=last, directory=directory, seconds=seconds
+    )
+    reports = artifacts / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    report_json = reports / f"first-model-{result.model.artifact_hash()}.json"
+    report_markdown = report_json.with_suffix(".md")
+    for path, content in (
+        (report_json, canonical_dumps(report)),
+        (report_markdown, render_markdown(report).encode()),
+    ):
+        with tempfile.NamedTemporaryFile(dir=reports, delete=False) as handle:
+            temporary = Path(handle.name)
+            try:
+                handle.write(content)
+                handle.close()
+                temporary.replace(path)
+            finally:
+                temporary.unlink(missing_ok=True)
+    structlog.get_logger().info(
+        LOG_EVENT,
+        artifact=result.model.artifact_hash(),
+        n_states=result.model.params.n_states,
+        covariance_type=result.model.params.covariance_type,
+        seconds=seconds,
+    )
+    return FirstModel(result, directory, report, report_json, report_markdown, seconds)
 
 
 def first_model_report(
@@ -169,7 +237,41 @@ def first_model_report(
 
     Raises ModelError when `result.selection` is None (a `train_candidate` result was not
     selected, so it has no BIC and validation table)."""
-    raise NotImplementedError
+    if result.selection is None:
+        raise ModelError("first model report requires a selected model")
+    model = result.model
+    info = model.training.info
+    report = {
+        "kind": REPORT_KIND,
+        "symbol": symbol,
+        "span": {"first": first, "last": last},
+        "fit_window": {"start": model.fit_start, "end": model.fit_end},
+        "artifact": {"hash": model.artifact_hash(), "path": str(directory)},
+        "chosen": {
+            "n_states": model.params.n_states,
+            "covariance_type": model.params.covariance_type,
+        },
+        "transition_matrix": model.params.transmat.tolist(),
+        **{
+            key: info[key]
+            for key in (
+                "states",
+                "selection",
+                "validation",
+                "sanity",
+                "restarts",
+                "n_rows",
+                "loglik",
+                "bic",
+                "data_hash",
+                "config",
+            )
+        },
+        "feature_config_hash": model.feature_config_hash,
+        "selection_seconds": seconds,
+    }
+    normalized: dict[str, Any] = canonical_loads(canonical_dumps(report))
+    return normalized
 
 
 def render_markdown(report: Mapping[str, Any]) -> str:
@@ -189,7 +291,88 @@ def render_markdown(report: Mapping[str, Any]) -> str:
       mean and standard error, and the sanity verdict; then the candidates set aside, if any.
 
     Ends with a newline."""
-    raise NotImplementedError
+    chosen, span = report["chosen"], report["span"]
+    lines = [
+        f"# First model: {report['symbol']}, {span['first']} to {span['last']}",
+        "",
+        f"- Artifact: `{report['artifact']['hash']}`",
+        f"- K = {chosen['n_states']}, {chosen['covariance_type']} covariance",
+        f"- Selection rule: {report['selection']['rule']}",
+        f"- Fit window: {report['fit_window']['start']} to {report['fit_window']['end']}; {report['n_rows']} rows",
+        f"- Selection time: {report['selection_seconds']:.1f} s",
+        "",
+        "## Transition matrix",
+        "",
+    ]
+
+    def table(headers: list[str], rows: list[list[str]]) -> None:
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join("---" for _ in headers) + " |")
+        lines.extend("| " + " | ".join(row) + " |" for row in rows)
+        lines.append("")
+
+    table(
+        ["State", *map(str, range(chosen["n_states"]))],
+        [[str(i), *(f"{v:.4f}" for v in row)] for i, row in enumerate(report["transition_matrix"])],
+    )
+    lines.extend(["## States", ""])
+    fields = [
+        "state",
+        "label",
+        "v",
+        "d",
+        "mean_return",
+        "volatility",
+        "duration_bars",
+        "duration_sessions",
+        "occupancy",
+    ]
+    table(
+        [
+            "State",
+            "Label",
+            "v",
+            "d",
+            "Annualized return",
+            "Annualized volatility",
+            "Duration (bars)",
+            "Duration (sessions)",
+            "Occupancy",
+        ],
+        [
+            ["inf" if row[key] is None else str(row[key]) for key in fields]
+            for row in report["states"]
+        ],
+    )
+    lines.extend(["## Candidates", ""])
+    fields = [
+        "n_states",
+        "covariance_type",
+        "n_params",
+        "loglik",
+        "bic",
+        "validation_mean",
+        "validation_se",
+        "sanity_passed",
+    ]
+    table(
+        [
+            "K",
+            "Covariance",
+            "Parameters",
+            "Log-likelihood",
+            "BIC",
+            "Validation mean",
+            "Validation SE",
+            "Sanity passed",
+        ],
+        [[str(row[key]) for key in fields] for row in report["selection"]["table"]],
+    )
+    for row in report["selection"]["set_aside"]:
+        lines.append(
+            f"- Set aside: K = {row['n_states']}, {row['covariance_type']}: {row['failed']}"
+        )
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def code_provenance(root: Path) -> dict[str, str | None]:
@@ -202,4 +385,31 @@ def code_provenance(root: Path) -> dict[str, str | None]:
       `root/.git` is not a directory or the ref can't be resolved to 40 lowercase hex;
     - "lockfile_sha256": the SHA-256 in hex of `root/uv.lock`'s bytes, None when it is missing.
     """
-    raise NotImplementedError
+    git = root / ".git"
+    commit = None
+    if git.is_dir() and (git / "HEAD").is_file():
+        head = (git / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            ref = head[5:]
+            path = git / ref
+            if ref.startswith("refs/") and ".." not in Path(ref).parts:
+                if path.is_file():
+                    head = path.read_text().strip()
+                elif (git / "packed-refs").is_file():
+                    head = next(
+                        (
+                            line.split()[0]
+                            for line in (git / "packed-refs").read_text().splitlines()
+                            if len(line.split()) == 2 and line.split()[1] == ref
+                        ),
+                        "",
+                    )
+        if re.fullmatch(r"[0-9a-f]{40}", head):
+            commit = head
+    lock = root / "uv.lock"
+    return {
+        "commit": commit,
+        "lockfile_sha256": hashlib.sha256(lock.read_bytes()).hexdigest()
+        if lock.is_file()
+        else None,
+    }
