@@ -33,14 +33,19 @@ harness can reuse its results across runs (it is a pure function of its argument
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 
+from quant.core.calendar import NEW_YORK
 from quant.core.calibration import Calibration, CalibrationConfig, CalibrationSource
+from quant.core.clock import ensure_utc
+from quant.core.errors import ModelError
 from quant.data.market_db import BarStore
-from quant.data.policy import DataPolicy
+from quant.data.policy import FIT_START, DataPolicy, Purpose
 from quant.eval.calibration import ForecastSeries, build_calibration, model_series
 from quant.features.menu import FeatureConfig
+from quant.features.stream import compute_features
+from quant.hmm.model import load_model
 from quant.store.ops import OpsStore
 
 __all__ = [
@@ -68,7 +73,15 @@ def model_spans(ops: OpsStore, *, as_of: datetime) -> tuple[ModelSpan, ...]:
     first: for consecutive pointers i, i + 1 (in seq order) the span [effective_at_i,
     min(effective_at_{i+1}, as_of)), the last one ending at `as_of`, empty spans left out.
     ClockError for a naive `as_of`."""
-    raise NotImplementedError("B7b: model_spans")
+    as_of = ensure_utc(as_of)
+    rows = ops.pointers("model")
+    out = []
+    for i, p in enumerate(rows):
+        end = rows[i + 1].effective_at if i + 1 < len(rows) else as_of
+        end = min(end, as_of)
+        if p.effective_at < end:
+            out.append(ModelSpan(p.artifact, p.effective_at, end))
+    return tuple(out)
 
 
 def calibration_series(
@@ -90,7 +103,35 @@ def calibration_series(
     `features.config_hash()` or its columns aren't the config's, or `model_series` refuses (a
     span starting before its model's fit_end is in-sample). PolicyError as the view raises it;
     ClockError for a naive `as_of`."""
-    raise NotImplementedError("B7b: calibration_series")
+    as_of = ensure_utc(as_of)
+    spans = model_spans(ops, as_of=as_of)
+    if not spans:
+        return ForecastSeries.empty()
+    origin = datetime.combine(FIT_START, time(), tzinfo=NEW_YORK).astimezone(UTC)
+    bars = store.view(as_of, as_of=as_of, policy=policy).hourly(
+        symbol, purpose=Purpose.CALIBRATE, since=origin
+    )
+    matrix = compute_features(bars, features)
+    parts = []
+    for span in spans:
+        model = load_model(artifacts / "models" / span.artifact)
+        if (
+            model.feature_config_hash != features.config_hash()
+            or model.scaler.columns != features.columns
+        ):
+            raise ModelError(
+                "governing model feature config or columns disagree with calibration features"
+            )
+        parts.append(
+            model_series(
+                model,
+                matrix.window(model.fit_start, span.end),
+                start=span.start,
+                end=span.end,
+                level=level,
+            )
+        )
+    return ForecastSeries.concat(parts)
 
 
 def calibrate(
@@ -109,4 +150,18 @@ def calibrate(
     features=features, artifacts=artifacts, level=config.outcome_level, policy=policy),
     as_of=as_of, source=source, config=config)` (module docstring, step 4). Writes nothing:
     neither the artifact nor a pointer. Raises as those do."""
-    raise NotImplementedError("B7b: calibrate")
+    return build_calibration(
+        calibration_series(
+            store,
+            ops,
+            as_of=as_of,
+            symbol=symbol,
+            features=features,
+            artifacts=artifacts,
+            level=config.outcome_level,
+            policy=policy,
+        ),
+        as_of=as_of,
+        source=source,
+        config=config,
+    )

@@ -20,7 +20,6 @@ from quant.core.errors import ModelError
 from quant.core.regime import Label
 from tests.support.calibration import forecaster, ref_bin, ref_isotonic, ref_metrics
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 CONFIG = r1_calibration_config()
 
 
@@ -70,7 +69,6 @@ def test_a_calibration_config_out_of_order_is_refused(update: dict[str, object])
 # --- the metrics ----------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4")
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_each_metric_is_the_formula(seed: int) -> None:
@@ -98,7 +96,6 @@ def test_each_metric_is_the_formula(seed: int) -> None:
     assert metrics.passed == ref["passed"]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4")
 @pytest.mark.parametrize(
     ("p", "expected"),
@@ -122,7 +119,6 @@ def test_reliability_bins_compare_the_decimal_value_of_each_forecast(
     assert bin_of(p) == expected
 
 
-@RED
 @pytest.mark.spec("SPEC§9")
 @pytest.mark.parametrize("p", [-0.1, 1.0000001, math.nan, math.inf])
 def test_a_forecast_outside_zero_to_one_has_no_bin(p: float) -> None:
@@ -132,7 +128,6 @@ def test_a_forecast_outside_zero_to_one_has_no_bin(p: float) -> None:
         bin_of(p)
 
 
-@RED
 @pytest.mark.spec("SPEC§9")
 def test_empty_bins_are_reported_empty_not_dropped() -> None:
     from quant.eval.calibration import reliability
@@ -147,7 +142,6 @@ def test_empty_bins_are_reported_empty_not_dropped() -> None:
     assert (curve[9].forecast, curve[9].observed) == (0.95, 1.0)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4")
 def test_ece_exactly_at_its_threshold_passes_and_the_next_float_fails() -> None:
     # Ten bars forecast 0.1 that never hold, and ten forecast 1.0 that always do:
@@ -168,7 +162,6 @@ def test_ece_exactly_at_its_threshold_passes_and_the_next_float_fails() -> None:
     assert not past.passed, "ECE past 0.05 must fail"
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4")
 def test_a_forecast_of_the_base_rate_has_skill_exactly_zero_and_fails() -> None:
     _, outcome = forecaster(1000, 3)
@@ -179,7 +172,6 @@ def test_a_forecast_of_the_base_rate_has_skill_exactly_zero_and_fails() -> None:
     assert not metrics.passed, "Brier skill must be strictly above 0"
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4")
 @pytest.mark.parametrize("held", [False, True], ids=["never", "always"])
 def test_a_label_whose_target_never_varies_has_no_skill_and_fails(held: bool) -> None:
@@ -195,7 +187,6 @@ def test_a_label_whose_target_never_varies_has_no_skill_and_fails(held: bool) ->
     assert not metrics.passed
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "C13")
 def test_no_bars_give_empty_metrics_that_fail() -> None:
     metrics = _metrics(np.empty(0, dtype=np.float64), np.empty(0, dtype=np.bool_))
@@ -211,7 +202,6 @@ def test_no_bars_give_empty_metrics_that_fail() -> None:
     assert not metrics.passed
 
 
-@RED
 @pytest.mark.spec("SPEC§9")
 @pytest.mark.parametrize(
     "fault", ["lengths", "nan", "above one", "below zero", "float outcome", "2-D", "float32"]
@@ -241,7 +231,6 @@ def test_malformed_forecasts_are_refused(fault: str) -> None:
 # --- PLAN B7's red tests --------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "C13")
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_a_well_calibrated_synthetic_forecaster_passes(seed: int) -> None:
@@ -259,7 +248,6 @@ def test_a_well_calibrated_synthetic_forecaster_passes(seed: int) -> None:
     assert (verdict.recalibrated, verdict.knots, knots) == (None, 0, None)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "C13")
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
 def test_a_miscalibrated_forecaster_fails_and_isotonic_recalibration_fixes_it(seed: int) -> None:
@@ -294,7 +282,6 @@ def test_a_miscalibrated_forecaster_fails_and_isotonic_recalibration_fixes_it(se
     assert np.array_equal(fitted[1], ref_y)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4")
 @pytest.mark.parametrize("seed", [0, 1])
 def test_a_recalibration_that_doesnt_hold_on_newer_bars_still_fails(seed: int) -> None:
@@ -316,7 +303,6 @@ def test_a_recalibration_that_doesnt_hold_on_newer_bars_still_fails(seed: int) -
     assert verdict.knots == len(knots[0])
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4")
 def test_a_forecast_without_information_still_fails_after_recalibration() -> None:
     # A constant forecast: isotonic maps it to one constant, which can't beat the base rate.
@@ -335,7 +321,6 @@ def test_a_forecast_without_information_still_fails_after_recalibration() -> Non
     assert len(knots[0]) == 1 == verdict.knots
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "C13")
 def test_without_enough_bars_a_label_fails_and_isnt_recalibrated() -> None:
     from quant.eval.calibration import calibrate_label
@@ -349,7 +334,6 @@ def test_without_enough_bars_a_label_fails_and_isnt_recalibrated() -> None:
     assert (verdict.recalibrated, verdict.knots, knots) == (None, 0, None)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4")
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_knots_are_monotone_within_zero_and_one(seed: int) -> None:
@@ -366,7 +350,6 @@ def test_knots_are_monotone_within_zero_and_one(seed: int) -> None:
     assert x[-1] <= forecast.max()
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4", "K3")
 def test_sizings_interpolation_is_scikit_learns_isotonic_prediction() -> None:
     # Sizing maps P through the knots with quant.core.calibration.interpolate (no scikit-learn
@@ -385,7 +368,6 @@ def test_sizings_interpolation_is_scikit_learns_isotonic_prediction() -> None:
     assert np.array_equal(interpolate(x[:1], y[:1], probe), np.full(len(probe), y[0]))
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4")
 @pytest.mark.parametrize(
     "fault",

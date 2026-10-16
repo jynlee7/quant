@@ -59,7 +59,6 @@ def _fit_only_store() -> BarStore:
 
 
 @pytest.mark.full
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 @pytest.mark.spec("SPEC§5", "SPEC§9", "C13", "T-NL2", "ARCH§7.3", "ARCH§7.4", "C7", "C11")
 def test_monthly_refits_through_2018_on_real_fit_data(tmp_path: Path) -> None:
     if not MARKET_DB.is_file():

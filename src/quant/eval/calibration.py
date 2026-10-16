@@ -70,27 +70,46 @@ models and hands them in. hmmlearn is not imported (I2).
 
 from __future__ import annotations
 
+import hashlib
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
+from fractions import Fraction
 from typing import Final
 
 import numpy as np
 import numpy.typing as npt
+from scipy.optimize import brentq
+from scipy.special import ndtr
+from sklearn.isotonic import IsotonicRegression
 
 from quant.core.calibration import (
+    BINS,
+    CALIBRATION_FORMAT,
     Calibration,
     CalibrationConfig,
+    CalibrationDocument,
     CalibrationSource,
     Knots,
     LabelMetrics,
     LabelVerdict,
     OutcomeCheck,
     ReliabilityBin,
+    interpolate,
 )
+from quant.core.canonical import sha256_hex
+from quant.core.clock import ensure_utc
+from quant.core.epoch import to_us
+from quant.core.errors import ModelError
 from quant.core.regime import Label
 from quant.data.frames import Floats, Ints
-from quant.features.stream import FeatureMatrix
+from quant.eval.smoother import smooth
+from quant.features.stream import FeatureMatrix, freeze_arrays
+from quant.hmm.filter import forward_pass
+from quant.hmm.labels import label_probs, top_label
 from quant.hmm.model import HmmModel
 
 # A boolean outcome array: y_t, whether bar t's smoothed label is the label scored.
@@ -136,27 +155,117 @@ class ForecastSeries:
         """Raise ModelError unless the arrays have the dtypes and shapes above, every value is
         finite, the rules above hold and every `models` entry is 64 lowercase hex characters;
         then store the arrays read-only (`freeze_arrays`)."""
-        raise NotImplementedError("B7b: ForecastSeries.__post_init__")
+        n = (
+            len(self.available_at)
+            if isinstance(self.available_at, np.ndarray) and self.available_at.ndim == 1
+            else -1
+        )
+        ok = (
+            isinstance(self.available_at, np.ndarray)
+            and self.available_at.dtype == np.int64
+            and self.available_at.ndim == 1
+            and isinstance(self.forecast, np.ndarray)
+            and self.forecast.dtype == np.float64
+            and self.forecast.shape == (n, len(LABELS))
+            and isinstance(self.smoothed, np.ndarray)
+            and self.smoothed.dtype == np.float64
+            and self.smoothed.shape == (n, len(LABELS))
+            and isinstance(self.target, np.ndarray)
+            and self.target.dtype == np.int64
+            and self.target.shape == (n,)
+            and all(
+                isinstance(a, np.ndarray) and a.dtype == np.float64 and a.shape == (n,)
+                for a in (self.low, self.high, self.realized)
+            )
+        )
+        if not ok:
+            raise ModelError("forecast series arrays have invalid dtypes or shapes")
+        if n and not (
+            (np.diff(self.available_at) > 0).all()
+            and np.isfinite(self.forecast).all()
+            and (self.forecast >= 0).all()
+            and (self.forecast <= 1).all()
+            and (np.abs(self.forecast.sum(axis=1) - 1) <= 1e-9).all()
+            and ((self.target >= 0) & (self.target < len(LABELS))).all()
+            and np.isfinite(self.smoothed).all()
+            and (self.smoothed >= 0).all()
+            and (self.smoothed <= 1).all()
+            and (np.abs(self.smoothed.sum(axis=1) - 1) <= 1e-9).all()
+            and np.isfinite(self.low).all()
+            and np.isfinite(self.high).all()
+            and np.isfinite(self.realized).all()
+            and (self.low <= self.high).all()
+        ):
+            raise ModelError("forecast series values or time order are invalid")
+        if not isinstance(self.models, tuple) or any(
+            not isinstance(m, str) or re.fullmatch(r"[0-9a-f]{64}", m) is None for m in self.models
+        ):
+            raise ModelError("forecast series model hashes must be lowercase SHA-256")
+        freeze_arrays(
+            self, "available_at", "forecast", "target", "smoothed", "low", "high", "realized"
+        )
 
     def __len__(self) -> int:
-        raise NotImplementedError("B7b: ForecastSeries.__len__")
+        return len(self.available_at)
 
     @classmethod
     def empty(cls) -> ForecastSeries:
         """No bars and no models."""
-        raise NotImplementedError("B7b: ForecastSeries.empty")
+        return cls(
+            (),
+            np.empty(0, np.int64),
+            np.empty((0, len(LABELS))),
+            np.empty(0, np.int64),
+            np.empty((0, len(LABELS))),
+            np.empty(0),
+            np.empty(0),
+            np.empty(0),
+        )
 
     @classmethod
     def concat(cls, parts: Sequence[ForecastSeries]) -> ForecastSeries:
         """The parts' bars in order, and their models in order. ModelError when the bars don't
         strictly increase across parts."""
-        raise NotImplementedError("B7b: ForecastSeries.concat")
+        parts = list(parts)
+        if not parts:
+            return cls.empty()
+        t = np.concatenate([p.available_at for p in parts])
+        if len(t) and not (np.diff(t) > 0).all():
+            raise ModelError("forecast series parts must increase strictly in time")
+        return cls(
+            tuple(m for p in parts for m in p.models),
+            t,
+            np.concatenate([p.forecast for p in parts]) if len(t) else np.empty((0, len(LABELS))),
+            np.concatenate([p.target for p in parts]),
+            np.concatenate([p.smoothed for p in parts]),
+            np.concatenate([p.low for p in parts]),
+            np.concatenate([p.high for p in parts]),
+            np.concatenate([p.realized for p in parts]),
+        )
 
     def data_hash(self) -> str:
         """`quant.core.canonical.sha256_hex` of {"models": [...], and for each of
         "available_at", "forecast", "target", "smoothed", "low", "high", "realized" {"dtype",
         "shape", "sha256"}}, each array hashed as HmmModel's are (little-endian, C-order bytes)."""
-        raise NotImplementedError("B7b: ForecastSeries.data_hash")
+        arrays = {
+            n: getattr(self, n)
+            for n in ("available_at", "forecast", "target", "smoothed", "low", "high", "realized")
+        }
+        return sha256_hex(
+            {
+                "models": list(self.models),
+                **{
+                    n: {
+                        "dtype": a.dtype.str,
+                        "shape": list(a.shape),
+                        "sha256": hashlib.sha256(
+                            np.ascontiguousarray(a, dtype=a.dtype.newbyteorder("<")).tobytes()
+                        ).hexdigest(),
+                    }
+                    for n, a in arrays.items()
+                },
+            }
+        )
 
 
 def f1_interval(model: HmmModel, next_state_probs: Floats, *, level: float) -> tuple[float, float]:
@@ -173,7 +282,36 @@ def f1_interval(model: HmmModel, next_state_probs: Floats, *, level: float) -> t
     Raises ModelError when the scaler has no OUTCOME_FEATURE column, `next_state_probs` isn't a
     float64 (K,) vector of nonnegative values summing to 1 within 1e-9, or `level` isn't in
     (0, 1)."""
-    raise NotImplementedError("B7b: f1_interval")
+    cols = model.scaler.columns
+    if OUTCOME_FEATURE not in cols:
+        raise ModelError("predictive interval requires the ret feature")
+    q = next_state_probs
+    k = model.params.n_states
+    if not (
+        isinstance(q, np.ndarray)
+        and q.dtype == np.float64
+        and q.shape == (k,)
+        and np.isfinite(q).all()
+        and (q >= 0).all()
+        and abs(q.sum() - 1) <= 1e-9
+    ):
+        raise ModelError("next-state probabilities must be a float64 probability vector")
+    if not 0 < level < 1:
+        raise ModelError("predictive interval level must lie in (0, 1)")
+    i = cols.index(OUTCOME_FEATURE)
+    mu = model.params.means[:, i] * model.scaler.std[i] + model.scaler.mean[i]
+    sd = np.sqrt(model.params.covars[:, i, i]) * model.scaler.std[i]
+    live = q > 0
+    lo = float(np.min(mu[live] - INTERVAL_SPAN * sd[live]))
+    hi = float(np.max(mu[live] + INTERVAL_SPAN * sd[live]))
+
+    def cdf(x: float) -> float:
+        return float(np.sum(q[live] * ndtr((x - mu[live]) / sd[live])))
+
+    return (
+        brentq(lambda x: cdf(x) - (1 - level) / 2, lo, hi, xtol=INTERVAL_XTOL),
+        brentq(lambda x: cdf(x) - (1 + level) / 2, lo, hi, xtol=INTERVAL_XTOL),
+    )
 
 
 def model_series(
@@ -193,20 +331,69 @@ def model_series(
     [model.fit_start, end); start < model.fit_end (an in-sample span); start >= end; the matrix
     has no rows; or `forward_pass`, `smooth` or `f1_interval` refuses. ClockError for a naive
     time."""
-    raise NotImplementedError("B7b: model_series")
+    start, end = ensure_utc(start), ensure_utc(end)
+    if (
+        matrix.columns != model.scaler.columns
+        or not len(matrix)
+        or start < model.fit_end
+        or start >= end
+    ):
+        raise ModelError(
+            "model series requires nonempty rows and an out-of-sample span with matching columns"
+        )
+    if int(matrix.available_at.min()) < to_us(model.fit_start) or int(
+        matrix.available_at.max()
+    ) >= to_us(end):
+        raise ModelError("model series rows must lie within [fit_start, end)")
+    trace = forward_pass(model.params, model.scaler, matrix.values, columns=matrix.columns)
+    smoothed = smooth(model.params, model.scaler, matrix.values, columns=matrix.columns)
+    indices = np.nonzero(matrix.available_at >= to_us(start))[0]
+    if not len(indices):
+        return ForecastSeries.empty()
+    i = matrix.columns.index(OUTCOME_FEATURE)
+    forecast = np.empty((len(indices), len(LABELS)))
+    smoothed_forecast = np.empty_like(forecast)
+    target = np.empty(len(indices), np.int64)
+    low = np.empty(len(indices))
+    high = np.empty(len(indices))
+    for j, t in enumerate(indices):
+        filtered_probs = label_probs(trace.state_probs[t], model.labels)
+        forecast[j] = [min(1.0, max(0.0, filtered_probs.get(label, 0.0))) for label in LABELS]
+        smooth_probs = label_probs(smoothed[t], model.labels)
+        smoothed_forecast[j] = [
+            min(1.0, max(0.0, smooth_probs.get(label, 0.0))) for label in LABELS
+        ]
+        target[j] = LABELS.index(top_label(smooth_probs))
+        low[j], high[j] = f1_interval(
+            model, trace.state_probs[t] @ model.params.transmat, level=level
+        )
+    return ForecastSeries(
+        (model.artifact_hash(),),
+        matrix.available_at[indices].copy(),
+        forecast,
+        target,
+        smoothed_forecast,
+        low,
+        high,
+        matrix.values[indices, i].copy(),
+    )
 
 
 def bin_of(p: float) -> int:
     """The reliability bin of forecast `p` in [0, 1]: min(BINS - 1, ⌊10 · Decimal(repr(p))⌋),
     so 0.1 is in bin 1, 0.3 in bin 3 (its repr is "0.3") and 1.0 in bin 9. ModelError for a
     value that isn't a finite float in [0, 1]."""
-    raise NotImplementedError("B7b: bin_of")
+    if not isinstance(p, float) or not math.isfinite(p) or p < 0 or p > 1:
+        raise ModelError("reliability forecast must be a finite float in [0, 1]")
+    return min(BINS - 1, int(Decimal(repr(p)) * 10))
 
 
 def brier_score(forecast: Floats, outcome: Bools) -> float:
     """`math.fsum((p - y)²) / n` over the bars, y = 1.0 where `outcome` is True. ModelError for
     n = 0, unequal lengths, or a forecast outside [0, 1] or not finite."""
-    raise NotImplementedError("B7b: brier_score")
+    _check(forecast, outcome, False)
+    y = outcome.astype(np.float64)
+    return math.fsum((forecast - y) ** 2) / len(forecast)
 
 
 def reliability(forecast: Floats, outcome: Bools) -> tuple[ReliabilityBin, ...]:
@@ -214,13 +401,36 @@ def reliability(forecast: Floats, outcome: Bools) -> tuple[ReliabilityBin, ...]:
     (b + 1)/10 (as the floats `b / 10`), its count, `fsum(p) / count` and `fsum(y) / count`, or
     None for both when empty. n = 0 gives BINS empty bins. Validates as `brier_score` (n = 0
     allowed)."""
-    raise NotImplementedError("B7b: reliability")
+    _check(forecast, outcome)
+    b = _bins(forecast)
+    y = outcome.astype(np.float64)
+    out = []
+    for k in range(BINS):
+        m = b == k
+        c = int(m.sum())
+        out.append(
+            ReliabilityBin(
+                lower=k / 10,
+                upper=(k + 1) / 10,
+                count=c,
+                forecast=math.fsum(forecast[m]) / c if c else None,
+                observed=math.fsum(y[m]) / c if c else None,
+            )
+        )
+    return tuple(out)
 
 
 def expected_calibration_error(forecast: Floats, outcome: Bools) -> float:
     """ECE = `math.fsum(abs(fsum(p in bin) - count(y in bin)) for each non-empty bin) / n`
     (module docstring). ModelError for n = 0, as `brier_score` otherwise."""
-    raise NotImplementedError("B7b: expected_calibration_error")
+    _check(forecast, outcome, False)
+    b = _bins(forecast)
+    y = outcome.astype(np.float64)
+    return math.fsum(
+        abs(math.fsum(forecast[b == k]) - math.fsum(y[b == k]))
+        for k in range(BINS)
+        if (b == k).any()
+    ) / len(forecast)
 
 
 def label_metrics(forecast: Floats, outcome: Bools, *, config: CalibrationConfig) -> LabelMetrics:
@@ -228,7 +438,36 @@ def label_metrics(forecast: Floats, outcome: Bools, *, config: CalibrationConfig
     the empty metrics (every number None, BINS empty bins, passed False). Raises ModelError for
     unequal lengths, `outcome` not a 1-D bool array, or a forecast that isn't a 1-D float64
     array of finite values in [0, 1]."""
-    raise NotImplementedError("B7b: label_metrics")
+    _check(forecast, outcome)
+    n = len(forecast)
+    if not n:
+        return LabelMetrics(
+            n=0,
+            base_rate=None,
+            brier=None,
+            reference=None,
+            skill=None,
+            ece=None,
+            reliability=reliability(forecast, outcome),
+            passed=False,
+        )
+    y = outcome.astype(np.float64)
+    base = math.fsum(y) / n
+    bs = brier_score(forecast, outcome)
+    ref = brier_score(np.full(n, base), outcome)
+    skill = None if ref == 0 else 1 - bs / ref
+    ece = expected_calibration_error(forecast, outcome)
+    passed = skill is not None and skill > 0 and Decimal(repr(ece)) <= Decimal(repr(config.ece_max))
+    return LabelMetrics(
+        n=n,
+        base_rate=base,
+        brier=bs,
+        reference=ref,
+        skill=skill,
+        ece=ece,
+        reliability=reliability(forecast, outcome),
+        passed=passed,
+    )
 
 
 def fit_isotonic(forecast: Floats, outcome: Bools) -> Knots:
@@ -237,7 +476,13 @@ def fit_isotonic(forecast: Floats, outcome: Bools) -> Knots:
     them, its `X_thresholds_` and `y_thresholds_` as new float64 arrays (x strictly increasing,
     y nondecreasing in [0, 1]). Deterministic. ModelError for n = 0, as `label_metrics`
     otherwise."""
-    raise NotImplementedError("B7b: fit_isotonic")
+    _check(forecast, outcome, False)
+    fitted = IsotonicRegression(y_min=0.0, y_max=1.0, increasing=True, out_of_bounds="clip").fit(
+        forecast, outcome.astype(np.float64)
+    )
+    return np.asarray(fitted.X_thresholds_, dtype=np.float64).copy(), np.asarray(
+        fitted.y_thresholds_, dtype=np.float64
+    ).copy()
 
 
 def calibrate_label(
@@ -259,7 +504,24 @@ def calibrate_label(
       recalibrated.passed; the verdict counts the artifact knots.
 
     Validates as `label_metrics`."""
-    raise NotImplementedError("B7b: calibrate_label")
+    raw = label_metrics(forecast, outcome, config=config)
+    if not sufficient:
+        return LabelVerdict(label=label, raw=raw, recalibrated=None, knots=0, passed=False), None
+    if raw.passed:
+        return LabelVerdict(label=label, raw=raw, recalibrated=None, knots=0, passed=True), None
+    half = len(forecast) // 2
+    early_x, early_y = fit_isotonic(forecast[:half], outcome[:half])
+    recalibrated = label_metrics(
+        interpolate(early_x, early_y, forecast[half:]), outcome[half:], config=config
+    )
+    knots = fit_isotonic(forecast, outcome)
+    return LabelVerdict(
+        label=label,
+        raw=raw,
+        recalibrated=recalibrated,
+        knots=len(knots[0]),
+        passed=recalibrated.passed,
+    ), knots
 
 
 def outcome_check(series: ForecastSeries, *, config: CalibrationConfig) -> OutcomeCheck:
@@ -268,7 +530,22 @@ def outcome_check(series: ForecastSeries, *, config: CalibrationConfig) -> Outco
     when low[t - 1] ≤ realized[t] ≤ high[t - 1]; level = config.outcome_level; passed when there
     are config.outcome_bars pairs and Fraction(covered, n) lies in [Fraction(Decimal(repr(
     coverage_low))), Fraction(Decimal(repr(coverage_high)))]."""
-    raise NotImplementedError("B7b: outcome_check")
+    n = len(series)
+    pairs = max(0, n - 1)
+    m = min(config.outcome_bars, pairs)
+    covered = 0
+    for t in range(n - m, n):
+        if series.low[t - 1] <= series.realized[t] <= series.high[t - 1]:
+            covered += 1
+    passed = (
+        m == config.outcome_bars
+        and Fraction(Decimal(repr(config.coverage_low)))
+        <= Fraction(covered, m)
+        <= Fraction(Decimal(repr(config.coverage_high)))
+        if m
+        else False
+    )
+    return OutcomeCheck(n=m, covered=covered, level=config.outcome_level, passed=passed)
 
 
 def build_calibration(
@@ -290,4 +567,58 @@ def build_calibration(
     Raises ModelError, before scoring anything, when a bar's available_at is at or after
     `as_of` (the calibration would score what wasn't known at its as-of time). ClockError for a
     naive `as_of`."""
-    raise NotImplementedError("B7b: build_calibration")
+    as_of = ensure_utc(as_of)
+    if len(series) and int(series.available_at.max()) >= to_us(as_of):
+        raise ModelError("calibration series contains bars at or after its as-of time")
+    bars = len(series)
+    scored = max(0, bars - config.settle_bars)
+    sufficient = scored >= config.min_bars
+    verdicts = []
+    knots = {}
+    for j, label in enumerate(LABELS):
+        verdict, label_knots = calibrate_label(
+            label,
+            np.ascontiguousarray(series.forecast[:scored, j]),
+            series.target[:scored] == j,
+            config=config,
+            sufficient=sufficient,
+        )
+        verdicts.append(verdict)
+        if label_knots is not None:
+            knots[label] = label_knots
+    document = CalibrationDocument(
+        format=CALIBRATION_FORMAT,
+        source=source,
+        as_of=as_of,
+        models=series.models,
+        bars=bars,
+        scored=scored,
+        sufficient=sufficient,
+        data_hash=series.data_hash(),
+        config=config,
+        labels=tuple(verdicts),
+        outcome=outcome_check(series, config=config),
+    )
+    return Calibration(document, knots)
+
+
+def _check(forecast: Floats, outcome: Bools, allow_empty: bool = True) -> None:
+    if not (
+        isinstance(forecast, np.ndarray)
+        and forecast.dtype == np.float64
+        and forecast.ndim == 1
+        and isinstance(outcome, np.ndarray)
+        and outcome.dtype == np.bool_
+        and outcome.shape == forecast.shape
+    ):
+        raise ModelError(
+            "metrics require matching one-dimensional float64 forecasts and bool outcomes"
+        )
+    if not np.isfinite(forecast).all() or (forecast < 0).any() or (forecast > 1).any():
+        raise ModelError("forecasts must be finite probabilities in [0, 1]")
+    if not allow_empty and not len(forecast):
+        raise ModelError("metrics require at least one forecast")
+
+
+def _bins(forecast: Floats) -> Ints:
+    return np.array([bin_of(float(p)) for p in forecast], dtype=np.int64)

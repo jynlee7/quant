@@ -315,7 +315,9 @@ class OpsStore:
         FROZEN, or given for REJECTED; `reasons` is empty for FROZEN or REJECTED, or not empty
         for ACTIVATED, or holds an empty string. ClockError for a naive `at` or `cutoff`."""
         if calibration is not None:
-            raise NotImplementedError("B7b: record_refit appends the pass's calibration pointer")
+            self._hash(calibration)
+            if outcome is not RefitOutcomeKind.ACTIVATED:
+                raise DataError("only an activated refit can activate a calibration")
         at, cutoff = ensure_utc(at), ensure_utc(cutoff)
         self._hash(previous)
         if artifact is not None:
@@ -335,6 +337,8 @@ class OpsStore:
             if outcome is RefitOutcomeKind.ACTIVATED:
                 pointer = self._pointer("model", cast(str, artifact), detail, stamp, calendar)
                 effective = pointer.effective_at
+                if calibration is not None:
+                    self._pointer("calibration", calibration, detail, stamp, calendar)
                 if self.frozen(effective):
                     self._freeze(False, UnfreezeCause.REFIT_PASSED.value, detail, effective, stamp)
             elif outcome is RefitOutcomeKind.FROZEN:

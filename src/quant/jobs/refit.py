@@ -58,7 +58,12 @@ from typing import Any, Final
 import structlog
 
 from quant.core.calendar import NEW_YORK, TradingCalendar
-from quant.core.calibration import Calibration, CalibrationConfig, r1_calibration_config
+from quant.core.calibration import (
+    Calibration,
+    CalibrationConfig,
+    r1_calibration_config,
+    save_calibration,
+)
 from quant.core.clock import ensure_utc
 from quant.core.errors import ModelError
 from quant.data.market_db import BarStore
@@ -265,8 +270,13 @@ def run_refit(
         report = None
     if model is not None:
         directory = save_model(model, artifacts / "models")
+    calibrated = None
+    calibration_directory = None
     if kind is RefitOutcomeKind.ACTIVATED and calibration is not None:
-        raise NotImplementedError("B7b: run_refit builds and activates the pass's calibration")
+        calibrated = calibration(data.fit_end)
+        if calibrated.as_of != data.fit_end:
+            raise ModelError("refit calibration must be as of its data cutoff")
+        calibration_directory = save_calibration(calibrated, artifacts / "calibrations")
     event = ops.record_refit(
         at=at,
         cutoff=data.fit_end,
@@ -275,6 +285,7 @@ def run_refit(
         previous=previous,
         reasons=reasons,
         calendar=calendar,
+        calibration=None if calibrated is None else calibrated.artifact_hash(),
     )
     logger = structlog.get_logger()
     if kind is RefitOutcomeKind.ACTIVATED:
@@ -287,7 +298,19 @@ def run_refit(
             artifact=event.artifact,
         )
     return RefitOutcome(
-        kind, at, data.fit_end, previous, model, directory, match, report, sanity, reasons, event
+        kind,
+        at,
+        data.fit_end,
+        previous,
+        model,
+        directory,
+        match,
+        report,
+        sanity,
+        reasons,
+        event,
+        calibrated,
+        calibration_directory,
     )
 
 

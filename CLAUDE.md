@@ -1,6 +1,6 @@
 # CLAUDE.md: SPY Regime Trader
 
-This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.6, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.10 and [docs/PLAN.md](docs/PLAN.md) v1.4. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
+This is a paper-trading system for SPY on 1-hour bars through Alpaca paper. A Gaussian HMM reads the regime, deterministic code decides and sizes, and hard risk limits sit in code. The approved design is in [docs/SPEC.md](docs/SPEC.md) v1.6, [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) v1.11 and [docs/PLAN.md](docs/PLAN.md) v1.4. Build progress is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
 
 ## Start every session here
 

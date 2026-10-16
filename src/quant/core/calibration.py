@@ -60,17 +60,28 @@ Times are UTC. "Now" never appears here (K6): a calibration's only time is its a
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import os
+import re
+import shutil
+import tempfile
+import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final, Self
 
 import numpy as np
 import numpy.typing as npt
 from pydantic import AwareDatetime, model_validator
 
+from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
+from quant.core.clock import ensure_utc
+from quant.core.errors import ClockError, ModelError
 from quant.core.model import StrictModel
 from quant.core.regime import Label
 
@@ -267,7 +278,16 @@ def interpolate(knots_x: Floats, knots_y: Floats, values: Floats) -> Floats:
     Raises ModelError unless the knots are 1-D float64 arrays of one length m ≥ 1, x strictly
     increasing, y nondecreasing within [0, 1], all finite, and `values` is a float64 array of
     finite values in [0, 1]."""
-    raise NotImplementedError("B7b: interpolate")
+    _check_knots(knots_x, knots_y)
+    if not (
+        isinstance(values, np.ndarray)
+        and values.dtype == np.float64
+        and np.isfinite(values).all()
+        and (values >= 0).all()
+        and (values <= 1).all()
+    ):
+        raise ModelError("values must be probabilities")
+    return np.asarray(np.interp(values, knots_x, knots_y), dtype=np.float64)
 
 
 @dataclass(frozen=True, eq=False)
@@ -297,29 +317,81 @@ class Calibration:
         Store `knots` as a read-only mapping of read-only array copies (as
         `quant.features.stream.freeze_arrays` makes them, without importing it), so nothing
         reachable from a Calibration can change its hash."""
-        raise NotImplementedError("B7b: Calibration.__post_init__")
+        document = self.document
+        config = document.config
+        if document.format != CALIBRATION_FORMAT or tuple(
+            verdict.label for verdict in document.labels
+        ) != tuple(Label):
+            raise ModelError("calibration format or label order is invalid")
+        if any(
+            len(verdict.raw.reliability) != BINS
+            or (verdict.recalibrated is not None and len(verdict.recalibrated.reliability) != BINS)
+            for verdict in document.labels
+        ):
+            raise ModelError("calibration metrics must have ten reliability bins")
+        if document.scored != max(0, document.bars - config.settle_bars) or document.sufficient != (
+            document.scored >= config.min_bars
+        ):
+            raise ModelError("calibration scored count or sufficiency disagrees with its config")
+        for verdict in document.labels:
+            if verdict.passed != (
+                document.sufficient
+                and (
+                    verdict.raw.passed
+                    or (verdict.recalibrated is not None and verdict.recalibrated.passed)
+                )
+            ):
+                raise ModelError("label verdict disagrees with its metrics or sufficiency")
+            if (verdict.knots > 0) != (verdict.recalibrated is not None) or verdict.knots < 0:
+                raise ModelError("knot count disagrees with recalibration metrics")
+        expected = {
+            verdict.label: verdict.knots for verdict in document.labels if verdict.knots > 0
+        }
+        if set(self.knots) != set(expected):
+            raise ModelError("knot labels disagree with the document")
+        frozen = {}
+        for label in Label:
+            if label in expected:
+                x, y = self.knots[label]
+                _check_knots(x, y)
+                if len(x) != expected[label]:
+                    raise ModelError("knot length disagrees with the document")
+                frozen[label] = (_ro(x), _ro(y))
+        if document.outcome.level != config.outcome_level or not (
+            0 <= document.outcome.covered <= document.outcome.n <= config.outcome_bars
+        ):
+            raise ModelError("outcome level or counts disagree with the config")
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", m) is None for m in (*document.models, document.data_hash)
+        ):
+            raise ModelError("calibration artifact hash is invalid or does not match")
+        object.__setattr__(self, "knots", MappingProxyType(frozen))
 
     @property
     def as_of(self) -> datetime:
         """`document.as_of`, in UTC."""
-        raise NotImplementedError("B7b: Calibration.as_of")
+        return ensure_utc(self.document.as_of)
 
     @property
     def source(self) -> CalibrationSource:
-        raise NotImplementedError("B7b: Calibration.source")
+        return self.document.source
 
     def verdict(self, label: Label) -> LabelVerdict:
         """The label's LabelVerdict."""
-        raise NotImplementedError("B7b: Calibration.verdict")
+        return self.document.labels[tuple(Label).index(label)]
 
     def passed(self, label: Label) -> bool:
         """The label's verdict: `verdict(label).passed`."""
-        raise NotImplementedError("B7b: Calibration.passed")
+        return self.verdict(label).passed
 
     def cap_fraction(self, label: Label) -> float:
         """1.0 when `passed(label)` and the outcome check passed, else `config.failed_cap`
         (module docstring, "Using one")."""
-        raise NotImplementedError("B7b: Calibration.cap_fraction")
+        return (
+            1.0
+            if self.passed(label) and self.document.outcome.passed
+            else self.document.config.failed_cap
+        )
 
     def calibrated(self, label: Label, p: float) -> float:
         """P̃ for a filtered probability `p` of `label`: `p` clipped to [0, 1], then mapped by
@@ -327,17 +399,47 @@ class Calibration:
         label's probability is a sum of state probabilities, which can leave [0, 1] by
         rounding, so `p` within PROBABILITY_SLACK outside it is clipped; ModelError for
         anything else (not finite, or further outside)."""
-        raise NotImplementedError("B7b: Calibration.calibrated")
+        if (
+            not isinstance(p, float)
+            or not np.isfinite(p)
+            or p < -PROBABILITY_SLACK
+            or p > 1 + PROBABILITY_SLACK
+        ):
+            raise ModelError(
+                "filtered probability must be finite and within probability slack of [0, 1]"
+            )
+        p = min(1.0, max(0.0, p))
+        if label in self.knots:
+            x, y = self.knots[label]
+            # Construction already validated and froze these knots; only p needs checking here.
+            return float(np.interp(p, x, y))
+        return p
 
     def require_before(self, tau: datetime) -> None:
         """T-NL2 (ARCHITECTURE §7.4): return when `as_of < tau`; raise ModelError, naming both
         times, when `tau <= as_of`. ClockError for a naive `tau`."""
-        raise NotImplementedError("B7b: Calibration.require_before")
+        tau = ensure_utc(tau)
+        if not self.as_of < tau:
+            raise ModelError(f"calibration as of {self.as_of} used at {tau}")
 
     def artifact_hash(self) -> str:
         """The artifact hash of the module docstring, 64 lowercase hex characters.
         Deterministic: it depends only on `document` and the knots' values."""
-        raise NotImplementedError("B7b: Calibration.artifact_hash")
+        return sha256_hex(
+            {
+                "calibration": self.document,
+                "knots": {
+                    n: {
+                        "dtype": "float64",
+                        "shape": list(a.shape),
+                        "sha256": hashlib.sha256(
+                            np.ascontiguousarray(a, dtype="<f8").tobytes()
+                        ).hexdigest(),
+                    }
+                    for n, a in _arrays(self).items()
+                },
+            }
+        )
 
 
 def save_calibration(calibration: Calibration, root: Path) -> Path:
@@ -349,7 +451,43 @@ def save_calibration(calibration: Calibration, root: Path) -> Path:
     exists checks it with `load_calibration` and returns it unchanged (idempotent, and never an
     overwrite); an existing directory that doesn't load as this calibration raises ModelError
     and is left alone. Any OSError is a ModelError."""
-    raise NotImplementedError("B7b: save_calibration")
+    digest = calibration.artifact_hash()
+    directory = root / digest
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        lock = os.open(root, os.O_RDONLY)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if directory.exists():
+                load_calibration(directory)
+                return directory
+            for stale in root.glob(".calibration-*"):
+                if stale.is_dir() and not stale.is_symlink():
+                    shutil.rmtree(stale)
+                else:
+                    stale.unlink()
+            with tempfile.TemporaryDirectory(prefix=".calibration-", dir=root) as temporary:
+                staged = Path(temporary) / digest
+                staged.mkdir()
+                with zipfile.ZipFile(
+                    staged / KNOTS_FILE, "w", compression=zipfile.ZIP_STORED
+                ) as archive:
+                    for name, array in _arrays(calibration).items():
+                        info = zipfile.ZipInfo(f"{name}.npy", date_time=(1980, 1, 1, 0, 0, 0))
+                        with archive.open(info, "w") as member:
+                            np.lib.format.write_array(member, array, allow_pickle=False)
+                (staged / DOCUMENT_FILE).write_bytes(
+                    canonical_dumps({"artifact_hash": digest, "calibration": calibration.document})
+                )
+                for path in (staged / KNOTS_FILE, staged / DOCUMENT_FILE, staged):
+                    _fsync(path)
+                staged.rename(directory)
+                _fsync(root)
+        finally:
+            os.close(lock)
+        return directory
+    except (OSError, ValueError) as exc:
+        raise ModelError(f"cannot save calibration artifact at {directory}") from exc
 
 
 def load_calibration(directory: Path) -> Calibration:
@@ -363,4 +501,82 @@ def load_calibration(directory: Path) -> Calibration:
     array that isn't float64; the Calibration fails its own checks; or the hash recomputed from
     what was read differs from calibration.json's `artifact_hash` or from the directory's
     name."""
-    raise NotImplementedError("B7b: load_calibration")
+    try:
+        raw = (directory / DOCUMENT_FILE).read_bytes()
+        payload = canonical_loads(raw)
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"artifact_hash", "calibration"}
+            or canonical_dumps(payload) != raw
+        ):
+            raise ModelError("calibration document must be canonical JSON with the expected keys")
+        document = CalibrationDocument.model_validate_json(canonical_dumps(payload["calibration"]))
+        expected = [
+            f"{verdict.label.value}_{a}.npy"
+            for verdict in document.labels
+            if verdict.knots > 0
+            for a in "xy"
+        ]
+        with zipfile.ZipFile(directory / KNOTS_FILE) as archive:
+            if sorted(archive.namelist()) != sorted(expected):
+                raise ModelError("knot archive members disagree with the document")
+        knots = {}
+        with np.load(directory / KNOTS_FILE, allow_pickle=False) as archive:
+            for verdict in document.labels:
+                if verdict.knots > 0:
+                    x, y = archive[f"{verdict.label.value}_x"], archive[f"{verdict.label.value}_y"]
+                    if x.dtype != np.float64 or y.dtype != np.float64:
+                        raise ModelError("knot arrays must be float64")
+                    knots[verdict.label] = (x, y)
+        calibration = Calibration(document, knots)
+        if (
+            calibration.artifact_hash() != payload["artifact_hash"]
+            or directory.name != payload["artifact_hash"]
+        ):
+            raise ModelError("calibration artifact hash is invalid or does not match")
+        return calibration
+    except (OSError, ValueError, TypeError, KeyError, zipfile.BadZipFile, ClockError) as exc:
+        raise ModelError("cannot load calibration artifact") from exc
+
+
+def _ro(a: Floats) -> Floats:
+    a = np.ascontiguousarray(a)
+    return np.frombuffer(a.tobytes(), dtype=a.dtype).reshape(a.shape)
+
+
+def _check_knots(x: Floats, y: Floats) -> None:
+    if not (
+        isinstance(x, np.ndarray)
+        and isinstance(y, np.ndarray)
+        and x.dtype == np.float64
+        and y.dtype == np.float64
+        and x.ndim == 1
+        and y.shape == x.shape
+        and len(x) >= 1
+        and np.isfinite(x).all()
+        and np.isfinite(y).all()
+        and (np.diff(x) > 0).all()
+        and (np.diff(y) >= 0).all()
+        and (y >= 0).all()
+        and (y <= 1).all()
+    ):
+        raise ModelError("knots must be an isotonic map")
+
+
+def _arrays(self: Calibration) -> dict[str, Floats]:
+    out = {}
+    for label in Label:
+        if label in self.knots:
+            x, y = self.knots[label]
+            out[f"{label.value}_x"] = x
+            out[f"{label.value}_y"] = y
+    return out
+
+
+def _fsync(path: Path) -> None:
+    """Flush a file's or a directory's contents and entries to the device."""
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

@@ -29,7 +29,6 @@ from tests.support.calibration import (
     series,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 CONFIG = r1_calibration_config()
 CALM, CHOP = LABELS.index(Label.CALM_UP), LABELS.index(Label.CHOP)
 
@@ -58,7 +57,6 @@ def _build(s: object, as_of: datetime, **kwargs: object) -> object:
 # --- C13 ------------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9", "A4")
 def test_fewer_than_a_thousand_out_of_sample_bars_fail_every_label() -> None:
     # 1,034 bars leave 999 once the newest 35 are out: every label fails, however good.
@@ -90,7 +88,6 @@ def test_fewer_than_a_thousand_out_of_sample_bars_fail_every_label() -> None:
         assert enough.cap_fraction(label) == 0.25
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9", "A4")
 def test_the_newest_35_bars_are_left_out_of_the_label_metrics() -> None:
     n = 1035
@@ -122,7 +119,6 @@ def test_the_newest_35_bars_are_left_out_of_the_label_metrics() -> None:
     assert scored.document.labels[CALM].raw.n == reference.document.labels[CALM].raw.n == 1000
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9")
 def test_fewer_bars_than_the_settling_window_score_nothing() -> None:
     calibration = _build(_exact_series(20), after(20))
@@ -131,7 +127,6 @@ def test_fewer_bars_than_the_settling_window_score_nothing() -> None:
     assert all(v.raw.n == 0 and not v.passed for v in document.labels)
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9", "ARCH§7.4")
 def test_an_empty_series_is_a_calibration_in_which_every_label_fails() -> None:
     from quant.eval.calibration import ForecastSeries
@@ -154,7 +149,6 @@ def test_an_empty_series_is_a_calibration_in_which_every_label_fails() -> None:
         assert calibration.calibrated(label, 0.4) == 0.4  # no knots: P̃ = P
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9")
 def test_a_failing_label_with_enough_bars_is_recalibrated_on_the_scored_bars_only() -> None:
     n = 4035
@@ -187,7 +181,6 @@ def _covering(k: int, pairs: int = 1000) -> np.ndarray:
     return covered
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9", "A4")
 @pytest.mark.parametrize(
     ("covered", "passes"),
@@ -201,7 +194,6 @@ def test_the_outcome_check_passes_on_exactly_its_binomial_band(covered: int, pas
     assert check.passed is passes
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9")
 def test_the_outcome_check_uses_the_latest_thousand_pairs() -> None:
     from quant.eval.calibration import outcome_check
@@ -218,7 +210,6 @@ def test_the_outcome_check_uses_the_latest_thousand_pairs() -> None:
     assert not few.passed
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9")
 def test_the_outcome_check_keeps_the_newest_bars() -> None:
     # The settling window is for smoothed labels; the realized F1 of the newest bars is final.
@@ -232,7 +223,6 @@ def test_the_outcome_check_keeps_the_newest_bars() -> None:
     assert check.covered == 900 - int(covered_share(n)[-35:].sum())
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9")
 @pytest.mark.parametrize(
     ("realized", "covered"),
@@ -265,7 +255,6 @@ def test_the_interval_includes_both_ends(realized: float, covered: bool) -> None
     assert check.covered == 1 + int(covered)  # pair (1, 2) is covered in any case
 
 
-@RED
 @pytest.mark.spec("C13", "SPEC§9", "A4")
 def test_a_failed_outcome_check_caps_every_label() -> None:
     n = 1035
@@ -279,7 +268,6 @@ def test_a_failed_outcome_check_caps_every_label() -> None:
 # --- the series and the as-of time ----------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("T-NL2", "ARCH§7.4", "C13")
 def test_a_series_holding_a_bar_at_or_after_the_as_of_time_is_refused() -> None:
     n = 50
@@ -293,7 +281,6 @@ def test_a_series_holding_a_bar_at_or_after_the_as_of_time_is_refused() -> None:
         _build(s, last.replace(tzinfo=None) + timedelta(hours=1))
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "SPEC§9")
 def test_the_document_records_its_source_models_data_and_as_of() -> None:
     from zoneinfo import ZoneInfo
@@ -311,7 +298,6 @@ def test_the_document_records_its_source_models_data_and_as_of() -> None:
     assert [v.label for v in document.labels] == list(Label)
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "SPEC§9")
 @pytest.mark.parametrize(
     "fault",
@@ -368,7 +354,6 @@ def test_a_malformed_series_is_refused(fault: str) -> None:
         ForecastSeries(**parts)
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "SPEC§9")
 def test_series_concatenate_in_time_order_only() -> None:
     from quant.eval.calibration import ForecastSeries

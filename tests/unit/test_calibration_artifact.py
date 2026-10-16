@@ -30,7 +30,6 @@ from quant.core.errors import ClockError, ModelError
 from quant.core.regime import Label
 from tests.support.calibration import after, covered_share, exact, series
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 N = 4035  # 4,000 scored bars
 
 
@@ -60,7 +59,6 @@ def _rebuild(calibration: object, **document: object) -> object:
 # --- the hash and the files -----------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1")
 def test_a_saved_calibration_loads_back_with_the_same_hash(tmp_path: Path) -> None:
     from quant.core.calibration import load_calibration, save_calibration
@@ -94,7 +92,6 @@ def test_a_saved_calibration_loads_back_with_the_same_hash(tmp_path: Path) -> No
         assert np.array_equal(archive["CALM_UP_x"], calibration.knots[Label.CALM_UP][0])
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1")
 def test_the_hash_is_stable_and_the_bytes_reproducible(tmp_path: Path) -> None:
     from quant.core.calibration import save_calibration
@@ -110,7 +107,6 @@ def test_the_hash_is_stable_and_the_bytes_reproducible(tmp_path: Path) -> None:
         assert (one / name).read_bytes() == (two / name).read_bytes()
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1")
 @pytest.mark.parametrize(
     "change",
@@ -144,7 +140,6 @@ def test_every_value_is_in_the_hash(change: str) -> None:
     assert other.artifact_hash() != calibration.artifact_hash()
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1")
 def test_saving_again_is_idempotent_and_never_an_overwrite(tmp_path: Path) -> None:
     from quant.core.calibration import save_calibration
@@ -164,7 +159,6 @@ def test_saving_again_is_idempotent_and_never_an_overwrite(tmp_path: Path) -> No
     assert (directory / KNOTS_FILE).read_bytes() == b"not a zip"
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1")
 def test_a_calibration_is_immutable() -> None:
     from pydantic import ValidationError
@@ -182,7 +176,6 @@ def test_a_calibration_is_immutable() -> None:
         calibration.document = calibration.document  # type: ignore[misc]
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1")
 def test_knots_handed_in_are_copied() -> None:
     from quant.core.calibration import Calibration
@@ -195,7 +188,6 @@ def test_knots_handed_in_are_copied() -> None:
     assert mine.artifact_hash() == digest
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1")
 @pytest.mark.parametrize(
     "tamper",
@@ -253,7 +245,6 @@ def test_a_tampered_artifact_is_refused(tamper: str, tmp_path: Path) -> None:
         load_calibration(directory)
 
 
-@RED
 @pytest.mark.spec("ARCH§7.4", "SPEC§9")
 @pytest.mark.parametrize(
     "fault",
@@ -315,7 +306,6 @@ def test_a_calibration_whose_parts_disagree_is_refused(fault: str) -> None:
 # --- using one ------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("T-NL2", "ARCH§7.4")
 def test_a_calibration_is_used_only_strictly_after_its_as_of_time() -> None:
     calibration = _timid()
@@ -328,7 +318,6 @@ def test_a_calibration_is_used_only_strictly_after_its_as_of_time() -> None:
         calibration.require_before(as_of.replace(tzinfo=None) + timedelta(days=1))
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4")
 def test_sizing_reads_the_calibrated_probability_and_the_cap_fraction() -> None:
     calibration = _timid()

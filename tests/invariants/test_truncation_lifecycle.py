@@ -54,7 +54,6 @@ from tests.support.truncation import (
     world,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 SEED = 20160104
 REFIT_CUTOFF = datetime(2016, 11, 30, 17, tzinfo=NEW_YORK).astimezone(UTC)
 REFIT_OPEN = datetime(2016, 12, 1, 9, 30, tzinfo=NEW_YORK).astimezone(UTC)
@@ -108,7 +107,6 @@ def test_the_lifecycle_layers_follow_the_filter_in_the_default_registry() -> Non
     assert spec.start.fit_end == w.model.fit_end
 
 
-@RED
 @pytest.mark.spec("T-NL1", "T-NL2", "I1", "SPEC§5", "SPEC§9", "C7", "ARCH§7.3", "ARCH§7.4")
 def test_the_full_run_refits_once_and_activates_the_refit_and_its_calibration_at_the_open() -> None:
     w = world()
@@ -173,7 +171,6 @@ def _calibration(digest: str) -> Calibration:
     return load_calibration(lifecycle_artifacts() / "calibrations" / digest)
 
 
-@RED
 @pytest.mark.spec("T-NL1", "T-NL2", "I1", "P4", "ARCH§13", "ARCH§7.4")
 def test_clean_lifecycle_passes_every_variant_on_both_sides_of_the_refit() -> None:
     w = world()
@@ -233,7 +230,6 @@ def _late_refit(store: Any, current: Any, *, at: datetime, **kwargs: Any) -> Any
 
 
 @pytest.mark.full  # about 3-4 s each: the fast tier's budget (B7b red)
-@RED
 @pytest.mark.spec("T-NL1", "T-NL2", "P3", "SPEC§5")
 def test_planted_leak_a_refit_trained_on_later_bars_is_caught_in_refit(
     monkeypatch: pytest.MonkeyPatch,
@@ -269,7 +265,6 @@ class _LateCalibration(CalibrationLayer):
         ]
 
 
-@RED
 @pytest.mark.spec("T-NL2", "P3", "ARCH§7.4", "SPEC§9")
 def test_planted_leak_a_calibration_as_of_after_tau_is_caught_by_provenance(
     tmp_path: Path,
@@ -373,7 +368,6 @@ def _peeking_series(
 
 
 @pytest.mark.full  # about 3-4 s each: the fast tier's budget (B7b red)
-@RED
 @pytest.mark.spec("T-NL1", "I1", "I2", "P3", "A4", "ARCH§7.4")
 def test_planted_leak_a_calibration_smoothing_past_its_as_of_time_is_caught_in_refit(
     monkeypatch: pytest.MonkeyPatch,

@@ -46,7 +46,6 @@ from tests.support.truncation import (
     world,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B7", raises=NotImplementedError)
 XNYS = TradingCalendar.xnys()
 US = timedelta(microseconds=1)
 LABELS = tuple(Label)
@@ -103,7 +102,6 @@ def _upto(matrix: FeatureMatrix, end: datetime) -> FeatureMatrix:
     return matrix.window(ROW_START, end)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "I2")
 def test_a_models_forecasts_are_its_filters_and_its_targets_the_smoothed_labels() -> None:
     from quant.eval.calibration import f1_interval, model_series
@@ -132,7 +130,6 @@ def test_a_models_forecasts_are_its_filters_and_its_targets_the_smoothed_labels(
         assert series.realized[i] == rows.values[t, 0]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "I1")
 def test_the_smoother_sees_nothing_past_the_span() -> None:
     from quant.eval.calibration import model_series
@@ -163,7 +160,6 @@ def test_the_smoother_sees_nothing_past_the_span() -> None:
         )
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "T-NL2")
 @pytest.mark.parametrize(
     "fault", ["in-sample span", "empty span", "columns", "before fit_start", "naive"]
@@ -211,7 +207,6 @@ def _ref_interval(
     )
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "C13")
 @pytest.mark.parametrize("q", [[0.2, 0.5, 0.3], [0.0, 1.0, 0.0], [0.98, 0.01, 0.01]])
 def test_the_f1_interval_is_the_central_mixture_interval_in_raw_units(q: list[float]) -> None:
@@ -232,7 +227,6 @@ def test_the_f1_interval_is_the_central_mixture_interval_in_raw_units(q: list[fl
         assert math.isclose(high, means[k] + z * sds[k], abs_tol=1e-9)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "C13")
 @pytest.mark.parametrize("fault", ["no ret column", "q sum", "q shape", "level"])
 def test_the_f1_interval_refuses_what_it_cant_compute(fault: str) -> None:
@@ -270,7 +264,6 @@ def _ops(at: datetime) -> tuple[Any, SimClock]:
     return OpsStore.memory(clock=clock), clock
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4", "ARCH§9.2", "C7")
 def test_the_spans_are_what_the_model_pointer_governed_before_the_as_of_time() -> None:
     from quant.jobs.calibrate import ModelSpan, model_spans
@@ -313,7 +306,6 @@ def _world_ops(
     return ops, clock
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4", "I1", "T-NL1")
 def test_the_job_reads_through_the_view_at_the_as_of_time_and_nothing_later(tmp_path: Path) -> None:
     from quant.jobs.calibrate import calibration_series
@@ -345,7 +337,6 @@ def test_the_job_reads_through_the_view_at_the_as_of_time_and_nothing_later(tmp_
     assert read(garbage).data_hash() == series.data_hash()
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4", "C13")
 def test_with_no_governed_bars_the_series_is_empty(tmp_path: Path) -> None:
     from quant.jobs.calibrate import calibrate
@@ -366,7 +357,6 @@ def test_with_no_governed_bars_the_series_is_empty(tmp_path: Path) -> None:
     assert all(calibration.cap_fraction(label) == 0.25 for label in Label)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4", "T-NL2")
 @pytest.mark.parametrize("fault", ["missing artifact", "feature config", "in-sample span"])
 def test_the_job_refuses_a_history_it_cant_score(fault: str, tmp_path: Path) -> None:
@@ -397,7 +387,6 @@ def test_the_job_refuses_a_history_it_cant_score(fault: str, tmp_path: Path) -> 
         )
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§7.4")
 def test_calibrate_scores_the_series_and_writes_nothing(tmp_path: Path) -> None:
     from quant.eval.calibration import build_calibration
@@ -464,7 +453,6 @@ def _refit(w: Any, current: HmmModel, ops: Any, artifacts: Path, **kwargs: Any) 
         )
 
 
-@RED
 @pytest.mark.spec("ARCH§7.3", "ARCH§7.4", "T-NL2", "C7", "SPEC§9")
 def test_a_passing_refit_builds_a_calibration_as_of_its_cutoff_and_activates_it_with_the_model(
     tmp_path: Path,
@@ -572,7 +560,6 @@ def _run(w: Any, ops: Any, artifacts: Path, builder: Any) -> Any:
         )
 
 
-@RED
 @pytest.mark.spec("ARCH§7.3", "ARCH§7.4", "T-NL2")
 @pytest.mark.parametrize("offset", [timedelta(hours=-1), US], ids=["earlier", "later"])
 def test_a_calibration_not_as_of_the_cutoff_is_refused_and_nothing_recorded(
@@ -602,7 +589,6 @@ def test_a_calibration_not_as_of_the_cutoff_is_refused_and_nothing_recorded(
     assert ops.pointers("calibration") == ()
 
 
-@RED
 @pytest.mark.spec("ARCH§7.3", "ARCH§7.4")
 def test_a_calibration_that_cant_be_built_leaves_no_refit_recorded(tmp_path: Path) -> None:
     w = world()
@@ -622,7 +608,6 @@ def test_a_calibration_that_cant_be_built_leaves_no_refit_recorded(tmp_path: Pat
 # --- ops.db ---------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "ARCH§7.3", "C7")
 def test_record_refit_appends_the_calibration_pointer_in_the_same_transaction() -> None:
     from quant.store.ops import RefitOutcomeKind
@@ -646,7 +631,6 @@ def test_record_refit_appends_the_calibration_pointer_in_the_same_transaction() 
     assert (pointer.recorded_at, pointer.reason) == (model.recorded_at, model.reason)
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "ARCH§7.3")
 @pytest.mark.parametrize("outcome", ["frozen", "rejected", "bad hash"])
 def test_record_refit_refuses_a_calibration_it_cant_activate(outcome: str) -> None:
