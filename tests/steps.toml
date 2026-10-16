@@ -47,4 +47,5 @@ covers = [
 covers = [
     "SPEC§5", "D6", "C5", "C7",
     "ARCH§6.2", "ARCH§7.1", "ARCH§7.3", "ARCH§7.5", "ARCH§9.2",
+    "SPEC§9", "A4", "C13", "ARCH§7.4", "T-NL1", "T-NL2",
 ]
