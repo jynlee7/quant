@@ -28,7 +28,9 @@ with `seq`. `current(kind, at)` is the row with the highest `seq` among those wi
 the same transaction, its consequences:
 
 - ACTIVATED: a model pointer to the new artifact, effective at the next open after the
-  recording, and, when entries would still be frozen at that open, an unfreeze event
+  recording; with a calibration (B7b, ARCHITECTURE §7.3 step 5), a calibration pointer to it,
+  effective at the same open, with the same reason; and, when entries would still be frozen at
+  that open, an unfreeze event
   (UnfreezeCause.REFIT_PASSED) effective at the same open: "the next refit passes every check"
   ends a freeze exactly when the new model starts governing;
 - FROZEN: the artifact was stored but not activated (C5): a freeze event (FreezeCause.
@@ -297,15 +299,23 @@ class OpsStore:
         previous: str,
         reasons: tuple[str, ...],
         calendar: TradingCalendar | None = None,
+        calibration: str | None = None,
     ) -> RefitEvent:
         """Record a refit's outcome and its consequences in one transaction (module docstring).
         The model pointer of ACTIVATED is effective at `calendar.next_open(stamp)` (XNYS when
         None), as `activate`'s, and its reason names the refit ("refit at <at, ISO UTC>").
+        `calibration` (B7b), the hash of the calibration the pass built, appends a calibration
+        pointer in the same transaction, after the model pointer, with the same effective_at,
+        recorded_at and reason. The RefitEvent itself doesn't name it: the pointer row does.
+        DataError, writing nothing, when `calibration` is given for FROZEN or REJECTED, or isn't
+        64 lowercase hex characters.
 
         Raises DataError, writing nothing, when: `cutoff > at`; `previous` or a given
         `artifact` isn't 64 lowercase hex characters; `artifact` is None for ACTIVATED or
         FROZEN, or given for REJECTED; `reasons` is empty for FROZEN or REJECTED, or not empty
         for ACTIVATED, or holds an empty string. ClockError for a naive `at` or `cutoff`."""
+        if calibration is not None:
+            raise NotImplementedError("B7b: record_refit appends the pass's calibration pointer")
         at, cutoff = ensure_utc(at), ensure_utc(cutoff)
         self._hash(previous)
         if artifact is not None:

@@ -63,6 +63,7 @@ forbidden_modules =
 name = K3 the decision path never imports hmmlearn or eval (I2)
 type = forbidden
 source_modules =
+    quant.core.calibration
     quant.data
     quant.features
     quant.hmm.filter
@@ -76,6 +77,7 @@ source_modules =
 forbidden_modules =
     hmmlearn
     quant.eval
+    sklearn
 
 [importlinter:contract:K4]
 name = K4 only engine, control and cli import the Alpaca broker adapter

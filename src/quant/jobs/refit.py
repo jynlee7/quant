@@ -31,12 +31,25 @@ same simulated times, each with the refit's instant `at` read from its Clock (K6
    Either way `OpsStore.record_refit` writes the event and its consequences in one transaction,
    and a structlog event names the outcome (info ACTIVATE_EVENT, warning FREEZE_EVENT).
 
-The calibration artifact a pass also builds (ARCHITECTURE §7.3 step 5) is B7b's.
+8. **The calibration** (ARCHITECTURE §7.3 step 5, §7.4; B7b): a pass builds a calibration as
+   of the refit's cutoff and moves the calibration pointer with the model's. `refit` hands
+   `run_refit` a builder (`quant.jobs.calibrate.calibrate` over the job's store, ops store,
+   symbol, features, artifacts and policy, with `calibration`'s config, r1's when None).
+   `run_refit` calls it only when the outcome is ACTIVATED, after training and before recording:
+   the builder's calibration must be as of `data.fit_end` (ModelError otherwise, recording
+   nothing); it is saved under `artifacts / "calibrations"`
+   (`quant.core.calibration.save_calibration`), and `OpsStore.record_refit(...,
+   calibration=<its hash>)` appends both pointers in the refit's one transaction, effective at
+   the same next open. Its as-of time (the cutoff) is before that open, so before every decision
+   that uses it (T-NL2). A FROZEN or REJECTED refit builds nothing and moves no calibration
+   pointer. The calibration scores only the models that governed before the cutoff: the new
+   model's pointer isn't effective yet. A builder that raises leaves no event: the job failed,
+   and is due again the next evening.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -45,6 +58,7 @@ from typing import Any, Final
 import structlog
 
 from quant.core.calendar import NEW_YORK, TradingCalendar
+from quant.core.calibration import Calibration, CalibrationConfig, r1_calibration_config
 from quant.core.clock import ensure_utc
 from quant.core.errors import ModelError
 from quant.data.market_db import BarStore
@@ -57,6 +71,7 @@ from quant.hmm.model import HmmModel, save_model
 from quant.hmm.select import Candidate, SanityReport
 from quant.hmm.train import TrainConfig, TrainingData, train_candidate
 from quant.jobs._rows import training_rows
+from quant.jobs.calibrate import calibrate
 from quant.store.ops import OpsStore, RefitEvent, RefitOutcomeKind
 
 # Spec §5: a refit every 30 calendar days.
@@ -67,6 +82,8 @@ CUTOFF_ET: Final = time(17, 0)
 ACTIVATE_EVENT: Final = "refit activated"
 FREEZE_EVENT: Final = "refit drift: entries frozen"
 REJECT_EVENT: Final = "refit rejected"
+# Builds a pass's calibration as of the given cutoff (module docstring, step 8).
+CalibrationBuilder = Callable[[datetime], Calibration]
 
 
 def refit_cutoff(at: datetime) -> datetime:
@@ -140,7 +157,10 @@ class RefitOutcome:
     - `sanity`: the new fit's SanityReport, None when training raised ModelError;
     - `reasons`: the drift reasons (FROZEN), the sanity reasons or the ModelError's message
       (REJECTED), () when ACTIVATED;
-    - `event`: the RefitEvent recorded in ops.db (its `effective_at` is the activation's).
+    - `event`: the RefitEvent recorded in ops.db (its `effective_at` is the activation's);
+    - `calibration`, `calibration_directory`: the calibration an ACTIVATED refit built and
+      activated, and its artifact directory (step 8); None otherwise, and None when
+      `run_refit` was given no builder.
     """
 
     kind: RefitOutcomeKind
@@ -154,6 +174,8 @@ class RefitOutcome:
     sanity: SanityReport | None
     reasons: tuple[str, ...]
     event: RefitEvent
+    calibration: Calibration | None = None
+    calibration_directory: Path | None = None
 
 
 def run_refit(
@@ -169,8 +191,9 @@ def run_refit(
     provenance: Mapping[str, Any],
     calendar: TradingCalendar | None = None,
     workers: int | None = None,
+    calibration: CalibrationBuilder | None = None,
 ) -> RefitOutcome:
-    """Refit `current` on `data` and record the outcome (module docstring, steps 4–7). `data`
+    """Refit `current` on `data` and record the outcome (module docstring, steps 4–8). `data`
     is the refit's window, normally `refit_data(...)` at `refit_cutoff(at)`; the event's
     `cutoff` is `data.fit_end`. `config` gives the restarts, seeds, EM settings, bootstrap
     draws and validation block (its `candidates` are ignored); `calendar` (XNYS when None)
@@ -186,7 +209,14 @@ def run_refit(
 
     Training goes through this module's `train_candidate` name (`train_candidate(data,
     Candidate(K, covariance type of current), thresholds=..., config=..., provenance=...,
-    workers=..., previous=current)`), which the tests replace to plant a sanity reject."""
+    workers=..., previous=current)`), which the tests replace to plant a sanity reject.
+
+    `calibration` (step 8): None builds no calibration (an ACTIVATED refit moves the model
+    pointer alone, as B7a did); a builder is called as `calibration(data.fit_end)` only for an
+    ACTIVATED outcome, before anything is recorded. ModelError, recording nothing, when its
+    calibration's `as_of` isn't `data.fit_end`; anything the builder raises propagates and
+    records nothing (the model artifact may already be saved: it is content-addressed and
+    unreferenced)."""
     at = ensure_utc(at)
     previous = current.artifact_hash()
     pointer = ops.current("model", at)
@@ -235,6 +265,8 @@ def run_refit(
         report = None
     if model is not None:
         directory = save_model(model, artifacts / "models")
+    if kind is RefitOutcomeKind.ACTIVATED and calibration is not None:
+        raise NotImplementedError("B7b: run_refit builds and activates the pass's calibration")
     event = ops.record_refit(
         at=at,
         cutoff=data.fit_end,
@@ -275,11 +307,17 @@ def refit(
     calendar: TradingCalendar | None = None,
     workers: int | None = None,
     policy: DataPolicy | None = None,
+    calibration: CalibrationConfig | None = None,
 ) -> RefitOutcome | None:
     """The evening job: None, reading and writing nothing, when `refit_due(current, at)` is
     false; otherwise `run_refit(refit_data(store, symbol, start=current.fit_start,
-    cutoff=refit_cutoff(at), features=features, policy=policy), current, at=at, ...)` with the
-    other arguments passed through."""
+    cutoff=refit_cutoff(at), features=features, policy=policy), current, at=at, ...,
+    calibration=<builder>)` with the other arguments passed through, the builder being
+    `lambda as_of: quant.jobs.calibrate.calibrate(store, ops, as_of=as_of, symbol=symbol,
+    features=features, artifacts=artifacts, config=calibration or r1_calibration_config(),
+    policy=policy)` (module docstring, step 8): every refit job builds its pass's calibration.
+    The calibration loads the models that governed from `artifacts / "models"`, so the active
+    model must be saved there (the first model's job and every refit save theirs)."""
     events = ops.refit_events()
     if not refit_due(current, at, last_refit=events[-1].cutoff if events else None):
         return None
@@ -291,6 +329,20 @@ def refit(
         features=features,
         policy=policy,
     )
+    rules = calibration or r1_calibration_config()
+
+    def build(as_of: datetime) -> Calibration:
+        return calibrate(
+            store,
+            ops,
+            as_of=as_of,
+            symbol=symbol,
+            features=features,
+            artifacts=artifacts,
+            config=rules,
+            policy=policy,
+        )
+
     return run_refit(
         data,
         current,
@@ -303,4 +355,5 @@ def refit(
         provenance=provenance,
         calendar=calendar,
         workers=workers,
+        calibration=build,
     )
