@@ -13,6 +13,7 @@ a calibration whose smoother reads past its as-of time.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -395,3 +396,117 @@ def test_planted_leak_a_calibration_smoothing_past_its_as_of_time_is_caught_in_r
         "mismatch",
         "error",
     }
+
+
+# --- B7b review: leaks the harness's memo and the filter's 0/1 forecasts hid -----------------
+
+
+def _slice(series: Any, keep: np.ndarray) -> Any:
+    """`series` with only the bars `keep` marks: every per-bar array cut, the rest as it is."""
+    n = len(series)
+    return dataclasses.replace(
+        series,
+        **{
+            f.name: getattr(series, f.name)[keep]
+            for f in dataclasses.fields(series)
+            if isinstance(getattr(series, f.name), np.ndarray) and len(getattr(series, f.name)) == n
+        },
+    )
+
+
+@pytest.mark.full  # about 1.5 s: the fast tier's budget
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("T-NL1", "P3", "ARCH§13", "ARCH§7.4")
+def test_planted_leak_a_forecast_series_reading_outside_its_arguments_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planted leak M: `model_series` smooths over rows it doesn't take as arguments, the bars
+    the run's store holds after the span (as leak S, one level down). Its arguments are equal
+    in every variant, so a memo keyed on them hands the truncated run the full run's result."""
+    w = world()
+    real_series, real_forecasts = calibrate_job.calibration_series, calibrate_job.model_series
+    seen: dict[str, Any] = {}
+
+    def remembering(store: Any, ops: Any, **kwargs: Any) -> Any:
+        seen["store"] = store
+        return real_series(store, ops, **kwargs)
+
+    def leaky(model: Any, matrix: Any, *, start: datetime, end: datetime, level: float) -> Any:
+        bars = seen["store"].view(HORIZON, as_of=HORIZON).hourly(SYMBOL, purpose=Purpose.OPERATE)
+        rows = compute_features(bars, w.config).window(model.fit_start, HORIZON)
+        peeked = real_forecasts(model, rows, start=start, end=HORIZON, level=level)
+        return _slice(peeked, peeked.available_at < to_us(end))
+
+    monkeypatch.setattr(calibrate_job, "calibration_series", remembering)
+    monkeypatch.setattr(calibrate_job, "model_series", leaky)
+    first_after = min(cut for cut in _lifecycle_cuts(w) if cut > REFIT_OPEN)
+    report = check_truncation(w, _upto_calibration(w), (first_after,), seed=SEED)
+    assert not report.ok, "the planted leak was not caught"
+    assert report.layers <= {"refit", "calibration"}, report.explain()
+    truncated = [f for f in report.failures if f.variant is Variant.TRUNCATED]
+    assert [f.kind for f in truncated] == ["mismatch"], report.explain()
+
+
+@pytest.mark.full  # about 2 s: the fast tier's budget
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("T-NL1", "P3", "ARCH§7.4", "SPEC§9")
+def test_planted_leak_knots_from_a_later_calibration_are_caught_in_calibration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planted leak K: sizing's P̃ maps a probability strictly inside (0, 1) through the knots
+    of a calibration as of the world's last evening, built from the run's own store (its
+    CALM_UP and CHOP knots differ between the full and the truncated store inside (0, 1),
+    and agree at 0 and 1), while the record keeps the governing calibration's hash, verdicts
+    and as-of time, so T-NL2 can't see it. A filter record whose label probabilities are only
+    ever 0 or 1 never reaches the leaky map."""
+    from quant.core.calibration import Calibration
+    from quant.core.clock import SimClock
+    from quant.hmm.model import save_model
+    from quant.store.ops import OpsStore
+
+    w = world()
+    spec = lifecycle_spec(w)
+    # Recalibrate every label: CALM_UP and CHOP pass as they are under the harness's rules.
+    strict = spec.calibration.model_copy(update={"ece_max": 1e-6})
+    real_run, real_calibrated = CalibrationLayer.run, Calibration.calibrated
+    seen: dict[str, Any] = {}
+    late: dict[int, tuple[Any, Calibration | None]] = {}
+
+    def late_for(store: Any) -> Calibration | None:
+        if id(store) not in late:
+            save_model(spec.start, lifecycle_artifacts() / "models")
+            ops = OpsStore.memory(clock=SimClock(w.activation))
+            ops.activate("model", spec.start.artifact_hash(), reason="first model")
+            try:
+                built: Calibration | None = calibrate_job.calibrate(
+                    store,
+                    ops,
+                    as_of=LATE_CUTOFF,
+                    symbol=SYMBOL,
+                    features=w.config,
+                    artifacts=lifecycle_artifacts(),
+                    config=strict,
+                )
+            except Exception:  # the garbage store's later bars don't make features
+                built = None
+            late[id(store)] = (store, built)
+        return late[id(store)][1]
+
+    def remembering(self: Any, source: Any, decisions: Any, upstream: Any) -> Any:
+        seen["store"] = source.store
+        return real_run(self, source, decisions, upstream)
+
+    def leaky(self: Calibration, label: Label, p: float) -> float:
+        later = late_for(seen["store"]) if 0.0 < p < 1.0 else None
+        if later is not None and label in later.knots:
+            return real_calibrated(later, label, p)
+        return real_calibrated(self, label, p)
+
+    monkeypatch.setattr(CalibrationLayer, "run", remembering)
+    monkeypatch.setattr(Calibration, "calibrated", leaky)
+    cuts = (w.edges["model_first"].tau, min(c for c in _lifecycle_cuts(w) if c > REFIT_OPEN))
+    report = check_truncation(w, _upto_calibration(w), cuts, seed=SEED)
+    assert not report.ok, "the planted leak was not caught"
+    assert report.layers == {"calibration"}, report.explain()
+    truncated = {f.kind for f in report.failures if f.variant is Variant.TRUNCATED}
+    assert truncated == {"mismatch"}, report.explain()

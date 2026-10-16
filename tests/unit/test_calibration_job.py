@@ -14,7 +14,7 @@ builds none.
 from __future__ import annotations
 
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -656,3 +656,133 @@ def test_record_refit_refuses_a_calibration_it_cant_activate(outcome: str) -> No
     assert ops.pointers("calibration") == ()
     assert ops.pointers("model") == ()
     assert ops.freeze_events() == ()
+
+
+# --- B7b review: DEV with a trial ticket, the lockbox skipped, the interval level -------------
+
+LOCKBOX_FIRST, LOCKBOX_LAST = date(2016, 11, 15), date(2016, 11, 22)
+
+
+def _shifted(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dev: date,
+    lockbox: date | None = None,
+    seal: date | None = None,
+    ticket: tuple[date, date],
+) -> tuple[Any, Any]:
+    """A policy over segments moved into the synthetic world's 2016 (the spec fixes their
+    starts, so only a test can move them), bound to a trial ledger, and a ticket that ledger
+    issued for the DEV days `ticket`."""
+    from quant.data.policy import DataPolicy, Segments
+    from quant.research.ledger import TrialLedger
+    from tests.support.ledger import LEDGER_START, run_spec
+
+    monkeypatch.setattr(Segments, "dev_start", dev)
+    if lockbox is not None:
+        monkeypatch.setattr(Segments, "lockbox_start", lockbox)
+    segments = Segments(lockbox_end=seal)
+    ledger = TrialLedger.memory(clock=SimClock(LEDGER_START), segments=segments)
+    issued = ledger.open_run(run_spec(first=ticket[0], last=ticket[1]))
+    return DataPolicy(segments, ledger), issued
+
+
+def _ny_day(available_at: int) -> date:
+    return datetime.fromtimestamp(available_at / 1_000_000, UTC).astimezone(NEW_YORK).date()
+
+
+# Without the ticket the same call raises LockboxError (the policy checks the lockbox first):
+# calibration_series reads every day from FIT_START to its as-of time as one calibrate read.
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=TypeError)
+@pytest.mark.spec("ARCH§6.3", "C1", "C11", "A2", "ARCH§7.4", "SPEC§9")
+def test_a_calibration_past_the_lockbox_skips_its_span_and_reads_dev_with_the_ticket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from quant.jobs.calibrate import calibrate, calibration_series
+
+    # FIT to 11-07, DEV 11-08 to 11-14, the lockbox 11-15 to 11-22, FORWARD from 11-23.
+    dev = date(2016, 11, 8)
+    policy, ticket = _shifted(
+        monkeypatch,
+        dev=dev,
+        lockbox=LOCKBOX_FIRST,
+        seal=LOCKBOX_LAST,
+        ticket=(dev, LOCKBOX_FIRST - timedelta(days=1)),
+    )
+    w = world()
+    model = lifecycle_spec(w).start
+    ops, _ = _world_ops(tmp_path, model)
+    config = lifecycle_spec(w).calibration
+    series = calibration_series(
+        w.store,
+        ops,
+        as_of=CUTOFF,
+        symbol="SPY",
+        features=r1_features(),
+        artifacts=tmp_path,
+        level=config.outcome_level,
+        policy=policy,
+        ticket=ticket,
+    )
+    days = {_ny_day(int(t)) for t in series.available_at}
+    assert not {d for d in days if LOCKBOX_FIRST <= d <= LOCKBOX_LAST}, "lockbox bars scored"
+    assert any(d < dev for d in days)  # FIT
+    assert any(dev <= d < LOCKBOX_FIRST for d in days)  # DEV, with the ticket
+    assert any(d > LOCKBOX_LAST for d in days)  # FORWARD
+    calibration = calibrate(
+        w.store,
+        ops,
+        as_of=CUTOFF,
+        symbol="SPY",
+        features=r1_features(),
+        artifacts=tmp_path,
+        config=config,
+        policy=policy,
+        ticket=ticket,
+    )
+    assert calibration.document.data_hash == series.data_hash()
+    assert calibration.document.bars == len(series)
+
+
+# Without the ticket a refit inside DEV raises PolicyError from its calibration (DEV is dark);
+# that may stay so. With one, refit has no parameter to take it.
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=TypeError)
+@pytest.mark.spec("ARCH§6.3", "C11", "A2", "ARCH§7.3", "ARCH§7.4", "C7")
+def test_a_refit_inside_dev_with_a_trial_ticket_activates_and_builds_its_calibration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from quant.store.ops import RefitOutcomeKind
+
+    # DEV from 2016-11-15 stands in for any refit cutoff inside DEV.
+    dev = date(2016, 11, 15)
+    policy, ticket = _shifted(monkeypatch, dev=dev, ticket=(dev, date(2024, 12, 31)))
+    w = world()
+    start = lifecycle_spec(w).start
+    ops, clock = _world_ops(tmp_path, start)
+    clock.advance_to(REFIT_AT)
+    outcome = _refit(w, start, ops, tmp_path, policy=policy, ticket=ticket)
+    assert outcome.kind is RefitOutcomeKind.ACTIVATED, outcome.reasons
+    calibration = outcome.calibration
+    assert calibration is not None
+    assert calibration.as_of == CUTOFF
+    assert calibration.document.models == (start.artifact_hash(),)
+    (pointer,) = ops.pointers("calibration")
+    assert (pointer.artifact, pointer.effective_at) == (calibration.artifact_hash(), NEXT_OPEN)
+    # It scored the DEV days the ticket covers, as the unticketed FIT world does.
+    assert calibration.document.sufficient
+
+
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
+@pytest.mark.spec("C13", "SPEC§9", "A4", "ARCH§7.4")
+def test_a_series_whose_intervals_are_at_another_level_than_the_config_is_refused() -> None:
+    from quant.eval.calibration import build_calibration, model_series
+
+    model, matrix = _known()
+    start, end = model.fit_end, _span_end(500)
+    rows = _upto(matrix, end)
+    at_level = model_series(model, rows, start=start, end=end, level=CONFIG.outcome_level)
+    build_calibration(at_level, as_of=end, source=CalibrationSource.BACKTEST, config=CONFIG)
+    narrow = model_series(model, rows, start=start, end=end, level=0.8)
+    # Its outcome check would score 80% intervals against the 90% band, and stamp 0.9.
+    with pytest.raises(ModelError):
+        build_calibration(narrow, as_of=end, source=CalibrationSource.BACKTEST, config=CONFIG)

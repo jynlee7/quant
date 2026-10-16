@@ -353,3 +353,161 @@ def test_the_artifact_module_imports_neither_eval_nor_scikit_learn() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == ""
+
+
+# --- B7b review: verdicts that contradict their own numbers ----------------------------------
+
+
+def _forge(fault: str) -> tuple[object, dict[Label, tuple[np.ndarray, np.ndarray]]]:
+    """A document and knots that agree on everything the parts must agree on, except one
+    verdict flag that its own numbers contradict (`fault`)."""
+    calibration = _timid()
+    document = calibration.document
+    knots = dict(calibration.knots)
+    labels = {v.label: v for v in document.labels}
+    crash, calm = labels[Label.CRASH], labels[Label.CALM_UP]
+    outcome = document.outcome
+    if fault == "insufficient but recalibrated":
+        from quant.eval.calibration import build_calibration
+
+        short = build_calibration(
+            series(100),
+            as_of=after(100),
+            source=CalibrationSource.BACKTEST,
+            config=r1_calibration_config(),
+        )
+        assert not short.document.sufficient
+        document = short.document
+        labels = {v.label: v for v in document.labels}
+        labels[Label.CALM_UP] = labels[Label.CALM_UP].model_copy(
+            update={"recalibrated": calm.recalibrated, "knots": calm.knots}
+        )
+        knots = {Label.CALM_UP: calibration.knots[Label.CALM_UP]}
+    elif fault == "raw passes without skill":  # the reviewer's probe: CRASH never occurs
+        labels[Label.CRASH] = crash.model_copy(
+            update={
+                "raw": crash.raw.model_copy(update={"passed": True}),
+                "recalibrated": None,
+                "knots": 0,
+                "passed": True,
+            }
+        )
+        del knots[Label.CRASH]
+    elif fault == "raw passes over ece_max":
+        assert calm.raw.skill > 0
+        assert calm.raw.ece > 0.05
+        labels[Label.CALM_UP] = calm.model_copy(
+            update={"raw": calm.raw.model_copy(update={"passed": True})}
+        )
+    elif fault == "raw passes without positive skill":
+        labels[Label.CALM_UP] = calm.model_copy(
+            update={"raw": calm.raw.model_copy(update={"skill": -0.1, "ece": 0.01, "passed": True})}
+        )
+    elif fault == "raw fails with passing numbers":
+        labels[Label.CALM_UP] = calm.model_copy(
+            update={"raw": calm.raw.model_copy(update={"skill": 0.5, "ece": 0.01})}
+        )
+    elif fault == "recalibration passes without skill":
+        assert crash.recalibrated is not None
+        assert crash.recalibrated.skill is None
+        labels[Label.CRASH] = crash.model_copy(
+            update={
+                "recalibrated": crash.recalibrated.model_copy(update={"passed": True}),
+                "passed": True,
+            }
+        )
+    elif fault == "outcome passes with no pairs":
+        outcome = outcome.model_copy(update={"n": 0, "covered": 0, "passed": True})
+    elif fault == "outcome passes outside the band":
+        outcome = outcome.model_copy(update={"covered": 950, "passed": True})
+    else:
+        assert fault == "outcome fails inside the band"
+        assert (outcome.n, outcome.covered) == (1000, 900)
+        outcome = outcome.model_copy(update={"passed": False})
+    forged = document.model_copy(
+        update={"labels": tuple(labels[label] for label in Label), "outcome": outcome}
+    )
+    return forged, knots
+
+
+def _write(document: object, knots: dict[Label, tuple[np.ndarray, np.ndarray]], root: Path) -> Path:
+    """What save_calibration writes for `document` and `knots`, under the hash recomputed as
+    `Calibration.artifact_hash` computes it, without building a Calibration."""
+    import hashlib
+
+    from quant.core.canonical import sha256_hex
+
+    arrays = {
+        f"{label.value}_{axis}": values
+        for label in Label
+        if label in knots
+        for axis, values in zip("xy", knots[label], strict=True)
+    }
+    digest = sha256_hex(
+        {
+            "calibration": document,
+            "knots": {
+                name: {
+                    "dtype": "float64",
+                    "shape": list(a.shape),
+                    "sha256": hashlib.sha256(
+                        np.ascontiguousarray(a, dtype="<f8").tobytes()
+                    ).hexdigest(),
+                }
+                for name, a in arrays.items()
+            },
+        }
+    )
+    directory = root / digest
+    directory.mkdir(parents=True)
+    with zipfile.ZipFile(directory / KNOTS_FILE, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, array in arrays.items():
+            with archive.open(f"{name}.npy", "w") as member:
+                np.lib.format.write_array(member, np.asarray(array), allow_pickle=False)
+    (directory / DOCUMENT_FILE).write_bytes(
+        canonical_dumps({"artifact_hash": digest, "calibration": document})
+    )
+    return directory
+
+
+CONTRADICTIONS = [
+    "raw passes without skill",
+    "raw passes over ece_max",
+    "raw passes without positive skill",
+    "raw fails with passing numbers",
+    "recalibration passes without skill",
+    "outcome passes with no pairs",
+    "outcome passes outside the band",
+    "outcome fails inside the band",
+    "insufficient but recalibrated",
+]
+
+
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
+@pytest.mark.spec("ARCH§7.4", "SPEC§9", "C13")
+@pytest.mark.parametrize("fault", CONTRADICTIONS)
+def test_a_verdict_its_own_numbers_contradict_is_refused(fault: str) -> None:
+    from quant.core.calibration import Calibration
+
+    document, knots = _forge(fault)
+    with pytest.raises(ModelError):
+        Calibration(document, knots)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
+@pytest.mark.spec("ARCH§7.4", "ARCH§9.1", "SPEC§9", "C13")
+@pytest.mark.parametrize("fault", CONTRADICTIONS)
+def test_a_saved_verdict_its_own_numbers_contradict_is_refused_on_load(
+    fault: str, tmp_path: Path
+) -> None:
+    from quant.core.calibration import load_calibration
+
+    # The writer is faithful: the untampered calibration loads back under its own hash.
+    good = _timid()
+    assert load_calibration(_write(good.document, dict(good.knots), tmp_path)).artifact_hash() == (
+        good.artifact_hash()
+    )
+    document, knots = _forge(fault)
+    directory = _write(document, knots, tmp_path)
+    with pytest.raises(ModelError):
+        load_calibration(directory)

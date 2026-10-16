@@ -370,3 +370,90 @@ def test_series_concatenate_in_time_order_only() -> None:
         ForecastSeries.concat([second, first])
     with pytest.raises(ValueError, match="read-only"):
         joined.forecast[0, 0] = 0.5
+
+
+# --- B7b review: settling per span, and the gap before the held-out half ---------------------
+
+
+def _two_spans(n_old: int, n_new: int, *, planted: int | None = None) -> tuple[object, datetime]:
+    """A superseded model's span of n_old bars, then the newest model's of n_new, as the job
+    concatenates them; with `planted`, the old span's newest `planted` bars hold STRESS, a
+    label no other bar holds."""
+    from quant.eval.calibration import ForecastSeries
+    from tests.support.calibration import forecaster
+
+    _, outcome = forecaster(n_old, 3)
+    target = np.where(outcome, CALM, CHOP)
+    if planted:
+        target[-planted:] = LABELS.index(Label.STRESS)
+    old = series(n_old, target=target, models=(MODEL_HASH,), seed=3)
+    new = series(n_new, start=SERIES_START + timedelta(hours=n_old), models=(OTHER_HASH,), seed=4)
+    return ForecastSeries.concat([old, new]), after(n_old + n_new)
+
+
+# A superseded span's smoother stops at the span's end (test_calibration_job), so its newest 35
+# targets are as unsettled as the newest 35 overall: C13's reason holds for every span.
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("C13", "SPEC§9", "A4", "ARCH§7.4")
+def test_the_last_35_bars_of_every_span_are_left_out_not_only_the_newest() -> None:
+    joined, as_of = _two_spans(600, 600, planted=35)
+    calibration = _build(joined, as_of)
+    document = calibration.document
+    assert document.bars == 1200
+    assert document.scored == 1200 - 2 * 35
+    assert all(v.raw.n == document.scored for v in document.labels)
+    # None of the superseded span's last 35 bars is scored: STRESS never occurs.
+    assert calibration.verdict(Label.STRESS).raw.base_rate == 0.0
+
+    # Its 36th newest bar is scored.
+    joined, as_of = _two_spans(600, 600, planted=36)
+    stress = _build(joined, as_of).verdict(Label.STRESS).raw
+    assert stress.base_rate == 1 / (1200 - 2 * 35)
+
+
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("C13", "SPEC§9", "A4", "ARCH§7.4")
+def test_bars_a_superseded_span_leaves_out_dont_count_toward_the_thousand() -> None:
+    joined, as_of = _two_spans(535, 534)  # 1,069 bars: 999 once each span leaves out 35
+    document = _build(joined, as_of).document
+    assert (document.bars, document.scored, document.sufficient) == (1069, 999, False)
+    joined, as_of = _two_spans(535, 535)
+    document = _build(joined, as_of).document
+    assert (document.bars, document.scored, document.sufficient) == (1070, 1000, True)
+
+
+# The held-out half's first targets were smoothed with rows after them, and so were the fit
+# half's last ones, with the held-out half's rows: a gap of settle_bars keeps those out of the fit.
+@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
+@pytest.mark.spec("C13", "SPEC§9", "ARCH§7.4")
+def test_the_isotonic_check_leaves_a_settling_gap_between_its_fit_and_scored_bars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import quant.eval.calibration as calibration_module
+
+    n = 4000
+    forecast, target = exact(n)
+    forecast = np.where(forecast < 0.5, 0.35, 0.65)  # right order, far too timid: fails raw
+    outcome = target == CALM
+    fits: list[tuple[np.ndarray, np.ndarray]] = []
+    real = calibration_module.fit_isotonic
+
+    def spy(f: np.ndarray, y: np.ndarray) -> object:
+        fits.append((f.copy(), y.copy()))
+        return real(f, y)
+
+    monkeypatch.setattr(calibration_module, "fit_isotonic", spy)
+    verdict, knots = calibration_module.calibrate_label(
+        Label.CALM_UP, forecast, outcome, config=CONFIG, sufficient=True
+    )
+    assert not verdict.raw.passed
+    assert verdict.recalibrated is not None
+    assert knots is not None
+    (held_out,) = [fit for fit in fits if len(fit[0]) < n]
+    m = len(held_out[0])
+    # The fit takes the oldest bars...
+    assert np.array_equal(held_out[0], forecast[:m])
+    assert np.array_equal(held_out[1], outcome[:m])
+    # ...and stops settle_bars before the first bar it is judged on.
+    first_scored = n - verdict.recalibrated.n
+    assert m + CONFIG.settle_bars <= first_scored, (m, first_scored)
