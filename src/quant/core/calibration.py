@@ -70,7 +70,9 @@ import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
+from fractions import Fraction
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Self
@@ -244,8 +246,12 @@ class CalibrationDocument(StrictModel):
       be used only strictly after it (T-NL2);
     - `models`: the artifact hashes of the models whose forecasts were scored, in the order
       their spans governed (empty when none had governed before `as_of`);
-    - `bars`: the out-of-sample bars before `as_of`; `scored`: max(0, bars - settle_bars), the
-      oldest bars, which the label metrics use; `sufficient`: scored ≥ min_bars (C13);
+    - `spans`: how many out-of-sample bars each span of the series holds, oldest first: one span
+      per model span, a span the lockbox cuts counting as two (`quant.jobs.calibrate`);
+    - `bars`: the out-of-sample bars before `as_of`, the sum of `spans`; `scored`: the sum over
+      the spans of max(0, span - settle_bars), each span's oldest bars, which the label metrics
+      use (each span's newest settle_bars targets were smoothed up to the span's end, so they
+      haven't settled); `sufficient`: scored ≥ min_bars (C13);
     - `data_hash`: `ForecastSeries.data_hash()` of the series scored
       (`quant.eval.calibration`), so two calibrations of different data never share a hash;
     - `config`: the rules it was judged by;
@@ -256,6 +262,7 @@ class CalibrationDocument(StrictModel):
     source: CalibrationSource
     as_of: AwareDatetime
     models: tuple[str, ...]
+    spans: tuple[int, ...]
     bars: int
     scored: int
     sufficient: bool
@@ -266,6 +273,36 @@ class CalibrationDocument(StrictModel):
 
 
 Knots = tuple[Floats, Floats]
+
+
+def scored_bars(spans: tuple[int, ...], config: CalibrationConfig) -> int:
+    """How many bars the label metrics score (C13): the sum over the spans of max(0, span -
+    config.settle_bars). Each span leaves out its newest settle_bars bars."""
+    return sum(max(0, n - config.settle_bars) for n in spans)
+
+
+def metrics_pass(skill: float | None, ece: float | None, config: CalibrationConfig) -> bool:
+    """Spec §9's pass: skill is not None, skill > 0, and ECE ≤ config.ece_max, compared on the
+    decimal values of the floats (`Decimal(repr(x))`). The one rule `LabelMetrics.passed`
+    holds to, wherever it is computed or checked."""
+    return (
+        skill is not None
+        and ece is not None
+        and skill > 0
+        and Decimal(repr(ece)) <= Decimal(repr(config.ece_max))
+    )
+
+
+def outcome_pass(n: int, covered: int, config: CalibrationConfig) -> bool:
+    """The outcome check's pass (C13): n == config.outcome_bars and Fraction(covered, n) lies in
+    [coverage_low, coverage_high], each bound taken exactly from its decimal value."""
+    return (
+        n > 0
+        and n == config.outcome_bars
+        and Fraction(Decimal(repr(config.coverage_low)))
+        <= Fraction(covered, n)
+        <= Fraction(Decimal(repr(config.coverage_high)))
+    )
 
 
 def interpolate(knots_x: Floats, knots_y: Floats, values: Floats) -> Floats:
@@ -304,14 +341,19 @@ class Calibration:
         - `document.format` is CALIBRATION_FORMAT and `document.labels` holds exactly one
           verdict per label, in `tuple(Label)` order, each with BINS reliability bins in its
           metrics;
-        - `scored == max(0, bars - config.settle_bars)` and `sufficient == (scored ≥
-          config.min_bars)`; each verdict's `passed` is `sufficient and (raw.passed or
-          (recalibrated is not None and recalibrated.passed))`, and its `knots` count is > 0
-          exactly when `recalibrated` is not None;
+        - every `spans` entry is positive, `bars == sum(spans)`, `scored ==
+          scored_bars(spans, config)` and `sufficient == (scored ≥ config.min_bars)`;
+        - each LabelMetrics' `passed` (raw and recalibrated) is `metrics_pass(skill, ece,
+          config)`: a verdict flag its own numbers contradict is refused;
+        - `recalibrated` is None when not `sufficient` (too few bars recalibrate nothing); each
+          verdict's `passed` is `sufficient and (raw.passed or (recalibrated is not None and
+          recalibrated.passed))`, and its `knots` count is > 0 exactly when `recalibrated` is
+          not None;
         - `knots` has an entry for exactly the labels whose verdict counts knots, each a pair
           of 1-D float64 arrays of that many points, x strictly increasing, y nondecreasing
           within [0, 1], all finite;
-        - `outcome.level == config.outcome_level` and 0 ≤ covered ≤ n ≤ config.outcome_bars;
+        - `outcome.level == config.outcome_level`, 0 ≤ covered ≤ n ≤ config.outcome_bars, and
+          `outcome.passed == outcome_pass(n, covered, config)`;
         - every `models` entry and `data_hash` are 64 lowercase hex characters.
 
         Store `knots` as a read-only mapping of read-only array copies (as
@@ -329,11 +371,22 @@ class Calibration:
             for verdict in document.labels
         ):
             raise ModelError("calibration metrics must have ten reliability bins")
-        if document.scored != max(0, document.bars - config.settle_bars) or document.sufficient != (
-            document.scored >= config.min_bars
+        if (
+            any(n <= 0 for n in document.spans)
+            or document.bars != sum(document.spans)
+            or document.scored != scored_bars(document.spans, config)
+            or document.sufficient != (document.scored >= config.min_bars)
         ):
             raise ModelError("calibration scored count or sufficiency disagrees with its config")
         for verdict in document.labels:
+            if any(
+                metrics.passed != metrics_pass(metrics.skill, metrics.ece, config)
+                for metrics in (verdict.raw, verdict.recalibrated)
+                if metrics is not None
+            ):
+                raise ModelError("label metrics' pass disagrees with their skill and ECE")
+            if verdict.recalibrated is not None and not document.sufficient:
+                raise ModelError("a calibration with too few bars recalibrates nothing")
             if verdict.passed != (
                 document.sufficient
                 and (
@@ -357,10 +410,13 @@ class Calibration:
                 if len(x) != expected[label]:
                     raise ModelError("knot length disagrees with the document")
                 frozen[label] = (_ro(x), _ro(y))
-        if document.outcome.level != config.outcome_level or not (
-            0 <= document.outcome.covered <= document.outcome.n <= config.outcome_bars
+        outcome = document.outcome
+        if (
+            outcome.level != config.outcome_level
+            or not 0 <= outcome.covered <= outcome.n <= config.outcome_bars
+            or outcome.passed != outcome_pass(outcome.n, outcome.covered, config)
         ):
-            raise ModelError("outcome level or counts disagree with the config")
+            raise ModelError("outcome level, counts or pass disagree with the config")
         if any(
             re.fullmatch(r"[0-9a-f]{64}", m) is None for m in (*document.models, document.data_hash)
         ):

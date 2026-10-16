@@ -34,7 +34,10 @@ same simulated times, each with the refit's instant `at` read from its Clock (K6
 8. **The calibration** (ARCHITECTURE §7.3 step 5, §7.4; B7b): a pass builds a calibration as
    of the refit's cutoff and moves the calibration pointer with the model's. `refit` hands
    `run_refit` a builder (`quant.jobs.calibrate.calibrate` over the job's store, ops store,
-   symbol, features, artifacts and policy, with `calibration`'s config, r1's when None).
+   symbol, features, artifacts, policy and trial ticket, with `calibration`'s config, r1's when
+   None). The calibration skips the lockbox and reads DEV only with the ticket (ARCHITECTURE
+   §6.3, C11): a refit whose calibration would score DEV without one raises PolicyError and
+   records nothing.
    `run_refit` calls it only when the outcome is ACTIVATED, after training and before recording:
    the builder's calibration must be as of `data.fit_end` (ModelError otherwise, recording
    nothing); it is saved under `artifacts / "calibrations"`
@@ -67,7 +70,7 @@ from quant.core.calibration import (
 from quant.core.clock import ensure_utc
 from quant.core.errors import ModelError
 from quant.data.market_db import BarStore
-from quant.data.policy import DataPolicy
+from quant.data.policy import DataPolicy, ScoringTicket
 from quant.features.menu import FeatureConfig
 from quant.hmm.drift import DriftReport, DriftThresholds, refit_drift
 from quant.hmm.labels import LabelThresholds
@@ -331,6 +334,7 @@ def refit(
     workers: int | None = None,
     policy: DataPolicy | None = None,
     calibration: CalibrationConfig | None = None,
+    ticket: ScoringTicket | None = None,
 ) -> RefitOutcome | None:
     """The evening job: None, reading and writing nothing, when `refit_due(current, at)` is
     false; otherwise `run_refit(refit_data(store, symbol, start=current.fit_start,
@@ -338,7 +342,9 @@ def refit(
     calibration=<builder>)` with the other arguments passed through, the builder being
     `lambda as_of: quant.jobs.calibrate.calibrate(store, ops, as_of=as_of, symbol=symbol,
     features=features, artifacts=artifacts, config=calibration or r1_calibration_config(),
-    policy=policy)` (module docstring, step 8): every refit job builds its pass's calibration.
+    policy=policy, ticket=ticket)` (module docstring, step 8): every refit job builds its pass's
+    calibration. `ticket` is the trial ticket the calibration's DEV reads need; the refit's own
+    rows are an operate read and need none.
     The calibration loads the models that governed from `artifacts / "models"`, so the active
     model must be saved there (the first model's job and every refit save theirs)."""
     events = ops.refit_events()
@@ -364,6 +370,7 @@ def refit(
             artifacts=artifacts,
             config=rules,
             policy=policy,
+            ticket=ticket,
         )
 
     return run_refit(

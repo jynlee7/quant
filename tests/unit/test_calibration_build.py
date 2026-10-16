@@ -393,7 +393,6 @@ def _two_spans(n_old: int, n_new: int, *, planted: int | None = None) -> tuple[o
 
 # A superseded span's smoother stops at the span's end (test_calibration_job), so its newest 35
 # targets are as unsettled as the newest 35 overall: C13's reason holds for every span.
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("C13", "SPEC§9", "A4", "ARCH§7.4")
 def test_the_last_35_bars_of_every_span_are_left_out_not_only_the_newest() -> None:
     joined, as_of = _two_spans(600, 600, planted=35)
@@ -411,7 +410,6 @@ def test_the_last_35_bars_of_every_span_are_left_out_not_only_the_newest() -> No
     assert stress.base_rate == 1 / (1200 - 2 * 35)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("C13", "SPEC§9", "A4", "ARCH§7.4")
 def test_bars_a_superseded_span_leaves_out_dont_count_toward_the_thousand() -> None:
     joined, as_of = _two_spans(535, 534)  # 1,069 bars: 999 once each span leaves out 35
@@ -424,7 +422,6 @@ def test_bars_a_superseded_span_leaves_out_dont_count_toward_the_thousand() -> N
 
 # The held-out half's first targets were smoothed with rows after them, and so were the fit
 # half's last ones, with the held-out half's rows: a gap of settle_bars keeps those out of the fit.
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("C13", "SPEC§9", "ARCH§7.4")
 def test_the_isotonic_check_leaves_a_settling_gap_between_its_fit_and_scored_bars(
     monkeypatch: pytest.MonkeyPatch,

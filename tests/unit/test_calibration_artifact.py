@@ -483,7 +483,6 @@ CONTRADICTIONS = [
 ]
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
 @pytest.mark.spec("ARCH§7.4", "SPEC§9", "C13")
 @pytest.mark.parametrize("fault", CONTRADICTIONS)
 def test_a_verdict_its_own_numbers_contradict_is_refused(fault: str) -> None:
@@ -494,7 +493,6 @@ def test_a_verdict_its_own_numbers_contradict_is_refused(fault: str) -> None:
         Calibration(document, knots)
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
 @pytest.mark.spec("ARCH§7.4", "ARCH§9.1", "SPEC§9", "C13")
 @pytest.mark.parametrize("fault", CONTRADICTIONS)
 def test_a_saved_verdict_its_own_numbers_contradict_is_refused_on_load(

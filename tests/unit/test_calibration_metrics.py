@@ -265,9 +265,11 @@ def test_a_miscalibrated_forecaster_fails_and_isotonic_recalibration_fixes_it(se
     assert verdict.recalibrated.passed, verdict.recalibrated
     assert verdict.passed
 
-    # The verdict is out of sample: knots fit on the older half, scored on the newer half.
+    # The verdict is out of sample: knots fit on the older half short of its last settle_bars
+    # (B7b review, finding D), scored on the newer half.
     half = n // 2
-    early_x, early_y = ref_isotonic(forecast[:half], outcome[:half])
+    fit = half - CONFIG.settle_bars
+    early_x, early_y = ref_isotonic(forecast[:fit], outcome[:fit])
     mapped = np.interp(forecast[half:], early_x, early_y)
     assert verdict.recalibrated == _metrics(mapped, outcome[half:])
     assert verdict.recalibrated.n == n - half

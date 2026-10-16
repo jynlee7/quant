@@ -693,7 +693,6 @@ def _ny_day(available_at: int) -> date:
 
 # Without the ticket the same call raises LockboxError (the policy checks the lockbox first):
 # calibration_series reads every day from FIT_START to its as-of time as one calibrate read.
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=TypeError)
 @pytest.mark.spec("ARCH§6.3", "C1", "C11", "A2", "ARCH§7.4", "SPEC§9")
 def test_a_calibration_past_the_lockbox_skips_its_span_and_reads_dev_with_the_ticket(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -746,7 +745,6 @@ def test_a_calibration_past_the_lockbox_skips_its_span_and_reads_dev_with_the_ti
 
 # Without the ticket a refit inside DEV raises PolicyError from its calibration (DEV is dark);
 # that may stay so. With one, refit has no parameter to take it.
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=TypeError)
 @pytest.mark.spec("ARCH§6.3", "C11", "A2", "ARCH§7.3", "ARCH§7.4", "C7")
 def test_a_refit_inside_dev_with_a_trial_ticket_activates_and_builds_its_calibration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -772,7 +770,6 @@ def test_a_refit_inside_dev_with_a_trial_ticket_activates_and_builds_its_calibra
     assert calibration.document.sufficient
 
 
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=pytest.fail.Exception)
 @pytest.mark.spec("C13", "SPEC§9", "A4", "ARCH§7.4")
 def test_a_series_whose_intervals_are_at_another_level_than_the_config_is_refused() -> None:
     from quant.eval.calibration import build_calibration, model_series

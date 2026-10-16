@@ -40,22 +40,25 @@ target is the label, else 0, each sum `math.fsum` (exactly rounded):
 - pass: skill is not None, skill > 0, and ECE ≤ ece_max on the decimal values of the floats
   (`Decimal(repr(x))`, as B4's sanity edges and B7a's drift edges compare).
 
-**C13.** The series holds every out-of-sample bar before the as-of time. The label metrics use
-all but the newest `settle_bars` (35) of them, whose smoothed labels haven't settled; a verdict
-needs at least `min_bars` (1,000) bars after that exclusion, and until then every label fails
-(and isn't recalibrated). The outcome check keeps the newest bars, whose realized F1 is final:
-it uses the latest `outcome_bars` pairs (bar t-1's interval, bar t's F1) of the whole series.
+**C13.** The series holds every out-of-sample bar before the as-of time, in spans: one per
+model span (`ForecastSeries.span`). Each span's smoother stopped at the span's end, so the
+newest `settle_bars` (35) bars of every span, not only of the newest one, have unsettled
+smoothed labels: the label metrics leave them out. A verdict needs at least `min_bars` (1,000)
+bars after those exclusions, and until then every label fails (and isn't recalibrated). The
+outcome check keeps the newest bars, whose realized F1 is final: it uses the latest
+`outcome_bars` pairs (bar t-1's interval, bar t's F1) of the whole series.
 
 **Recalibration** ("fit on past out-of-sample data only"). A label whose raw forecast fails,
 with enough bars, is recalibrated with isotonic regression (scikit-learn's
 `IsotonicRegression(y_min=0.0, y_max=1.0, increasing=True, out_of_bounds="clip")`):
 
 - the artifact's knots are fit on every scored bar, all of them before the as-of time;
-- the verdict judges the map out of sample: knots fit on the older half of the scored bars
-  (the first ⌊n/2⌋) map the newer half through `quant.core.calibration.interpolate`, and those
-  mapped forecasts are scored on the newer half. Scoring the map on the bars it was fit on
-  would always pass (an isotonic fit is calibrated on its own bars), so "if it still fails"
-  could never happen;
+- the verdict judges the map out of sample: knots fit on the older half of the scored bars,
+  short of its last `settle_bars` (the first ⌊n/2⌋ - settle_bars), map the newer half through
+  `quant.core.calibration.interpolate`, and those mapped forecasts are scored on the newer
+  half. Scoring the map on the bars it was fit on would always pass (an isotonic fit is
+  calibrated on its own bars), so "if it still fails" could never happen; and the gap keeps
+  out of the fit the targets that were smoothed with the held-out half's rows;
 - if the recalibrated forecast still fails, the label fails, and sizing caps it
   (`Calibration.cap_fraction`).
 
@@ -77,7 +80,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from fractions import Fraction
 from typing import Final
 
 import numpy as np
@@ -99,6 +101,9 @@ from quant.core.calibration import (
     OutcomeCheck,
     ReliabilityBin,
     interpolate,
+    metrics_pass,
+    outcome_pass,
+    scored_bars,
 )
 from quant.core.canonical import sha256_hex
 from quant.core.clock import ensure_utc
@@ -106,7 +111,7 @@ from quant.core.epoch import to_us
 from quant.core.errors import ModelError
 from quant.core.regime import Label
 from quant.data.frames import Floats, Ints
-from quant.eval.smoother import smooth
+from quant.eval.smoother import smooth_trace
 from quant.features.stream import FeatureMatrix, freeze_arrays
 from quant.hmm.filter import forward_pass
 from quant.hmm.labels import label_probs, top_label
@@ -138,7 +143,14 @@ class ForecastSeries:
       from, as `forecast` (each in [0, 1], rows summing to 1 within 1e-9);
     - `low`, `high` (n,) float64: the central interval for F1 of the next bar, forecast at this
       one, low ≤ high;
-    - `realized` (n,) float64: this bar's F1, raw.
+    - `realized` (n,) float64: this bar's F1, raw;
+    - `level`: the central level of every `low`, `high` interval (`model_series`'s), or None
+      when the series doesn't state it (a series of no bars, or one built by hand);
+      `build_calibration` refuses a series with bars whose level isn't its config's;
+    - `span` (n,) int64: which span each bar belongs to, nondecreasing from 0: `model_series`
+      gives one span, and `concat` numbers each part's spans after the previous part's. None
+      is one span of every bar. Each span leaves out its own newest settle_bars bars (C13,
+      `build_calibration`), since its smoother stopped at the span's end.
 
     Immutable. Zero bars is valid (`empty`)."""
 
@@ -150,11 +162,14 @@ class ForecastSeries:
     low: Floats
     high: Floats
     realized: Floats
+    level: float | None = None
+    span: Ints | None = None
 
     def __post_init__(self) -> None:
         """Raise ModelError unless the arrays have the dtypes and shapes above, every value is
-        finite, the rules above hold and every `models` entry is 64 lowercase hex characters;
-        then store the arrays read-only (`freeze_arrays`)."""
+        finite, the rules above hold, `level` is None or a float in (0, 1), and every `models`
+        entry is 64 lowercase hex characters; then store `span` (zeros when None) and the
+        arrays read-only (`freeze_arrays`)."""
         n = (
             len(self.available_at)
             if isinstance(self.available_at, np.ndarray) and self.available_at.ndim == 1
@@ -201,12 +216,43 @@ class ForecastSeries:
             not isinstance(m, str) or re.fullmatch(r"[0-9a-f]{64}", m) is None for m in self.models
         ):
             raise ModelError("forecast series model hashes must be lowercase SHA-256")
+        if self.level is not None and not (isinstance(self.level, float) and 0 < self.level < 1):
+            raise ModelError("forecast series interval level must be a float in (0, 1)")
+        if self.span is None:
+            object.__setattr__(self, "span", np.zeros(n, np.int64))
+        elif not (
+            isinstance(self.span, np.ndarray)
+            and self.span.dtype == np.int64
+            and self.span.shape == (n,)
+            and (not n or (self.span[0] >= 0 and (np.diff(self.span) >= 0).all()))
+        ):
+            raise ModelError("forecast series spans must be nondecreasing indices, one per bar")
         freeze_arrays(
-            self, "available_at", "forecast", "target", "smoothed", "low", "high", "realized"
+            self,
+            "available_at",
+            "forecast",
+            "target",
+            "smoothed",
+            "low",
+            "high",
+            "realized",
+            "span",
         )
 
     def __len__(self) -> int:
         return len(self.available_at)
+
+    def spans(self) -> tuple[int, ...]:
+        """How many bars each span holds, oldest first (runs of equal `span`); () for no bars."""
+        if not len(self):
+            return ()
+        ids = self._span_ids()
+        cuts = np.flatnonzero(np.diff(ids)) + 1
+        return tuple(len(run) for run in np.split(ids, cuts))
+
+    def _span_ids(self) -> Ints:
+        """`span`, which __post_init__ always fills."""
+        return np.zeros(len(self), np.int64) if self.span is None else self.span
 
     @classmethod
     def empty(cls) -> ForecastSeries:
@@ -224,36 +270,60 @@ class ForecastSeries:
 
     @classmethod
     def concat(cls, parts: Sequence[ForecastSeries]) -> ForecastSeries:
-        """The parts' bars in order, and their models in order. ModelError when the bars don't
-        strictly increase across parts."""
-        parts = list(parts)
+        """The parts' bars in order, and their models in order; each part's spans follow the
+        previous part's, so a part is at least one span of its own. The level is the parts'
+        with bars (None when none has any). ModelError when the bars don't strictly increase
+        across parts, or when the parts with bars state different levels."""
+        parts = [p for p in parts if len(p)]
         if not parts:
             return cls.empty()
+        levels = {p.level for p in parts}
+        if len(levels) != 1:
+            raise ModelError("forecast series parts must have intervals at one level")
         t = np.concatenate([p.available_at for p in parts])
-        if len(t) and not (np.diff(t) > 0).all():
+        if not (np.diff(t) > 0).all():
             raise ModelError("forecast series parts must increase strictly in time")
+        spans, offset = [], 0
+        for p in parts:
+            ids = p._span_ids()
+            ids = ids - ids[0] + offset
+            spans.append(ids)
+            offset = int(ids[-1]) + 1
         return cls(
             tuple(m for p in parts for m in p.models),
             t,
-            np.concatenate([p.forecast for p in parts]) if len(t) else np.empty((0, len(LABELS))),
+            np.concatenate([p.forecast for p in parts]),
             np.concatenate([p.target for p in parts]),
             np.concatenate([p.smoothed for p in parts]),
             np.concatenate([p.low for p in parts]),
             np.concatenate([p.high for p in parts]),
             np.concatenate([p.realized for p in parts]),
+            level=levels.pop(),
+            span=np.concatenate(spans),
         )
 
     def data_hash(self) -> str:
-        """`quant.core.canonical.sha256_hex` of {"models": [...], and for each of
-        "available_at", "forecast", "target", "smoothed", "low", "high", "realized" {"dtype",
-        "shape", "sha256"}}, each array hashed as HmmModel's are (little-endian, C-order bytes)."""
+        """`quant.core.canonical.sha256_hex` of {"models": [...], "level": level or null, and
+        for each of "available_at", "forecast", "target", "smoothed", "low", "high",
+        "realized", "span" {"dtype", "shape", "sha256"}}, each array hashed as HmmModel's are
+        (little-endian, C-order bytes)."""
         arrays = {
             n: getattr(self, n)
-            for n in ("available_at", "forecast", "target", "smoothed", "low", "high", "realized")
+            for n in (
+                "available_at",
+                "forecast",
+                "target",
+                "smoothed",
+                "low",
+                "high",
+                "realized",
+                "span",
+            )
         }
         return sha256_hex(
             {
                 "models": list(self.models),
+                "level": self.level,
                 **{
                     n: {
                         "dtype": a.dtype.str,
@@ -318,18 +388,20 @@ def model_series(
     model: HmmModel, matrix: FeatureMatrix, *, start: datetime, end: datetime, level: float
 ) -> ForecastSeries:
     """The forecasts `model` made over its active span [start, end) (module docstring, "The
-    series"), with `models` = (its artifact hash,).
+    series"), with `models` = (its artifact hash,), `level` = `level` and one span.
 
     `matrix` is the model's own feature rows from its fit_start up to the end of the span,
     raw: every row's available_at in [model.fit_start, end). `forward_pass` from π over all of
     them gives p_t (`trace.state_probs[t]`) and q_t = `trace.state_probs[t] @
-    model.params.transmat`, and `quant.eval.smoother.smooth` over the same rows the smoothed
-    posteriors. The realized F1 is the row's raw OUTCOME_FEATURE value. The out-of-sample bars are the rows with start ≤ available_at < end;
-    rows before `start` only warm the filter. No such row gives an empty series with no models.
+    model.params.transmat`, and `quant.eval.smoother.smooth_trace` of that same trace the
+    smoothed posteriors (one forward pass, as `smooth` over the same rows would give). The
+    realized F1 is the row's raw OUTCOME_FEATURE value. The out-of-sample bars are the rows
+    with start ≤ available_at < end; rows before `start` only warm the filter. No such row
+    gives an empty series with no models.
 
     Raises ModelError when: the matrix's columns aren't the model scaler's; a row lies outside
     [model.fit_start, end); start < model.fit_end (an in-sample span); start >= end; the matrix
-    has no rows; or `forward_pass`, `smooth` or `f1_interval` refuses. ClockError for a naive
+    has no rows; or `forward_pass`, `smooth_trace` or `f1_interval` refuses. ClockError for a naive
     time."""
     start, end = ensure_utc(start), ensure_utc(end)
     if (
@@ -346,7 +418,7 @@ def model_series(
     ) >= to_us(end):
         raise ModelError("model series rows must lie within [fit_start, end)")
     trace = forward_pass(model.params, model.scaler, matrix.values, columns=matrix.columns)
-    smoothed = smooth(model.params, model.scaler, matrix.values, columns=matrix.columns)
+    smoothed = smooth_trace(model.params, trace)
     indices = np.nonzero(matrix.available_at >= to_us(start))[0]
     if not len(indices):
         return ForecastSeries.empty()
@@ -376,6 +448,7 @@ def model_series(
         low,
         high,
         matrix.values[indices, i].copy(),
+        level=level,
     )
 
 
@@ -457,7 +530,7 @@ def label_metrics(forecast: Floats, outcome: Bools, *, config: CalibrationConfig
     ref = brier_score(np.full(n, base), outcome)
     skill = None if ref == 0 else 1 - bs / ref
     ece = expected_calibration_error(forecast, outcome)
-    passed = skill is not None and skill > 0 and Decimal(repr(ece)) <= Decimal(repr(config.ece_max))
+    passed = metrics_pass(skill, ece, config)
     return LabelMetrics(
         n=n,
         base_rate=base,
@@ -498,10 +571,13 @@ def calibrate_label(
     - raw = `label_metrics(forecast, outcome)`;
     - not `sufficient`: (raw, recalibrated None, 0 knots, passed False), no knots;
     - raw passes: (raw, None, 0, passed True), no knots;
-    - else: half = n // 2; the knots `fit_isotonic(forecast[:half], outcome[:half])` map
-      forecast[half:] through `interpolate`, recalibrated = `label_metrics` of those against
-      outcome[half:]; the artifact's knots are `fit_isotonic(forecast, outcome)`; passed =
-      recalibrated.passed; the verdict counts the artifact knots.
+    - else: half = n // 2 and m = half - config.settle_bars; the knots `fit_isotonic(
+      forecast[:m], outcome[:m])` map forecast[half:] through `interpolate`, recalibrated =
+      `label_metrics` of those against outcome[half:]. The settle_bars bars between them are
+      left out: the fit's last targets were smoothed with the held-out bars' rows. When m < 1
+      nothing is left to fit, and recalibrated is the metrics of no bars (it fails). The
+      artifact's knots are `fit_isotonic(forecast, outcome)`; passed = recalibrated.passed;
+      the verdict counts the artifact knots.
 
     Validates as `label_metrics`."""
     raw = label_metrics(forecast, outcome, config=config)
@@ -510,10 +586,14 @@ def calibrate_label(
     if raw.passed:
         return LabelVerdict(label=label, raw=raw, recalibrated=None, knots=0, passed=True), None
     half = len(forecast) // 2
-    early_x, early_y = fit_isotonic(forecast[:half], outcome[:half])
-    recalibrated = label_metrics(
-        interpolate(early_x, early_y, forecast[half:]), outcome[half:], config=config
-    )
+    fit = half - config.settle_bars
+    if fit < 1:
+        recalibrated = label_metrics(forecast[:0], outcome[:0], config=config)
+    else:
+        early_x, early_y = fit_isotonic(forecast[:fit], outcome[:fit])
+        recalibrated = label_metrics(
+            interpolate(early_x, early_y, forecast[half:]), outcome[half:], config=config
+        )
     knots = fit_isotonic(forecast, outcome)
     return LabelVerdict(
         label=label,
@@ -529,7 +609,9 @@ def outcome_check(series: ForecastSeries, *, config: CalibrationConfig) -> Outco
     latest min(config.outcome_bars, len - 1) of them (none for fewer than two bars), covered
     when low[t - 1] ≤ realized[t] ≤ high[t - 1]; level = config.outcome_level; passed when there
     are config.outcome_bars pairs and Fraction(covered, n) lies in [Fraction(Decimal(repr(
-    coverage_low))), Fraction(Decimal(repr(coverage_high)))]."""
+    coverage_low))), Fraction(Decimal(repr(coverage_high)))] (`quant.core.calibration.
+    outcome_pass`). The pairs run across span boundaries: a superseded model's interval at its
+    last bar forecast the next bar's F1, which the realized value settles at once."""
     n = len(series)
     pairs = max(0, n - 1)
     m = min(config.outcome_bars, pairs)
@@ -537,15 +619,12 @@ def outcome_check(series: ForecastSeries, *, config: CalibrationConfig) -> Outco
     for t in range(n - m, n):
         if series.low[t - 1] <= series.realized[t] <= series.high[t - 1]:
             covered += 1
-    passed = (
-        m == config.outcome_bars
-        and Fraction(Decimal(repr(config.coverage_low)))
-        <= Fraction(covered, m)
-        <= Fraction(Decimal(repr(config.coverage_high)))
-        if m
-        else False
+    return OutcomeCheck(
+        n=m,
+        covered=covered,
+        level=config.outcome_level,
+        passed=outcome_pass(m, covered, config),
     )
-    return OutcomeCheck(n=m, covered=covered, level=config.outcome_level, passed=passed)
 
 
 def build_calibration(
@@ -557,29 +636,43 @@ def build_calibration(
 ) -> Calibration:
     """The calibration of `series` as of `as_of` (module docstring):
 
-    - bars = len(series); scored = max(0, bars - config.settle_bars), the oldest bars;
-      sufficient = scored ≥ config.min_bars;
-    - per label j of LABELS: `calibrate_label(label, series.forecast[:scored, j],
-      series.target[:scored] == j, config=config, sufficient=sufficient)`;
+    - spans = `series.spans()`, bars = len(series); the scored bars are each span's oldest
+      max(0, span - config.settle_bars), in order (`quant.core.calibration.scored_bars`
+      counts them): every span leaves out its newest settle_bars bars, whose targets were
+      smoothed up to the span's end. sufficient = scored ≥ config.min_bars;
+    - per label j of LABELS: `calibrate_label(label, <the scored bars' forecast[:, j]>,
+      <their target> == j, config=config, sufficient=sufficient)`;
     - outcome = `outcome_check(series, config=config)` over the whole series;
-    - the document's models and data_hash are the series', `as_of` in UTC.
+    - the document's models, spans and data_hash are the series', `as_of` in UTC.
 
     Raises ModelError, before scoring anything, when a bar's available_at is at or after
-    `as_of` (the calibration would score what wasn't known at its as-of time). ClockError for a
-    naive `as_of`."""
+    `as_of` (the calibration would score what wasn't known at its as-of time), or when the
+    series has bars and its `level` isn't `config.outcome_level` (its outcome check would score
+    intervals at another level against this band). ClockError for a naive `as_of`."""
     as_of = ensure_utc(as_of)
     if len(series) and int(series.available_at.max()) >= to_us(as_of):
         raise ModelError("calibration series contains bars at or after its as-of time")
+    if len(series) and series.level != config.outcome_level:
+        raise ModelError(
+            f"calibration series intervals are at level {series.level}, "
+            f"not the config's {config.outcome_level}"
+        )
     bars = len(series)
-    scored = max(0, bars - config.settle_bars)
+    spans = series.spans()
+    keep = np.zeros(bars, dtype=np.bool_)
+    offset = 0
+    for n in spans:
+        keep[offset : offset + max(0, n - config.settle_bars)] = True
+        offset += n
+    scored = scored_bars(spans, config)
     sufficient = scored >= config.min_bars
     verdicts = []
     knots = {}
     for j, label in enumerate(LABELS):
         verdict, label_knots = calibrate_label(
             label,
-            np.ascontiguousarray(series.forecast[:scored, j]),
-            series.target[:scored] == j,
+            np.ascontiguousarray(series.forecast[keep, j]),
+            series.target[keep] == j,
             config=config,
             sufficient=sufficient,
         )
@@ -591,6 +684,7 @@ def build_calibration(
         source=source,
         as_of=as_of,
         models=series.models,
+        spans=spans,
         bars=bars,
         scored=scored,
         sufficient=sufficient,

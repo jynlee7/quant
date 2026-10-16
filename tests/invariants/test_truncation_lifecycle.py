@@ -172,6 +172,9 @@ def _calibration(digest: str) -> Calibration:
     return load_calibration(lifecycle_artifacts() / "calibrations" / digest)
 
 
+# About 3.5 s: the fast tier's budget (B7b review green). The fast tier's fifty-cut test runs the
+# same default registry, refit and calibration layers included, on both sides of the refit.
+@pytest.mark.full
 @pytest.mark.spec("T-NL1", "T-NL2", "I1", "P4", "ARCH§13", "ARCH§7.4")
 def test_clean_lifecycle_passes_every_variant_on_both_sides_of_the_refit() -> None:
     w = world()
@@ -309,6 +312,7 @@ def _peeking_series(
     artifacts: Path,
     level: float,
     policy: Any = None,
+    ticket: Any = None,
 ) -> Any:
     """Planted leak S: calibration_series whose smoother runs over every row the store holds,
     later ones included (the view read at HORIZON), keeping only the bars before `as_of`:
@@ -363,6 +367,7 @@ def _peeking_series(
                 np.array([lo for lo, _ in intervals]),
                 np.array([hi for _, hi in intervals]),
                 rows.values[keep, rows.columns.index("ret")].copy(),
+                level=level,
             )
         )
     return ForecastSeries.concat(parts)
@@ -415,7 +420,6 @@ def _slice(series: Any, keep: np.ndarray) -> Any:
 
 
 @pytest.mark.full  # about 1.5 s: the fast tier's budget
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("T-NL1", "P3", "ARCH§13", "ARCH§7.4")
 def test_planted_leak_a_forecast_series_reading_outside_its_arguments_is_caught(
     monkeypatch: pytest.MonkeyPatch,
@@ -448,7 +452,6 @@ def test_planted_leak_a_forecast_series_reading_outside_its_arguments_is_caught(
 
 
 @pytest.mark.full  # about 2 s: the fast tier's budget
-@pytest.mark.xfail(strict=True, reason="red:B7", raises=AssertionError)
 @pytest.mark.spec("T-NL1", "P3", "ARCH§7.4", "SPEC§9")
 def test_planted_leak_knots_from_a_later_calibration_are_caught_in_calibration(
     monkeypatch: pytest.MonkeyPatch,

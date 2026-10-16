@@ -77,6 +77,7 @@ import random
 import shutil
 import sqlite3
 import tempfile
+import weakref
 from collections import OrderedDict
 from collections.abc import Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -184,6 +185,10 @@ LIFECYCLE_PROVENANCE: Final = MappingProxyType({"source": "harness lifecycle"})
 # pairs (r1: 1,000 each, C13), so the synthetic world's one refit (about 109 scored bars) gets a
 # real verdict. `lifecycle_spec`.
 HARNESS_CALIBRATION_BARS: Final = 60
+# The probabilities the calibration layer maps through each label's knots (B7b review, finding
+# F): 0 to 1 by 0.05, so P̃ is evaluated strictly inside (0, 1), where knots differ, and not only
+# at the 0 or 1 the synthetic filter's label probabilities round to.
+CALIBRATION_GRID: Final = tuple(k / 20 for k in range(21))
 # The synthetic world's first lifecycle model is the fixture relabeled under these: r1's with
 # calm_d 1.5, which labels its two states CALM_UP and CHOP (`lifecycle_spec`).
 START_THRESHOLDS: Final = LabelThresholds(crash_v=1.75, stress_v=1.25, stress_d=-0.5, calm_d=1.5)
@@ -925,9 +930,11 @@ def lifecycle_spec(world: World) -> LifecycleSpec:
     return LifecycleSpec(start, train, r1_thresholds(), calibration)
 
 
-# Results of the lifecycle's two costly pure functions, reused for exactly equal inputs.
-_TRAINED: Final[dict[tuple[Any, ...], Any]] = {}
-_SERIES: Final[dict[tuple[Any, ...], Any]] = {}
+# Results of the lifecycle's two costly functions, per store, reused for exactly equal inputs.
+# A store's entry goes when the store does, so no run is handed another store's results.
+_MEMOS: Final[weakref.WeakKeyDictionary[BarStore, tuple[dict[Any, Any], dict[Any, Any]]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _array_key(*arrays: np.ndarray) -> tuple[str, ...]:
@@ -938,16 +945,21 @@ def _array_key(*arrays: np.ndarray) -> tuple[str, ...]:
 
 
 @contextmanager
-def lifecycle_memo() -> Iterator[None]:
+def lifecycle_memo(store: BarStore) -> Iterator[None]:
     """While it is open, `quant.jobs.refit.train_candidate` and `quant.jobs.calibrate.
-    model_series` reuse their results for exactly equal inputs, so a refit's training and a
-    model's forecasts are computed once per session rather than once per run. Both are pure
-    functions of their arguments, and the keys are exact (data and artifact hashes, the bytes of
+    model_series` reuse their results for exactly equal inputs within `store`'s runs: the
+    world's own store (the full run, variant b) computes each once per session rather than once
+    per run. The keys are exact (the wrapped function, data and artifact hashes, the bytes of
     every array, canonical JSON of every config), so a leak that changes an input misses the
-    memo. The functions in place when it opens are wrapped (a test's monkeypatch included) and
-    put back when it closes."""
+    memo; and the memo is per store, so a leak that reads outside its arguments (the run's
+    store, after its as-of time) can't hand a truncated or garbage run the full run's result
+    (B7b review, finding E). The functions in place when it opens are wrapped (a test's
+    monkeypatch included) and put back when it closes."""
     train = refit_job.train_candidate
     series = calibrate_job.model_series
+    if store not in _MEMOS:
+        _MEMOS[store] = ({}, {})
+    trained_memo, series_memo = _MEMOS[store]
 
     def trained(
         data: TrainingData,
@@ -968,8 +980,8 @@ def lifecycle_memo() -> Iterator[None]:
             canonical_dumps(provenance),
             None if previous is None else previous.artifact_hash(),
         )
-        if key not in _TRAINED:
-            _TRAINED[key] = train(
+        if key not in trained_memo:
+            trained_memo[key] = train(
                 data,
                 candidate,
                 thresholds=thresholds,
@@ -978,7 +990,7 @@ def lifecycle_memo() -> Iterator[None]:
                 workers=workers,
                 previous=previous,
             )
-        return _TRAINED[key]
+        return trained_memo[key]
 
     def forecasts(
         model: HmmModel, matrix: FeatureMatrix, *, start: datetime, end: datetime, level: float
@@ -992,9 +1004,9 @@ def lifecycle_memo() -> Iterator[None]:
             to_us(end),
             float(level).hex(),
         )
-        if key not in _SERIES:
-            _SERIES[key] = series(model, matrix, start=start, end=end, level=level)
-        return _SERIES[key]
+        if key not in series_memo:
+            series_memo[key] = series(model, matrix, start=start, end=end, level=level)
+        return series_memo[key]
 
     refit_job.train_candidate = trained  # type: ignore[assignment]
     calibrate_job.model_series = forecasts  # type: ignore[assignment]
@@ -1125,8 +1137,8 @@ class RefitLayer:
     [outcome, cutoff µs, artifact, effective_at µs or null, reasons], "job_errors": every
     evening job that raised a QuantError so far, as [at µs, class, message]}, with the
     governing model's Provenance: its hash and fit_end, which for a refit is its data cutoff
-    (T-NL2). Stateless between runs; its training and forecasts are memoized across runs
-    (`lifecycle_memo`)."""
+    (T-NL2). Stateless between runs; its training and forecasts are memoized across the runs
+    on one store (`lifecycle_memo`), never across stores."""
 
     name: Final = "refit"
 
@@ -1165,7 +1177,7 @@ class RefitLayer:
         records = []
         lifecycle: _Lifecycle | None = None
         # Refit and calibration outcomes are compared through the records, not the logs.
-        with capture_logs(), lifecycle_memo():
+        with capture_logs(), lifecycle_memo(source.store):
             for d in decisions:
                 if d.tau < self.activation:
                     records.append(cached_record(d.tau, self.name, {"model": None}, cold=True))
@@ -1188,8 +1200,11 @@ class CalibrationLayer:
     "sufficient", "outcome": the outcome check's verdict, "labels": {label: {"passed",
     "cap_fraction", "forecast": the upstream filter record's label probability (0 for a label
     it lacks; null when that record has no "label_probs"), "calibrated": `calibrated(label,
-    forecast)` or null}} for every label}, with the calibration's Provenance: its hash and its
-    as-of time, which T-NL2 needs strictly before τ.
+    forecast)` or null, "curve": `calibrated(label, p)` for each p of CALIBRATION_GRID}} for
+    every label}, with the calibration's Provenance: its hash and its as-of time, which T-NL2
+    needs strictly before τ. The curve is evaluated afresh in each run (once per calibration
+    there), never shared between runs, so a map that depends on anything but the calibration
+    shows.
 
     The filter layer still runs the fixture model; the governing model's own filter, swapped at
     each activation, is the engine's (B8, B14)."""
@@ -1210,6 +1225,7 @@ class CalibrationLayer:
         upstream: Mapping[str, Sequence[Record]],
     ) -> list[Record]:
         records = []
+        curves: dict[str, dict[str, list[float]]] = {}
         for d, refit, filtered in zip(
             decisions, upstream["refit"], upstream["filter"], strict=True
         ):
@@ -1218,6 +1234,11 @@ class CalibrationLayer:
                 records.append(cached_record(d.tau, self.name, {"calibration": None}, cold=True))
                 continue
             calibration = _calibration(self.artifacts / "calibrations" / digest)
+            if digest not in curves:
+                curves[digest] = {
+                    label.value: [calibration.calibrated(label, p) for p in CALIBRATION_GRID]
+                    for label in Label
+                }
             probs = None if filtered.cold else filtered.output.get("label_probs")
             labels = {}
             for label in Label:
@@ -1227,6 +1248,7 @@ class CalibrationLayer:
                     "cap_fraction": calibration.cap_fraction(label),
                     "forecast": p,
                     "calibrated": None if p is None else calibration.calibrated(label, p),
+                    "curve": curves[digest][label.value],
                 }
             output = {
                 "calibration": digest,

@@ -17,7 +17,7 @@ from scipy.special import logsumexp
 
 from quant.core.errors import ModelError
 from quant.data.frames import Floats
-from quant.hmm.filter import forward_pass
+from quant.hmm.filter import ForwardTrace, forward_pass
 from quant.hmm.model import GaussianParams, ScalerParams
 
 
@@ -26,8 +26,20 @@ def smooth(
 ) -> Floats:
     """Smoothed state posteriors, shape (n, K): row t is P(s_t | x_1..x_n), summing to 1.
 
-    Run `forward_pass` over `rows` (n, d), whose columns `columns` names, for log alpha and the emissions log b(z_t), then the
-    backward recursion in log space: log β_{n-1} = 0 and
+    `smooth_trace(params, forward_pass(params, scaler, rows, columns=columns))`: the forward
+    pass over `rows` (n, d), whose columns `columns` names, then the backward recursion. Raises
+    as `forward_pass` does.
+    """
+    return smooth_trace(params, forward_pass(params, scaler, rows, columns=columns))
+
+
+def smooth_trace(params: GaussianParams, trace: ForwardTrace) -> Floats:
+    """Smoothed state posteriors, shape (n, K), from `trace`, the forward pass `forward_pass`
+    made under `params` over n rows: log alpha (`trace.log_probs`) and the emissions log b(z_t)
+    (`trace.emissions`). A caller that needs the filter's p_t as well runs the forward pass
+    once and hands its trace here (`quant.eval.calibration.model_series`).
+
+    The backward recursion runs in log space: log β_{n-1} = 0 and
 
         log β_t,j = logsumexp_k(log a_jk + e_{t+1},k + log β_{t+1},k) - c_t,
 
@@ -35,14 +47,18 @@ def smooth(
     centers them, and c_t the largest entry of the logsumexp, so β stays at most 0. Centering
     first keeps an outlier's emissions (about -5e17) from rounding log a_jk + log β away. Any
     constant per bar cancels: the posterior is exp(log p_t + log β_t), renormalized to sum to
-    1. Raises as `forward_pass` does.
+    1. Raises ModelError when the trace's shapes don't fit `params`, or the backward recursion
+    finds no path.
     """
-    trace = forward_pass(params, scaler, rows, columns=columns)
+    k = params.n_states
+    n = len(trace.log_probs)
+    if trace.log_probs.shape != (n, k) or trace.emissions.shape != (n, k):
+        raise ModelError("the forward trace doesn't fit the model's states")
     with np.errstate(divide="ignore"):
         log_a = np.log(params.transmat)
-    beta = np.zeros(params.n_states, dtype=np.float64)
+    beta = np.zeros(k, dtype=np.float64)
     result = np.empty_like(trace.state_probs)
-    for t in range(len(rows) - 1, -1, -1):
+    for t in range(n - 1, -1, -1):
         joint = trace.log_probs[t] + beta
         joint -= np.max(joint)
         result[t] = np.exp(joint - logsumexp(joint))

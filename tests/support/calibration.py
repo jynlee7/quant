@@ -29,6 +29,8 @@ SERIES_START = datetime(2017, 1, 3, 15, 30, tzinfo=UTC)
 # The as-of time just after a series of n bars: the hour after its last bar.
 MODEL_HASH = "ab" * 32
 OTHER_HASH = "cd" * 32
+# The level the series' intervals are stated at: r1's outcome level.
+SERIES_LEVEL = 0.90
 
 
 def forecaster(
@@ -96,6 +98,7 @@ def series(
     start: datetime = SERIES_START,
     models: tuple[str, ...] = (MODEL_HASH,),
     seed: int = 0,
+    level: float = SERIES_LEVEL,
 ) -> Any:
     """A ForecastSeries of n hourly bars from `start`.
 
@@ -105,7 +108,8 @@ def series(
       and the smoothed probabilities one-hot on it;
     - the outcome check: interval [-1, 1] at every bar, realized F1 0.5 (inside) where
       `covered` holds for that bar and 2.0 (outside) elsewhere; the first bar's realized value
-      is never scored. Default: every bar covered.
+      is never scored. Default: every bar covered;
+    - the intervals' level: `level` (r1's 0.90), and one span of every bar.
     """
     from quant.eval.calibration import ForecastSeries
 
@@ -131,6 +135,7 @@ def series(
         low=np.full(n, -1.0),
         high=np.full(n, 1.0),
         realized=np.where(inside, 0.5, 2.0).astype(np.float64),
+        level=level,
     )
 
 
