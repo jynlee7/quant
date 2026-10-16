@@ -17,9 +17,10 @@ import typer
 from quant.core.calendar import TradingCalendar
 from quant.core.canonical import canonical_dumps
 from quant.core.clock import WallClock
-from quant.core.errors import ConfigError
+from quant.core.errors import ConfigError, DataError
 from quant.core.schedule import Timing
 from quant.core.settings import DEFAULT_ENV_FILE, load_settings
+from quant.data.actions import SUPPLEMENT_PATH, load_dividend_supplement
 from quant.data.alpaca_data import AlpacaMarketData
 from quant.data.backfill import backfill as run_backfill
 from quant.data.market_db import BarStore
@@ -50,19 +51,33 @@ def backfill(
         typer.Option("--end", formats=["%Y-%m-%d"], help="the last session (default: latest)"),
     ] = None,
     symbol: Annotated[str, typer.Option("--symbol")] = "SPY",
+    supplement: Annotated[
+        Path,
+        typer.Option(
+            "--supplement", help="the dividend supplement (config/dividend_supplement.json)"
+        ),
+    ] = SUPPLEMENT_PATH,
 ) -> None:
-    """Fill market.db with SIP minutes and corporate actions (quant.data.backfill).
+    """Fill market.db with SIP minutes and corporate actions (quant.data.backfill), then the
+    dividend supplement's rows for the span (quant.data.actions.load_dividend_supplement).
 
     Resumable: sessions it already stored are skipped. It never goes past the last session
     whose minutes are all available, whatever --end says. Exits 0 when done, printing what it
-    did, and on stderr any session written NOW and any action it couldn't store.
-    Exits 2 when the settings can't be loaded (ConfigError), saying why and creating nothing.
-    Exits 3 when the feed reports a split, which halts trading (ARCHITECTURE §6.1).
+    did, and on stderr any session written NOW and any action or supplement row it couldn't
+    store. Exits 2 when the settings can't be loaded (ConfigError) or the supplement can't be
+    (DataError), saying why and creating nothing: the settings are loaded first, then the
+    supplement, both before market.db is opened. Exits 3 when the feed reports a split, which
+    halts trading (ARCHITECTURE §6.1).
     """
     try:
         settings = load_settings(env_file)
     except ConfigError as exc:
         typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
+    try:
+        rows = load_dividend_supplement(supplement)
+    except DataError as exc:
+        typer.echo(f"{supplement}: {exc}", err=True)
         raise typer.Exit(2) from None
     clock = WallClock()
     source = AlpacaMarketData(settings.alpaca, clock=clock)
@@ -70,7 +85,13 @@ def backfill(
     store = BarStore.open(db, clock=clock)
     try:
         result = run_backfill(
-            store, source, symbol, start.date(), None if end is None else end.date(), clock=clock
+            store,
+            source,
+            symbol,
+            start.date(),
+            None if end is None else end.date(),
+            clock=clock,
+            supplement=rows,
         )
         typer.echo(
             f"Fetched {len(result.fetched)}, skipped {result.skipped}, empty {len(result.empty)}; last {result.last}"
@@ -80,6 +101,8 @@ def backfill(
             typer.echo(f"Completed as NOW (history can't revise them): {sessions}", err=True)
         for conflict in result.actions.conflicts:
             typer.echo(f"Action not stored: {conflict}", err=True)
+        for conflict in result.supplement.conflicts:
+            typer.echo(f"Supplement row not stored: {conflict}", err=True)
         if result.actions.halt:
             typer.echo(result.actions.halt, err=True)
             raise typer.Exit(3)

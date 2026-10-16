@@ -56,6 +56,14 @@ writes garbage into each of those tables too, chosen from the raw rows rather th
 view under test, so a read of them that breaks one of the view's rules (availability, known_at
 before as_of, or a latest-version subquery bounded by as_of) is caught (B6 review).
 
+**The lifecycle (B7b).** `RefitLayer` runs the evening jobs, monthly refits (B7a) and the
+calibrations each pass builds, through `quant.jobs.refit.refit` on the run's own store and a
+fresh in-memory ops.db, and records the model and calibration pointers governing at τ; a refit's
+Provenance is its data cutoff. `CalibrationLayer` records what sizing reads from the governing
+calibration, with the calibration's as-of time as its Provenance, so T-NL2 holds both before every
+τ that uses them. Their artifacts live in one session-wide, content-addressed directory
+(`lifecycle_artifacts`).
+
 **The fixture model (B6 review).** Its rows are the first model's own
 (`quant.jobs.first_model.training_data`), read at τ = as_of = its fit_end, so the harness and
 production can't disagree on which bars feed a model or how returns pair.
@@ -63,13 +71,18 @@ production can't disagree on which bars feed a model or how returns pair.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import random
+import shutil
 import sqlite3
+import tempfile
+import weakref
 from collections import OrderedDict
-from collections.abc import Hashable, Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from functools import cache, lru_cache
 from itertools import chain, pairwise
@@ -80,11 +93,20 @@ from typing import Any, Final, Protocol
 import numpy as np
 from structlog.testing import capture_logs
 
+import quant.jobs.calibrate as calibrate_job
+import quant.jobs.refit as refit_job
 from quant.core.calendar import NEW_YORK, TradingCalendar
+from quant.core.calibration import (
+    Calibration,
+    CalibrationConfig,
+    load_calibration,
+    r1_calibration_config,
+    save_calibration,
+)
 from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
 from quant.core.clock import SimClock
 from quant.core.epoch import from_us, to_us
-from quant.core.errors import FeatureError, ModelError
+from quant.core.errors import FeatureError, ModelError, QuantError
 from quant.core.orders import Side, TradingMode
 from quant.core.regime import Label
 from quant.core.schedule import Decision, decision_schedule
@@ -95,15 +117,17 @@ from quant.data.validate import MOVE_KIND, DataFlag
 from quant.data.view import PointInTimeView
 from quant.features.menu import FeatureConfig, r1_features
 from quant.features.scaler import Scaler
-from quant.features.stream import FeatureStream, compute_features, features_for
+from quant.features.stream import FeatureMatrix, FeatureStream, compute_features, features_for
+from quant.hmm.drift import r1_drift_thresholds
 from quant.hmm.filter import ForwardFilter
-from quant.hmm.labels import r1_thresholds
-from quant.hmm.model import HmmModel
+from quant.hmm.labels import LabelTable, LabelThresholds, StateLabel, classify, r1_thresholds
+from quant.hmm.model import HmmModel, save_model
 from quant.hmm.select import Candidate
-from quant.hmm.train import TrainingData, r1_train_config, train_candidate
+from quant.hmm.train import TrainConfig, TrainingData, r1_train_config, train_candidate
 from quant.jobs.first_model import training_data
 from quant.risk.engine import MemorySpentApprovals, RiskApprovedOrder, RiskEngine, Veto
 from quant.risk.limits import RiskConfig
+from quant.store.ops import OpsStore
 from tests.support.bars import SYMBOL, revise_close, synthetic_days
 from tests.support.risk import config as risk_config
 from tests.support.risk import context, intent
@@ -151,6 +175,23 @@ FLAG_SPAN: Final = timedelta(days=1)
 # available (as history), so every flags read has a flag to get right (B6 review S1/M2): the
 # synthetic bars never move 5% in a minute, and SPY's real minutes almost never do.
 PLANTED_FLAG_DETAIL: Final = "planted"
+
+# The lifecycle layers (B7b): the evening job runs at 17:30 New York on each session day, as B7a's
+# refit tests run it; refits train like the fixture model, with 50 bootstrap draws.
+EVENING_ET: Final = time(17, 30)
+LIFECYCLE_BOOTSTRAP: Final = 50
+LIFECYCLE_PROVENANCE: Final = MappingProxyType({"source": "harness lifecycle"})
+# The harness's calibration verdicts need this many scored bars, and the outcome check this many
+# pairs (r1: 1,000 each, C13), so the synthetic world's one refit (about 109 scored bars) gets a
+# real verdict. `lifecycle_spec`.
+HARNESS_CALIBRATION_BARS: Final = 60
+# The probabilities the calibration layer maps through each label's knots (B7b review, finding
+# F): 0 to 1 by 0.05, so P̃ is evaluated strictly inside (0, 1), where knots differ, and not only
+# at the 0 or 1 the synthetic filter's label probabilities round to.
+CALIBRATION_GRID: Final = tuple(k / 20 for k in range(21))
+# The synthetic world's first lifecycle model is the fixture relabeled under these: r1's with
+# calm_d 1.5, which labels its two states CALM_UP and CHOP (`lifecycle_spec`).
+START_THRESHOLDS: Final = LabelThresholds(crash_v=1.75, stress_v=1.25, stress_d=-0.5, calm_d=1.5)
 
 # The full tier's real bars (PLAN P4): the repository's market.db.
 MARKET_DB: Final = Path(__file__).resolve().parents[2] / "var" / "market.db"
@@ -806,6 +847,429 @@ class ActionsLayer:
         return view.flags(SYMBOL, d.tau - FLAG_SPAN, d.tau + MINUTE_SPAN, purpose=Purpose.OPERATE)
 
 
+# --- the lifecycle: refits and calibrations (B7b) ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class LifecycleSpec:
+    """What the lifecycle layers run (`lifecycle_spec`).
+
+    - `start`: the first model, activated at the world's activation;
+    - `train`: the refits' TrainConfig (the fixture's few restarts, serial);
+    - `thresholds`: the label thresholds refits derive labels under (r1's);
+    - `calibration`: the calibration rules: r1's, except `min_bars` and `outcome_bars`
+      (HARNESS_CALIBRATION_BARS), so the synthetic world's refit, about 100 scored bars after it
+      activates, gets a real verdict, recalibration included. The spec's numbers are pinned by
+      the unit tests (tests/unit/test_calibration_*.py), not here.
+    """
+
+    start: HmmModel
+    train: TrainConfig
+    thresholds: LabelThresholds
+    calibration: CalibrationConfig
+
+
+@cache
+def lifecycle_artifacts() -> Path:
+    """The session's artifact root for the lifecycle layers: a temporary directory, removed at
+    exit. Artifacts are content-addressed and saving is idempotent, so every run, variant and
+    registry may share it: a leaky run's artifacts have other hashes, never the clean ones'."""
+    root = Path(tempfile.mkdtemp(prefix="quant-harness-artifacts-"))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+    return root
+
+
+def relabeled(model: HmmModel, thresholds: LabelThresholds) -> HmmModel:
+    """`model` with each state's label `classify(v, d, thresholds)` from its own v and d: the
+    same parameters, scaler and window under another label table (another artifact hash)."""
+    table = LabelTable(
+        thresholds=thresholds,
+        states=tuple(
+            StateLabel(v=s.v, d=s.d, label=classify(s.v, s.d, thresholds))
+            for s in model.labels.states
+        ),
+    )
+    return HmmModel(
+        params=model.params,
+        scaler=model.scaler,
+        fit_start=model.fit_start,
+        fit_end=model.fit_end,
+        feature_config_hash=model.feature_config_hash,
+        labels=table,
+        training=model.training,
+    )
+
+
+@cache
+def lifecycle_spec(world: World) -> LifecycleSpec:
+    """The lifecycle a world runs. The synthetic world starts from its fixture model relabeled
+    under START_THRESHOLDS, which gives it two labels (CALM_UP, CHOP); its refit on 2016-11-30
+    derives exactly the labels it inherits under r1's thresholds and passes every drift check,
+    so a new model and its calibration govern from the 2016-12-01 open. The fixture model as it
+    is has one label, which would make every calibration target constant. A real world starts
+    from its fixture model as it is."""
+    start = (
+        world.model
+        if world.spec.market_db is not None
+        else relabeled(world.model, START_THRESHOLDS)
+    )
+    train = r1_train_config().model_copy(
+        update={
+            "n_restarts": FIXTURE_RESTARTS,
+            "base_seed": FIXTURE_BASE_SEED,
+            "validation_months": 1,
+            "bootstrap_draws": LIFECYCLE_BOOTSTRAP,
+        }
+    )
+    calibration = r1_calibration_config().model_copy(
+        update={
+            "min_bars": HARNESS_CALIBRATION_BARS,
+            "outcome_bars": HARNESS_CALIBRATION_BARS,
+        }
+    )
+    return LifecycleSpec(start, train, r1_thresholds(), calibration)
+
+
+# Results of the lifecycle's two costly functions, per store, reused for exactly equal inputs.
+# A store's entry goes when the store does, so no run is handed another store's results.
+_MEMOS: Final[weakref.WeakKeyDictionary[BarStore, tuple[dict[Any, Any], dict[Any, Any]]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _array_key(*arrays: np.ndarray) -> tuple[str, ...]:
+    return tuple(
+        f"{a.dtype.str}{a.shape}" + hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest()
+        for a in arrays
+    )
+
+
+@contextmanager
+def lifecycle_memo(store: BarStore) -> Iterator[None]:
+    """While it is open, `quant.jobs.refit.train_candidate` and `quant.jobs.calibrate.
+    model_series` reuse their results for exactly equal inputs within `store`'s runs: the
+    world's own store (the full run, variant b) computes each once per session rather than once
+    per run. The keys are exact (the wrapped function, data and artifact hashes, the bytes of
+    every array, canonical JSON of every config), so a leak that changes an input misses the
+    memo; and the memo is per store, so a leak that reads outside its arguments (the run's
+    store, after its as-of time) can't hand a truncated or garbage run the full run's result
+    (B7b review, finding E). The functions in place when it opens are wrapped (a test's
+    monkeypatch included) and put back when it closes."""
+    train = refit_job.train_candidate
+    series = calibrate_job.model_series
+    if store not in _MEMOS:
+        _MEMOS[store] = ({}, {})
+    trained_memo, series_memo = _MEMOS[store]
+
+    def trained(
+        data: TrainingData,
+        candidate: Candidate,
+        *,
+        thresholds: LabelThresholds,
+        config: TrainConfig,
+        provenance: Mapping[str, Any],
+        workers: int | None = None,
+        previous: HmmModel | None = None,
+    ) -> Any:
+        key = (
+            train,
+            data.data_hash(),
+            canonical_dumps(candidate),
+            canonical_dumps(thresholds),
+            canonical_dumps(config),
+            canonical_dumps(provenance),
+            None if previous is None else previous.artifact_hash(),
+        )
+        if key not in trained_memo:
+            trained_memo[key] = train(
+                data,
+                candidate,
+                thresholds=thresholds,
+                config=config,
+                provenance=provenance,
+                workers=workers,
+                previous=previous,
+            )
+        return trained_memo[key]
+
+    def forecasts(
+        model: HmmModel, matrix: FeatureMatrix, *, start: datetime, end: datetime, level: float
+    ) -> Any:
+        key = (
+            series,
+            model.artifact_hash(),
+            matrix.columns,
+            *_array_key(matrix.t_open, matrix.available_at, matrix.values),
+            to_us(start),
+            to_us(end),
+            float(level).hex(),
+        )
+        if key not in series_memo:
+            series_memo[key] = series(model, matrix, start=start, end=end, level=level)
+        return series_memo[key]
+
+    refit_job.train_candidate = trained  # type: ignore[assignment]
+    calibrate_job.model_series = forecasts  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        refit_job.train_candidate = train
+        calibrate_job.model_series = series
+
+
+class _Lifecycle:
+    """One run's lifecycle state: its ops store on a SimClock, the models it knows by hash, the
+    next session whose evening job hasn't run, and the evening jobs' errors."""
+
+    def __init__(self, layer: RefitLayer, source: Source) -> None:
+        self.layer, self.source = layer, source
+        spec = layer.spec
+        self.clock = SimClock(layer.activation)
+        self.ops = OpsStore.memory(clock=self.clock)
+        self.models: dict[str, HmmModel] = {spec.start.artifact_hash(): spec.start}
+        self.errors: list[list[Any]] = []
+        artifacts = layer.artifacts
+        save_model(spec.start, artifacts / "models")
+        self.ops.activate("model", spec.start.artifact_hash(), reason="first model")
+        first = calibrate_job.calibrate(
+            source.store,
+            self.ops,
+            as_of=layer.activation,
+            symbol=SYMBOL,
+            features=layer.config,
+            artifacts=artifacts,
+            config=spec.calibration,
+        )
+        save_calibration(first, artifacts / "calibrations")
+        self.ops.activate("calibration", first.artifact_hash(), reason="first model")
+        cal = TradingCalendar.xnys()
+        day = layer.activation.astimezone(NEW_YORK).date()
+        self.next_day = day if cal.is_session(day) else cal.next_session(day)
+
+    def evenings_before(self, tau: datetime) -> None:
+        """Run every evening job at EVENING_ET New York on a session day, from `next_day` on,
+        that comes before `tau`, in order."""
+        cal = TradingCalendar.xnys()
+        while (evening := evening_at(self.next_day)) < tau:
+            self.evening(evening)
+            self.next_day = cal.next_session(self.next_day)
+
+    def evening(self, at: datetime) -> None:
+        """The evening job at `at`: `quant.jobs.refit.refit` of the model governing at `at`, as
+        the scheduler runs it (B13). A QuantError is the job failing, as it would be logged
+        live; the run records it and goes on (the next evening retries)."""
+        layer, spec = self.layer, self.layer.spec
+        self.clock.advance_to(at)
+        pointer = self.ops.current("model", at)
+        assert pointer is not None, "the first model governs from the activation's open"
+        try:
+            outcome = refit_job.refit(
+                self.source.store,
+                self.models[pointer.artifact],
+                at=at,
+                symbol=SYMBOL,
+                features=layer.config,
+                ops=self.ops,
+                artifacts=layer.artifacts,
+                config=spec.train,
+                thresholds=spec.thresholds,
+                drift=r1_drift_thresholds(),
+                provenance=LIFECYCLE_PROVENANCE,
+                workers=1,
+                calibration=spec.calibration,
+            )
+        except QuantError as exc:
+            self.errors.append([to_us(at), type(exc).__name__, str(exc)])
+            return
+        if outcome is not None and outcome.model is not None:
+            self.models[outcome.model.artifact_hash()] = outcome.model
+
+    def record(self, tau: datetime) -> Record:
+        """The refit layer's record at `tau` (`RefitLayer`)."""
+        pointer = self.ops.current("model", tau)
+        assert pointer is not None, "the first model governs from the activation's open"
+        model = self.models[pointer.artifact]
+        calibration = self.ops.current("calibration", tau)
+        output = {
+            "model": pointer.artifact,
+            "frozen": self.ops.frozen(tau),
+            "calibration": None if calibration is None else calibration.artifact,
+            "refits": [
+                [
+                    event.outcome.value,
+                    to_us(event.cutoff),
+                    event.artifact,
+                    None if event.effective_at is None else to_us(event.effective_at),
+                    list(event.reasons),
+                ]
+                for event in self.ops.refit_events()
+            ],
+            "job_errors": [list(error) for error in self.errors],
+        }
+        return cached_record(
+            tau, self.layer.name, output, Provenance(pointer.artifact, model.fit_end)
+        )
+
+
+def evening_at(day: date) -> datetime:
+    """EVENING_ET New York on `day`, in UTC: when the harness runs a session's evening job."""
+    return datetime.combine(day, EVENING_ET, tzinfo=NEW_YORK).astimezone(UTC)
+
+
+class RefitLayer:
+    """The model lifecycle's evening jobs (B7, the B5 open item "register refits and
+    calibration as layers"): monthly refits (B7a) and the calibration each pass builds (B7b),
+    run as live trading runs them, through `quant.jobs.refit.refit` itself.
+
+    A decision before `activation` records {"model": null}, no provenance and `cold`. At the
+    first decision at or after it, the run starts its lifecycle (`_Lifecycle`): a fresh
+    in-memory ops.db on a SimClock at `activation`, the start model saved under `artifacts` and
+    activated, and its calibration, built as of `activation` (`quant.jobs.calibrate.calibrate`,
+    with no governed bars yet, so every label fails), saved and activated: both govern from the
+    next open. Before each decision, every evening job before τ runs (EVENING_ET New York on
+    each session day): `refit(...)` of the model governing then, on `source.store`, with the
+    spec's configs, r1's drift thresholds, LIFECYCLE_PROVENANCE and workers=1. The refit reads
+    the store only through the view at its cutoff, and the calibration at its as-of time, both
+    before τ.
+
+    Per decision it records {"model": the model pointer at τ, "frozen": `ops.frozen(τ)`,
+    "calibration": the calibration pointer at τ, "refits": every refit event so far as
+    [outcome, cutoff µs, artifact, effective_at µs or null, reasons], "job_errors": every
+    evening job that raised a QuantError so far, as [at µs, class, message]}, with the
+    governing model's Provenance: its hash and fit_end, which for a refit is its data cutoff
+    (T-NL2). Stateless between runs; its training and forecasts are memoized across the runs
+    on one store (`lifecycle_memo`), never across stores."""
+
+    name: Final = "refit"
+
+    def __init__(
+        self,
+        world: World,
+        *,
+        spec: LifecycleSpec | None = None,
+        activation: datetime | None = None,
+        artifacts: Path | None = None,
+    ) -> None:
+        """`spec` is `lifecycle_spec(world)`, `activation` the world's and `artifacts`
+        `lifecycle_artifacts()` when None. Nothing is built or read until `run`."""
+        self.world = world
+        self._spec = spec
+        self.activation = world.activation if activation is None else activation
+        self._artifacts = artifacts
+        self.config = world.config
+
+    @property
+    def spec(self) -> LifecycleSpec:
+        if self._spec is None:
+            self._spec = lifecycle_spec(self.world)
+        return self._spec
+
+    @property
+    def artifacts(self) -> Path:
+        return lifecycle_artifacts() if self._artifacts is None else self._artifacts
+
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        records = []
+        lifecycle: _Lifecycle | None = None
+        # Refit and calibration outcomes are compared through the records, not the logs.
+        with capture_logs(), lifecycle_memo(source.store):
+            for d in decisions:
+                if d.tau < self.activation:
+                    records.append(cached_record(d.tau, self.name, {"model": None}, cold=True))
+                    continue
+                if lifecycle is None:
+                    lifecycle = _Lifecycle(self, source)
+                lifecycle.evenings_before(d.tau)
+                records.append(lifecycle.record(d.tau))
+            if lifecycle is not None:
+                lifecycle.ops.close()
+        return records
+
+
+class CalibrationLayer:
+    """The calibration sizing reads (B7b; spec §9, ARCHITECTURE §7.4). Per decision, the
+    upstream refit record's "calibration" hash names the calibration governing at τ, loaded
+    from `artifacts / "calibrations"` (`load_calibration`, cached by hash: the hash fixes the
+    content). A decision whose refit record is cold or names no calibration records
+    {"calibration": null}, cold. Otherwise it records {"calibration": the hash, "as_of": µs,
+    "sufficient", "outcome": the outcome check's verdict, "labels": {label: {"passed",
+    "cap_fraction", "forecast": the upstream filter record's label probability (0 for a label
+    it lacks; null when that record has no "label_probs"), "calibrated": `calibrated(label,
+    forecast)` or null, "curve": `calibrated(label, p)` for each p of CALIBRATION_GRID}} for
+    every label}, with the calibration's Provenance: its hash and its as-of time, which T-NL2
+    needs strictly before τ. The curve is evaluated afresh in each run (once per calibration
+    there), never shared between runs, so a map that depends on anything but the calibration
+    shows.
+
+    The filter layer still runs the fixture model; the governing model's own filter, swapped at
+    each activation, is the engine's (B8, B14)."""
+
+    name: Final = "calibration"
+
+    def __init__(self, *, artifacts: Path | None = None) -> None:
+        self._artifacts = artifacts
+
+    @property
+    def artifacts(self) -> Path:
+        return lifecycle_artifacts() if self._artifacts is None else self._artifacts
+
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        records = []
+        curves: dict[str, dict[str, list[float]]] = {}
+        for d, refit, filtered in zip(
+            decisions, upstream["refit"], upstream["filter"], strict=True
+        ):
+            digest = None if refit.cold else refit.output.get("calibration")
+            if digest is None:
+                records.append(cached_record(d.tau, self.name, {"calibration": None}, cold=True))
+                continue
+            calibration = _calibration(self.artifacts / "calibrations" / digest)
+            if digest not in curves:
+                curves[digest] = {
+                    label.value: [calibration.calibrated(label, p) for p in CALIBRATION_GRID]
+                    for label in Label
+                }
+            probs = None if filtered.cold else filtered.output.get("label_probs")
+            labels = {}
+            for label in Label:
+                p = None if probs is None else float(probs.get(label.value, 0.0))
+                labels[label.value] = {
+                    "passed": calibration.passed(label),
+                    "cap_fraction": calibration.cap_fraction(label),
+                    "forecast": p,
+                    "calibrated": None if p is None else calibration.calibrated(label, p),
+                    "curve": curves[digest][label.value],
+                }
+            output = {
+                "calibration": digest,
+                "as_of": to_us(calibration.as_of),
+                "sufficient": calibration.document.sufficient,
+                "outcome": calibration.document.outcome.passed,
+                "labels": labels,
+            }
+            records.append(
+                cached_record(d.tau, self.name, output, Provenance(digest, calibration.as_of))
+            )
+        return records
+
+
+@lru_cache(maxsize=256)
+def _calibration(directory: Path) -> Calibration:
+    """`load_calibration(directory)`, once per directory: a directory is named by its content's
+    hash, and `load_calibration` checks it."""
+    return load_calibration(directory)
+
+
 # --- the world -------------------------------------------------------------------------------
 
 
@@ -937,13 +1401,15 @@ def fixture_model(fit_end: datetime, spec: WorldSpec = SYNTHETIC) -> HmmModel:
 def default_registry(world: World, *, risk_seed: int = 0) -> Registry:
     """The clean decision path in order: ViewLayer, FeaturesLayer(world.config, world.scaler,
     activation=world.activation), FilterLayer(world.model, activation=world.activation),
-    RiskLayer(the committed risk.yaml, seed=risk_seed), ActionsLayer. Later steps add their
-    layers here (CLAUDE.md rule 4)."""
+    RefitLayer(world) and CalibrationLayer() (B7b), RiskLayer(the committed risk.yaml,
+    seed=risk_seed), ActionsLayer. Later steps add their layers here (CLAUDE.md rule 4)."""
     return Registry(
         (
             ViewLayer(),
             FeaturesLayer(world.config, world.scaler, activation=world.activation),
             FilterLayer(world.model, activation=world.activation),
+            RefitLayer(world),
+            CalibrationLayer(),
             RiskLayer(risk_config(), seed=risk_seed),
             ActionsLayer(),
         )
@@ -1138,7 +1604,9 @@ def garbage_store(world: World, cut: datetime, *, seed: int) -> tuple[BarStore, 
     store = truncated_store(world, cut)
     clock = SimClock(cut)
     store = BarStore(store._conn, clock=clock)
-    decision = next(d for d in world.decisions if d.tau == cut)
+    # The cut's bar is the latest decision's at or before the cut, so a cut between decisions
+    # (a refit's 17:00 cutoff, B7) works as well as one at a decision.
+    decision = max((d for d in world.decisions if d.tau <= cut), key=lambda d: d.tau)
     previous, bar = store.view(cut, as_of=cut).hourly(SYMBOL, purpose=Purpose.OPERATE, last=2)
     if bar.t_open != decision.bar.t_open:
         raise ValueError(f"the cut's bar isn't visible at {cut.isoformat()}")

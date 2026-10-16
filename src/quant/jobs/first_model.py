@@ -43,35 +43,30 @@ Clock passed in (K6).
 from __future__ import annotations
 
 import hashlib
-import math
 import os
 import re
 import subprocess
 import tempfile
-from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from itertools import pairwise
 from pathlib import Path
 from typing import Any, Final
 
-import numpy as np
 import structlog
 
-from quant.core.calendar import NEW_YORK, TradingCalendar
+from quant.core.calendar import NEW_YORK
 from quant.core.canonical import canonical_dumps, canonical_loads
 from quant.core.clock import Clock
-from quant.core.epoch import to_us
-from quant.core.errors import DataError, ModelError, PolicyError
+from quant.core.errors import ModelError, PolicyError
 from quant.data.frames import HourlyBar
 from quant.data.market_db import BarStore
-from quant.data.policy import DEV_START, FIT_START, DataPolicy, Purpose
+from quant.data.policy import DEV_START, FIT_START, DataPolicy
 from quant.features.menu import FeatureConfig
-from quant.features.stream import compute_features
 from quant.hmm.labels import LabelThresholds
 from quant.hmm.model import save_model
 from quant.hmm.train import TrainConfig, TrainingData, TrainResult, select_and_train
+from quant.jobs._rows import training_rows
 
 # FIT's last day: the day before DEV starts (spec §2 splits, D4).
 FIT_LAST: Final = DEV_START - timedelta(days=1)
@@ -124,49 +119,26 @@ def training_data(
 
     Raises ModelError (from TrainingData) when fewer than two warm rows remain."""
     start, end = fit_window(first, last)
-    origin = datetime.combine(FIT_START, time(), tzinfo=NEW_YORK).astimezone(UTC)
-    bars = store.view(end, as_of=end, policy=policy).hourly(
-        symbol, purpose=Purpose.OPERATE, since=origin
-    )
-    late = [bar for bar in bars if bar.session >= DEV_START or bar.t_open >= end]
-    if late:
-        raise PolicyError(
-            f"first model rows must lie inside FIT, before DEV starts on {DEV_START} and before "
-            f"{end.isoformat()}; read a bar of {late[0].session}"
-        )
-    _require_whole_sessions(bars, first, last)
-    matrix = compute_features(bars, features).window(start, end)
-    by_open = {
-        to_us(bar.t_open): (math.log(bar.close / previous.close), bar.session.toordinal())
-        for previous, bar in pairwise(bar for bar in bars if bar.complete)
-    }
-    return TrainingData(
-        matrix,
-        np.array([by_open[int(t)][0] for t in matrix.t_open], dtype=np.float64),
-        np.array([by_open[int(t)][1] for t in matrix.t_open], dtype=np.int64),
-        start,
-        end,
-        features.config_hash(),
-    )
 
+    def require_fit(bars: list[HourlyBar]) -> None:
+        late = [bar for bar in bars if bar.session >= DEV_START or bar.t_open >= end]
+        if late:
+            raise PolicyError(
+                f"first model rows must lie inside FIT, before DEV starts on {DEV_START} and before "
+                f"{end.isoformat()}; read a bar of {late[0].session}"
+            )
 
-def _require_whole_sessions(bars: list[HourlyBar], first: date, last: date) -> None:
-    """DataError unless every session of [first, last] has all its calendar hourly bars among
-    `bars`, naming the sessions that don't."""
-    calendar = TradingCalendar.xnys()
-    counts = Counter(bar.session for bar in bars)
-    short = [
-        day
-        for day in calendar.sessions(first, last)
-        if counts[day] != len(calendar.session(day).bars)
-    ]
-    if short:
-        shown = ", ".join(day.isoformat() for day in short[:10])
-        raise DataError(
-            f"the view at fit_end lacks hourly bars of {len(short)} session(s) of the span "
-            f"({shown}{', ...' if len(short) > 10 else ''}): known after fit_end, or never "
-            "stored; check the store with `quant data quality`"
-        )
+    return training_rows(
+        store,
+        symbol,
+        start=start,
+        end=end,
+        first=first,
+        last=last,
+        features=features,
+        policy=policy,
+        validate=require_fit,
+    )
 
 
 @dataclass(frozen=True, eq=False)

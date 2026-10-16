@@ -24,18 +24,33 @@ share count the same way, so it maps to a split of `new_rate / old_rate`, never 
 Actions are fetched again on every backfill. One stored before with the same values changes
 nothing. One that differs is a revision, which history can't make (ARCHITECTURE §6.2): it is
 left as stored and reported in `ActionSync.conflicts`, and the others are still stored.
+
+**The dividend supplement** (B7, the owner's call at CP1): the feed misses SPY's dividends with
+ex-dates 2016-03-18, 2018-06-15 and 2026-09-18 (docs/VERIFY.md). They come from State Street's
+"ETF Historical Distributions" spreadsheet, as the committed file `config/dividend_supplement.json`
+(`load_dividend_supplement`). The source gives no declaration date, so each row is a Dividend
+declared on its ex-date with `declared_in_feed=False`, exactly like a feed dividend without one.
+The backfill stores the supplement after the feed, under the same stamp
+(`quant.data.backfill.backfill`'s `supplement`). A row that differs from a stored dividend is a
+conflict, reported in the supplement's `ActionSync.conflicts`, never an overwrite.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from pathlib import Path
+from typing import Any, Final
 
-from quant.core.errors import DataError
+from quant.core.canonical import canonical_loads
+from quant.core.errors import CanonicalJSONError, DataError
 from quant.data.market_db import BarStore, Stamp
+
+# The committed supplement, relative to the repo root (the CLI's default).
+SUPPLEMENT_PATH: Final = Path("config/dividend_supplement.json")
 
 
 @dataclass(frozen=True)
@@ -142,13 +157,18 @@ def actions_from_announcements(payload: Any) -> CorporateActions:
 
 
 def store_actions(
-    store: BarStore, symbol: str, actions: CorporateActions, *, known_at: Stamp
+    store: BarStore,
+    symbol: str,
+    actions: CorporateActions,
+    *,
+    known_at: Stamp,
+    allow_revision: bool = True,
 ) -> ActionSync:
     """Store `symbol`'s dividends and splits (`BarStore.put_dividend`, `put_split`), stamped as
     `known_at` says. Storing the same actions twice changes nothing. An action the store
     refuses, such as a changed one under HISTORY, is left as stored and reported in
     `ActionSync.conflicts`; the others are still stored. Every split is surfaced, so it
-    halts."""
+    halts. With allow_revision=False, differing dividends are conflicts under either stamp."""
     dividends = [d for d in actions.dividends if d.symbol == symbol]
     splits = tuple(s for s in actions.splits if s.symbol == symbol)
     conflicts: list[str] = []
@@ -156,7 +176,12 @@ def store_actions(
     for d in dividends:
         try:
             store.put_dividend(
-                symbol, ex_date=d.ex_date, amount=d.amount, declared=d.declared, known_at=known_at
+                symbol,
+                ex_date=d.ex_date,
+                amount=d.amount,
+                declared=d.declared,
+                known_at=known_at,
+                allow_revision=allow_revision,
             )
             stored += 1
         except DataError as exc:
@@ -176,3 +201,121 @@ def _positive(value: Any) -> float:
     if not math.isfinite(number) or number <= 0:
         raise DataError("corporate action rate must be finite and positive")
     return number
+
+
+@dataclass(frozen=True)
+class SupplementSource:
+    """Where the supplement's rows come from: the publisher's `name`, the `page` that links the
+    file, the file's `url` (both https), the day it was `retrieved`, and the `sha256` of the
+    retrieved file's bytes (64 lowercase hex characters)."""
+
+    name: str
+    page: str
+    url: str
+    retrieved: date
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SupplementRow:
+    """One dividend as the source lists it. `amount` is cash per share."""
+
+    symbol: str
+    cusip: str
+    ex_date: date
+    record_date: date
+    payable_date: date
+    amount: float
+
+
+@dataclass(frozen=True)
+class DividendSupplement:
+    """The parsed supplement file: its source, its note, and its rows in the file's order,
+    sorted by (ex_date, symbol)."""
+
+    source: SupplementSource
+    note: str
+    rows: tuple[SupplementRow, ...]
+
+    @property
+    def actions(self) -> CorporateActions:
+        """The rows as corporate actions: one Dividend per row, in ex-date order, `Dividend(
+        symbol, ex_date, amount, declared=ex_date, declared_in_feed=False)` (the ex-date stands
+        in for the missing declaration date, ARCHITECTURE §6.2), and no splits."""
+        return CorporateActions(
+            tuple(Dividend(r.symbol, r.ex_date, r.amount, r.ex_date, False) for r in self.rows), ()
+        )
+
+
+def load_dividend_supplement(path: Path) -> DividendSupplement:
+    """Parse the supplement file at `path` (`config/dividend_supplement.json`).
+
+    The file is JSON, read with `quant.core.canonical.canonical_loads` (duplicate keys, NaN and
+    infinities refused; any whitespace and key order accepted, so it stays reviewable). Its
+    top-level object has exactly the keys:
+
+    - "source": an object with exactly "name", "page", "url", "retrieved" (an ISO date) and
+      "sha256" (64 lowercase hex characters); "page" and "url" start with "https://";
+    - "note": a non-empty string;
+    - "dividends": a non-empty list of objects with exactly "symbol", "cusip", "ex_date",
+      "record_date", "payable_date" (ISO dates) and "amount" (a JSON number, finite and > 0).
+      Within a row ex_date <= record_date <= payable_date. The rows are sorted strictly by
+      (ex_date, symbol), so no (symbol, ex_date) appears twice.
+
+    Strings must be non-empty. Raises DataError naming the problem for an unreadable file
+    (OSError), text that isn't such JSON, a missing or extra key, a value of the wrong type, a
+    bad date or amount, or rows out of order. Nothing else is accepted, so an edit to the file
+    either keeps this shape or fails loudly."""
+
+    def obj(value: Any, keys: str) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != set(keys.split()):
+            raise ValueError("missing or extra keys")
+        return value
+
+    def string(value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("expected nonempty string")
+        return value
+
+    def day(value: Any) -> date:
+        value = string(value)
+        result = date.fromisoformat(value)
+        if result.isoformat() != value:
+            raise ValueError("expected ISO date")
+        return result
+
+    try:
+        document = obj(canonical_loads(path.read_text()), "source note dividends")
+        source = obj(document["source"], "name page url retrieved sha256")
+        for key in ("name", "page", "url", "sha256"):
+            string(source[key])
+        if any(not source[k].startswith("https://") for k in ("page", "url")):
+            raise ValueError("source URLs must use https")
+        if re.fullmatch(r"[0-9a-f]{64}", source["sha256"]) is None:
+            raise ValueError("invalid source sha256")
+        parsed_source = SupplementSource(**(source | {"retrieved": day(source["retrieved"])}))
+        note = string(document["note"])
+        if not isinstance(document["dividends"], list) or not document["dividends"]:
+            raise ValueError("expected nonempty dividends list")
+        rows: list[SupplementRow] = []
+        for value in document["dividends"]:
+            row = obj(value, "symbol cusip ex_date record_date payable_date amount")
+            amount = row["amount"]
+            if type(amount) not in (int, float) or not math.isfinite(amount) or amount <= 0:
+                raise ValueError("invalid dividend amount")
+            parsed = SupplementRow(
+                string(row["symbol"]),
+                string(row["cusip"]),
+                day(row["ex_date"]),
+                day(row["record_date"]),
+                day(row["payable_date"]),
+                float(amount),
+            )
+            if not parsed.ex_date <= parsed.record_date <= parsed.payable_date:
+                raise ValueError("dividend dates out of order")
+            if rows and (rows[-1].ex_date, rows[-1].symbol) >= (parsed.ex_date, parsed.symbol):
+                raise ValueError("dividend rows out of order or duplicated")
+            rows.append(parsed)
+        return DividendSupplement(parsed_source, note, tuple(rows))
+    except (OSError, ValueError, TypeError, OverflowError, CanonicalJSONError) as exc:
+        raise DataError(f"{path}: invalid dividend supplement: {exc}") from exc

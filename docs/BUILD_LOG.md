@@ -2,6 +2,128 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B7 · Model lifecycle: refit, drift, calibration (done 2026-10-15, tag `b07-done`)
+
+Built on `b07-lifecycle` in two parts, each with its own red, green and review:
+
+- **B7a:** the dividend supplement, refit, label matching, drift, ops.db's pointers and freeze, and the live drift monitor.
+- **B7b:** calibration, its artifact, and the refit and calibration layers in the truncation harness.
+
+Claude agents wrote the reds and B7b's review fixes. Codex wrote B7a's green, its review fixes and B7b's green; its sandbox can't write `.git`, so the orchestrator committed them. A Claude agent stood in for Codex once it reached its usage limit.
+
+**Built**
+
+- **The dividend supplement** (your call at CP1):
+  - `config/dividend_supplement.json` holds State Street's three SPY rows the feed misses (2016-03-18, 2018-06-15, 2026-09-18), with the source URL, retrieval date and the spreadsheet's SHA-256. The loader checks its schema strictly, and a test pins its rows.
+  - The backfill stores them after the feed under the same stamp. They never revise a stored dividend, under NOW or HISTORY: a differing row is reported as a conflict.
+  - **Result:** `var/market.db` holds 43 SPY dividends for 2016–2026, each one version, each known at the end of its ex-date.
+- **`store.ops` (ops.db):** append-only pointers (model, calibration, release), refit events and freeze events.
+  - Every table refuses UPDATE, DELETE and REPLACE.
+  - Stamps never go back.
+  - Activation and rollback take effect at the next session open (`TradingCalendar.next_open`), never mid-session (C7).
+  - `frozen(t)` replays the events in order. A drifted refit freezes entries from its recording; the next passing refit unfreezes them at its open; a manual acknowledgement unfreezes them at once and is logged (C5).
+- **`jobs.refit`:**
+  - **Cutoff:** 17:00 New York.
+  - **Cadence:** due 30 New York days after the later of the active model's last data day and the latest refit's cutoff, whatever that refit's outcome.
+  - **Window:** expanding from the model's fit start, read through the view at the cutoff with the whole-session check that `first_model` has (`jobs._rows`, shared). K and the covariance type stay fixed.
+  - **Seeding:** restart 0 of the full-window fit starts from the previous model, converted through raw units into the new scaler's space.
+  - **Outcomes:** ACTIVATED (both pointers at the next open), FROZEN (stored, not activated), or REJECTED (nothing stored, a warning). A ModelError from training, matching or drift is REJECTED.
+- **`hmm.match`:** Hungarian matching on symmetric KL in raw units. Labels are inherited, with the rule-derived ones kept beside them.
+- **`hmm.drift`:**
+  - **The four refit rules:** a transition probability moving more than 0.10, a duration changing more than 50%, a mean moving more than 0.5 in the previous model's units, and a derived label differing from the inherited one. They compare on decimal values, so they fire just past their thresholds and not at them.
+  - **The live monitor:** full 35-bar windows, `fsum` means, firing strictly below the validation threshold, and reset by a model swap.
+- **Calibration:**
+  - **Metrics** (`eval.calibration`): Brier score, Brier skill, 10-bin reliability and ECE against the hard smoothed label, under the model active at each bar.
+  - **The outcome check:** the F1 90% one-bar-ahead interval.
+  - **Recalibration:** isotonic, judged out of sample.
+  - **The sample rules (C13):** listed under Deviations.
+  - **The artifact:** `quant.core.calibration`, which sizing reads as plain data (K3). It is `calibration.json` plus `knots.npz`, content-addressed, and its pass flags are re-derived from its numbers on load.
+  - **`jobs.calibrate`:** builds the calibration from ops.db's model spans. It skips the lockbox and reads DEV only with a trial ticket (ARCH §6.3). A refit that activates builds its calibration as of its cutoff.
+- **The truncation harness** (B5's open item): `RefitLayer` and `CalibrationLayer` are in the default registry. Their provenance is the governing model's data cutoff and the calibration's as-of time, both before τ (T-NL1, T-NL2). Its memo is per store, so the truncated and garbage runs recompute.
+
+**Tests:** 1,339 fast tests, 328 more than at B6. They include:
+
+- a permuted model matched back exactly;
+- each drift rule's edge;
+- activation across weekends and holidays;
+- append-only history;
+- calibrated and miscalibrated synthetic forecasters;
+- C13's counts;
+- the artifact's tamper and as-of refusals;
+- planted leaks in the refit and calibration layers.
+
+The full tier adds the monthly refits through 2018 on real FIT data, from a model selected on 2016–2017 (K = 5, full covariance), on a copy of `market.db` with everything known from 2019 on deleted.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| Fast gate | 105 s (1,339 tests) |
+| Real-bar 200 cuts (full) | 336 s (125 s at B6: the lifecycle layers) |
+| Synthetic 200 cuts (full) | 99 s |
+| Monthly refits through 2018 (full) | 219 s |
+| Backfill rerun | 3 s |
+
+**Review:** two rounds, one per sub-step. Each round used the code-review skill and Codex, or a Claude stand-in. Each finding got a red test, then a fix.
+
+- **B7a** (8cbb717, dbf7c1e):
+  - a supplement row under NOW revised the feed's dividend;
+  - `INSERT OR REPLACE` rewrote ops history;
+  - a refit ran again the same evening, every evening after a FROZEN or REJECTED one, or on day 29;
+  - `refit_data` dropped the whole-session check;
+  - a ModelError after training escaped;
+  - a "future rows" test that passed on the pointer check alone.
+- **B7b** (092240b, e3a0bf0):
+  - **(high)** every refit past 2018 would have failed, because the calibration read DEV without a ticket and the lockbox;
+  - each superseded span's last 35 bars were scored with unsettled targets;
+  - no gap before the isotonic check's held-out half;
+  - the harness memo let the truncated runs reuse the full run's results;
+  - the calibration layer saw only probabilities of 0 and 1;
+  - a series' interval level went unchecked;
+  - verdict flags weren't checked on load;
+  - the forward pass ran twice.
+- **A red-test defect, found by the green:** `garbage_store` accepted only a decision instant, which a 17:00 cutoff isn't. It now takes the latest decision at or before the cut. No assertion changed.
+- **A test oracle changed by finding D:** `test_calibration_metrics.py`'s reference isotonic fit is now on the older half short of its last 35 bars.
+
+Not fixed, with reasons:
+
+- **A supplement row stored before a later feed row with a real declaration date.** History can't revise a stored row, so the feed's row is reported as a conflict on every run. The stand-in is conservative: it is known later, never earlier. If it happens, the row comes out of the supplement, with a gated store repair.
+- **A freeze recorded after an ACTIVATED refit but before its open wins.** This can't happen now. No refit can rerun within 30 days, and the live monitor fires only on bars, so it can't fire between an evening and the next open.
+- **A release that changes the feature config, or a pruned artifact,** makes every later refit's calibration raise. Release lineage is B14's: re-selection and promotions are gated, and artifacts are never pruned.
+- **Outcome pairs are consecutive rows (filter time).** A dropped bar misscores one pair. The real data has three incomplete bars, all in DEV.
+- **Duplicated code:** `symmetric_kl` factorizes each covariance K times, which is negligible for K ≤ 6. The three standardized-space conversions stay separate, because the decimal edges and the seed equality rest on their exact expressions. `save_calibration` and the array hashing repeat `hmm.model`'s; a shared `quant.core` helper can come later.
+
+**Deviations** (documents updated in this merge)
+
+- **ARCHITECTURE v1.10, §6.2:** missing dividends are filled from the committed supplement.
+- **ARCHITECTURE v1.11, §7.4:** where SPEC §9 and C13 are silent, these readings apply:
+  - **Counts:** C13's 1,000 bars are counted after the newest 35 are left out, so a verdict needs 1,035. The last 35 bars of *every* model span are left out, not only the newest 35.
+  - **Recalibration:** a failing label's isotonic map is fit on the older half, short of its last 35 bars, and judged on the newer half.
+  - **The outcome check:** it uses the latest min(1,000, n − 1) pairs, the newest 35 included, since realized F1 needs no settling.
+  - **Edges:** ECE ≤ 0.05 and skill > 0, on decimal values.
+  - **Reads:** the calibration skips the lockbox and reads DEV with the trial ticket.
+  - **The artifact type** lives in `quant.core.calibration`.
+- **PLAN v1.4:** B7's drift-edge test fires just past each threshold, not at it (SPEC §5 says "more than").
+- **CLAUDE.md** cites ARCHITECTURE v1.11 and PLAN v1.4.
+- **New artifact hashes:** every model artifact now records `info["restarts"]["seeded"]`, so new artifacts hash differently. No test pins a hash.
+
+**Closed from B6:**
+
+- the CP1 questions: the supplement was approved and built, and the second paper account exists (VERIFY §2);
+- the keys: you regenerated them on 2026-10-15.
+
+**Open items**
+
+- **You, at this report:** confirm the readings above, especially leaving out the last 35 bars of every span. With monthly refits that drops about a quarter of the bars, so a verdict takes longer to reach.
+- **B11:** the walk-forward passes the trial ticket to `refit(ticket=)`.
+- **B13:**
+  - `.env.test` has no `TRADING_MODE`, so `load_settings` refuses it as is;
+  - the engine wires `record_freeze(LIVE_DRIFT)` from the live monitor.
+- **B14:** live refits after the seal need the release's trial ticket for DEV calibration history; the fills source's 30-fill rule; release lineage across feature configs.
+- **B8/B14:** the filter layer still runs the fixture model, so filtering under the governing model after a swap is untested in the harness.
+- **The fast-tier budget:** 105 of 120 s. B7 moved B4's two slowest training tests and one lifecycle test to `full`. The next candidates are B4's remaining training tests and the calibration job tests.
+- **The full tier** now takes much longer, mostly the real-bar 200 cuts at 336 s.
+
 ## B6 · Real data and the first model (done 2026-10-15, tag `b06-done`)
 
 You put the Alpaca paper keys in on 2026-10-15, and B6 was built the same day on `b06-data`, in two parts:

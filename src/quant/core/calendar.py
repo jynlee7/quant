@@ -15,6 +15,7 @@ from functools import cache
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from quant.core.clock import ensure_utc
 from quant.core.errors import CalendarError
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -145,6 +146,21 @@ class TradingCalendar:
         if index == len(self._days):
             raise CalendarError(f"no session after {day} before {CALENDAR_END}")
         return self._days[index]
+
+    def next_open(self, at: datetime) -> datetime:
+        """The open, in UTC, of the first session that opens strictly after `at`: when a refit,
+        promotion or rollback recorded at `at` takes effect (C7, ARCHITECTURE §9.2), never
+        mid-session. During a session, or after its close, that is the next session's open,
+        across weekends and holidays; before a session day's open, that day's open; exactly at
+        an open, the next session's. Raises ClockError for a naive `at`, and CalendarError when
+        `at`'s New York date is outside the calendar or no session opens after it before
+        CALENDAR_END."""
+        at = ensure_utc(at)
+        day = at.astimezone(NEW_YORK).date()
+        self._check_range(day)
+        if self.is_session(day) and self.session(day).open > at:
+            return self.session(day).open
+        return self.session(self.next_session(day)).open
 
 
 @cache
