@@ -75,15 +75,15 @@ import math
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, time
-from functools import lru_cache
 from typing import Any
+from weakref import WeakKeyDictionary, proxy
 
 import numpy as np
 from pydantic import Field
 
 from quant.core.calendar import NEW_YORK
 from quant.core.calibration import Calibration
-from quant.core.errors import FeatureError, ModelError
+from quant.core.errors import ConfigError, FeatureError, ModelError
 from quant.core.model import StrictModel
 from quant.core.orders import SYMBOL, OrderIntent
 from quant.core.regime import Label
@@ -103,8 +103,7 @@ from quant.decide.primitives import step as primitive_step
 from quant.decide.record import DecisionRecord, FilterView, HealthView, RuleView, TargetView
 from quant.decide.sizing import Caps
 from quant.decide.state import EngineState
-from quant.features.menu import FeatureConfig
-from quant.features.stream import FeatureState, FeatureStream, features_for
+from quant.features.stream import FeatureRow, FeatureState, FeatureStream, features_for
 from quant.hmm.filter import FilterState, ForwardFilter
 from quant.hmm.model import HmmModel
 
@@ -193,9 +192,13 @@ def decide(state: EngineState, view: PointInTimeView, inputs: DecideInputs) -> D
     if need_warm:
         stream = FeatureStream(fconfig)
     else:
-        if state.features is None or state.filter is None:
-            raise ValueError("a warm filter requires feature and filter state")
-        stream = _restore_stream(fconfig, state.features)
+        try:
+            if state.features is None:
+                raise ConfigError("missing feature state")
+            stream = FeatureStream.restore(fconfig, state.features)
+        except ConfigError:
+            stream = FeatureStream(fconfig)
+            need_warm = True
     filt: ForwardFilter | None = None
     try:
         filt = (
@@ -245,11 +248,24 @@ def decide(state: EngineState, view: PointInTimeView, inputs: DecideInputs) -> D
     features = None
     out = None
     error: BaseException | None = warm_error
+
+    def consume(row: FeatureRow) -> None:
+        nonlocal out, error
+        if (
+            error is None
+            and filt is not None
+            and row.warm
+            and all(math.isfinite(v) for v in row.values)
+            and row.available_at >= model.fit_start
+        ):
+            try:
+                out = filt.step(np.array(row.values, dtype=np.float64), columns=fconfig.columns)
+            except ModelError as exc:
+                error = exc
+
     try:
-        vector = features_for(stream, view, SYMBOL, d.bar)
+        vector = features_for(stream, view, SYMBOL, d.bar, on_row=consume)
         features = [float(x) for x in vector]
-        if error is None and filt is not None:
-            out = filt.step(vector, columns=fconfig.columns)
     except (FeatureError, ModelError) as exc:
         error = error or exc
     values = {}
@@ -314,6 +330,7 @@ def decide(state: EngineState, view: PointInTimeView, inputs: DecideInputs) -> D
         elif active in values and probs is not None:
             allowed = (
                 sw.entries_allowed
+                and not d.reduce_only
                 and not flags.halted
                 and not flags.drift_frozen
                 and not flags.daily_loss_lock
@@ -454,6 +471,8 @@ def decide(state: EngineState, view: PointInTimeView, inputs: DecideInputs) -> D
         engine_hash=engine.config_hash(),
         caps_hash=caps.caps_hash(),
         code_commit=inputs.code_commit,
+        account=inputs.account.model_dump(mode="json"),
+        flags=inputs.flags.model_dump(mode="json"),
         health=HealthView(
             cause=None if sw.health.cause is None else sw.health.cause.value,
             streak=sw.health.streak,
@@ -480,33 +499,34 @@ def decide(state: EngineState, view: PointInTimeView, inputs: DecideInputs) -> D
 FIT_MIDNIGHT = datetime.combine(FIT_START, time(), tzinfo=NEW_YORK).astimezone(UTC)
 
 
-@lru_cache(maxsize=64)
-def _model(model: HmmModel) -> ForwardFilter:
-    """Memoize immutable model constants by identity; never step the template.
+_models: WeakKeyDictionary[HmmModel, ForwardFilter] = WeakKeyDictionary()
+_model_hashes: WeakKeyDictionary[HmmModel, str] = WeakKeyDictionary()
+_calibration_hashes: WeakKeyDictionary[Calibration, str] = WeakKeyDictionary()
 
-    HmmModel has identity equality and owns read-only arrays. The bounded cache
-    retains the key, so neither object-id reuse nor model swaps can alias it.
-    """
-    return ForwardFilter(model)
+
+def _model(model: HmmModel) -> ForwardFilter:
+    """Keep constants only while their model is alive; the template never steps."""
+    if model not in _models:
+        template = ForwardFilter(model)
+        template._model = proxy(model)
+        _models[model] = template
+    return _models[model]
 
 
 def _fresh_filter(model: HmmModel) -> ForwardFilter:
     """Share model constants, but give each decision its own filter posterior."""
     template = _model(model)
     f = copy.copy(template)
+    f._model = model
     f._log_probs = None
     f._bars = 0
     return f
 
 
 def _restore_filter(model: HmmModel, state: FilterState) -> ForwardFilter:
-    """Restore a trusted EngineState snapshot without rebuilding model constants."""
+    """Reuse ForwardFilter.restore's validation without rebuilding model constants."""
     f = _fresh_filter(model)
-    if state.log_probs is not None:
-        f._log_probs = np.array(
-            [float("-inf") if p is None else p for p in state.log_probs], dtype=np.float64
-        )
-    f._bars = state.bars
+    f.restore_state(state)
     return f
 
 
@@ -527,25 +547,21 @@ def _copy[T: (FeatureState, IndicatorState)](state: T) -> T:
     return type(state).model_construct(**fields)
 
 
-def _restore_stream(config: FeatureConfig, state: FeatureState) -> FeatureStream:
-    s = FeatureStream(config)
-    s._state = _copy(state)
-    return s
-
-
 def _restore_ind(config: IndicatorConfig, state: IndicatorState) -> IndicatorStream:
     s = IndicatorStream(config)
     s._state = _copy(state)
     return s
 
 
-@lru_cache(maxsize=64)
 def _hash_of(calibration: Calibration) -> str:
     """Memoize the immutable calibration artifact's digest by identity."""
-    return calibration.artifact_hash()
+    if calibration not in _calibration_hashes:
+        _calibration_hashes[calibration] = calibration.artifact_hash()
+    return _calibration_hashes[calibration]
 
 
-@lru_cache(maxsize=64)
 def _model_hash(model: HmmModel) -> str:
     """Keep provenance available even when the model cannot build a filter."""
-    return model.artifact_hash()
+    if model not in _model_hashes:
+        _model_hashes[model] = model.artifact_hash()
+    return _model_hashes[model]

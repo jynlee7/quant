@@ -337,7 +337,8 @@ class FeatureStream:
         only when its oldest number is 1 and only in one slot (the stream's first bar has no
         return or range), else one per number.
         """
-        if state.config_hash != config.config_hash():
+        stream = cls(config)
+        if state.config_hash != stream._state.config_hash:
             raise ConfigError("feature state belongs to a different config")
         slots = {slot.value for slot in Slot}
         for history, enabled in (
@@ -417,8 +418,16 @@ class FeatureStream:
             )
         ):
             raise ConfigError("an empty stream must have empty histories")
-        stream = cls(config)
-        stream._state = state.model_copy(deep=True)
+        # All leaves are immutable scalars; detach histories without traversing each leaf.
+        stream._state = state.model_copy(
+            update={
+                "returns": list(state.returns),
+                "slot_numbers": {k: list(v) for k, v in state.slot_numbers.items()},
+                "slot_returns": {k: list(v) for k, v in state.slot_returns.items()},
+                "slot_ranges": {k: list(v) for k, v in state.slot_ranges.items()},
+                "slot_volumes": {k: list(v) for k, v in state.slot_volumes.items()},
+            }
+        )
         return stream
 
 
@@ -534,7 +543,14 @@ def compute_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Featur
     )
 
 
-def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar: BarSpec) -> Floats:
+def features_for(
+    stream: FeatureStream,
+    view: PointInTimeView,
+    symbol: str,
+    bar: BarSpec,
+    *,
+    on_row: Callable[[FeatureRow], None] | None = None,
+) -> Floats:
     """The feature vector for the decision on `bar`, read through the point-in-time view (I1).
 
     Reads `symbol`'s hourly bars from `view` with purpose OPERATE: all of them for a stream that
@@ -542,6 +558,7 @@ def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar:
     and oldest first, each of them that opens at or before `bar.t_open`; later ones are left for
     later decisions. Incomplete bars are skipped as missing data, as in `compute_features`.
     Returns the `vector()` of `bar`'s row.
+    If supplied, `on_row` observes every consumed row in order, including partial progress.
 
     Raises FeatureError, a model error (rule 6 applies), when `bar` isn't among the bars fed:
     it isn't visible in the view (missing, or not yet available at the view's tau), it is
@@ -550,7 +567,14 @@ def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar:
     propagates, and feeding stops there). Bars consumed before an error stay consumed, so a
     caller that keeps the stream's snapshot keeps them.
     """
-    return feed_through(stream.last_t_open, stream.update, view, symbol, bar).vector()
+
+    def update(candidate: HourlyBar) -> FeatureRow:
+        row = stream.update(candidate)
+        if on_row is not None:
+            on_row(row)
+        return row
+
+    return feed_through(stream.last_t_open, update, view, symbol, bar).vector()
 
 
 def feed_through[T](

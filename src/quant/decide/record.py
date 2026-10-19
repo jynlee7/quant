@@ -116,6 +116,8 @@ class DecisionRecord(StrictModel):
     engine_hash: str
     caps_hash: str
     code_commit: str
+    account: dict[str, float | int]
+    flags: dict[str, bool]
     health: HealthView
     features: list[float] | None
     filter: FilterView | None

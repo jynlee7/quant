@@ -44,6 +44,7 @@ EngineState (ARCHITECTURE §4.3).
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -106,12 +107,16 @@ def kelly(n: int, mean: float, sd: float | None, *, min_bars: int) -> float:
     """f* = max(0, mean - sd / sqrt(n)) / sd^2, the full Kelly fraction on the lower confidence
     bound of the mean (spec §9). 0.0 when n < min_bars, when sd is None or 0, and when the bound
     is not positive. Never negative, never NaN."""
-    if n < min_bars or sd is None or sd == 0 or n < 1:
+    if n < min_bars or sd is None or sd == 0:
+        return 0.0
+    variance = sd * sd
+    if not math.isfinite(variance) or variance < sys.float_info.min:
         return 0.0
     lcb = mean - sd / math.sqrt(n)
     if not lcb > 0:
         return 0.0
-    return lcb / (sd * sd)
+    result = lcb / variance
+    return result if math.isfinite(result) else 0.0
 
 
 class EdgeBook(StrictModel):

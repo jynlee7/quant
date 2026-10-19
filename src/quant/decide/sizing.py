@@ -51,15 +51,15 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import StrEnum
-from fractions import Fraction
 from typing import Final
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from quant.core.calibration import PROBABILITY_SLACK, Calibration, r1_calibration_config
 from quant.core.canonical import sha256_hex
 from quant.core.model import StrictModel
 from quant.core.regime import Label
+from quant.decide import exact_decimal
 from quant.decide.config import SizingConfig
 from quant.decide.playbook import Playbook
 
@@ -82,6 +82,14 @@ class Caps(StrictModel):
     max_position: float = Field(ge=0.0, le=1.0)
     overnight_cap: float = Field(ge=0.0, le=1.0)
     single_order_cap: float = Field(gt=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def valid_labels(self) -> Caps:
+        if set(self.label_caps) != set(Label) or any(
+            not 0 <= v <= 1 for v in self.label_caps.values()
+        ):
+            raise ValueError("label_caps must hold every Label in [0, 1]")
+        return self
 
     def cap(self, label: Label | None) -> float:
         """`label_caps[label]`, or 0.0 for None (no active label sizes nothing). ValueError
@@ -232,8 +240,7 @@ def target(
     ):
         if cond:
             return Target(0.0, reason, None)
-    if active is None:
-        return Target(0.0, ZeroReason.NO_ACTIVE, None)
+    assert active is not None  # noqa: S101 - narrowed by the zero-reason checks
     if playbook is None:
         raise ValueError("playbook is required")
     if label_prob is None:
@@ -259,7 +266,7 @@ def exceeds_deadband(target: float, current: float, deadband: float) -> bool:
     """|target - current| >= deadband, exactly on the decimal values: `abs(Fraction(repr(
     target)) - Fraction(repr(current))) >= Fraction(repr(deadband))`, so 0.35 against 0.25 is a
     gap of exactly 0.10 and resizes (float subtraction gives 0.09999999999999998)."""
-    return abs(_x(target) - _x(current)) >= _x(deadband)
+    return abs(exact_decimal(target) - exact_decimal(current)) >= exact_decimal(deadband)
 
 
 @dataclass(frozen=True)
@@ -314,12 +321,9 @@ def rebalance(
     if (frozen or locked or reduce_only) and t > current:
         t = current
         limited = True
-    forced = _x(t) < _x(current) and (rule_forced or halted or _x(current) > _x(ceiling))
+    forced = exact_decimal(t) < exact_decimal(current) and (
+        rule_forced or halted or exact_decimal(current) > exact_decimal(ceiling)
+    )
     if t != current and (forced or t == 0.0 or exceeds_deadband(t, current, deadband)):
         return Rebalance(t, True, ceiling, limited, forced, False)
     return Rebalance(current, False, ceiling, limited, forced, t != current)
-
-
-def _x(v: float) -> Fraction:
-    """Exact decimal value, independent of the ambient decimal context."""
-    return Fraction(repr(float(v)))

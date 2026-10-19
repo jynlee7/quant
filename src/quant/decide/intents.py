@@ -34,11 +34,11 @@ Pure: no clock, no I/O.
 from __future__ import annotations
 
 import math
-from fractions import Fraction
 
 from quant.core.orders import OrderIntent, Side
 from quant.core.regime import Label
 from quant.core.schedule import Decision
+from quant.decide import exact_decimal
 from quant.decide.sizing import Caps
 
 
@@ -59,7 +59,7 @@ def target_shares(desired: float, *, equity: float, price: float) -> int:
         raise ValueError("desired must be in [0, 1]")
     if not (math.isfinite(equity) and equity > 0 and math.isfinite(price) and price > 0):
         raise ValueError("equity and price must be finite and > 0")
-    return math.floor(_x(desired) * _x(equity) / _x(price))
+    return math.floor(exact_decimal(desired) * exact_decimal(equity) / exact_decimal(price))
 
 
 def order(
@@ -115,7 +115,3 @@ def order(
         reduce_only=bool(decision.reduce_only or forced),
         stop_price=None,
     )
-
-
-def _x(v: float) -> Fraction:
-    return Fraction(repr(float(v)))

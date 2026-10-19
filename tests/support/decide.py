@@ -254,9 +254,9 @@ DECISION_INDEX = 2
 @functools.cache
 def r1_release() -> Any:
     """The repository's release r1 (`quant.decide.playbook.load_release`)."""
-    from quant.decide.playbook import load_release
+    from tests.support.truncation import harness_release
 
-    return load_release(REPO)
+    return harness_release()
 
 
 def r1_playbook(label: Label) -> Any:
@@ -267,9 +267,9 @@ def r1_playbook(label: Label) -> Any:
 @functools.cache
 def engine_config() -> Any:
     """The committed config/engine.yaml."""
-    from quant.decide.config import parse_engine_config
+    from tests.support.truncation import harness_engine
 
-    return parse_engine_config(ENGINE_YAML.read_bytes())
+    return harness_engine()
 
 
 @functools.cache

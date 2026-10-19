@@ -47,7 +47,6 @@ def _with_filter(fx: DecideFixture, **update: Any) -> Any:
 
 
 @pytest.mark.spec("SPEC§8", "C2", "ARCH§4.3")
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=ValueError)
 def test_a_filter_state_with_an_extra_log_prob_is_a_model_failure() -> None:
     from quant.decide.health import Cause
 
@@ -69,7 +68,6 @@ def test_a_filter_state_with_an_extra_log_prob_is_a_model_failure() -> None:
         "log_probs None after bars",
     ],
 )
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=AssertionError)
 def test_a_filter_state_restore_refuses_is_a_model_failure(case: str) -> None:
     from quant.decide.health import Cause
 
@@ -93,7 +91,6 @@ def test_a_filter_state_restore_refuses_is_a_model_failure(case: str) -> None:
 
 @pytest.mark.spec("SPEC§6", "ARCH§4.3", "ARCH§4.2")
 @pytest.mark.parametrize("perturbed", [False, True], ids=["hash only", "hash and values"])
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=AssertionError)
 def test_a_feature_state_of_another_config_warms_afresh(perturbed: bool) -> None:
     fx = DecideFixture.get()
     warm = fx.warm()
@@ -112,7 +109,6 @@ def test_a_feature_state_of_another_config_warms_afresh(perturbed: bool) -> None
 
 
 @pytest.mark.spec("SPEC§6", "ARCH§4.3", "ARCH§4.2")
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=KeyError)
 def test_a_feature_state_restore_refuses_warms_afresh() -> None:
     fx = DecideFixture.get()
     warm = fx.warm()
@@ -130,7 +126,6 @@ def test_a_feature_state_restore_refuses_warms_afresh() -> None:
 
 
 @pytest.mark.spec("SPEC§6", "ARCH§4.2", "ARCH§4.3")
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=AssertionError)
 def test_a_late_bar_steps_the_filter_as_the_warm_up_does() -> None:
     fx = DecideFixture.get()
     late, decision = fx.previous, fx.decision
@@ -163,7 +158,6 @@ def test_a_late_bar_steps_the_filter_as_the_warm_up_does() -> None:
 
 @pytest.mark.spec("C12", "SPEC§9")
 @pytest.mark.parametrize(("mean", "sd"), [(1e-160, 1e-170), (1.0, 1e-200)])
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=ZeroDivisionError)
 def test_kelly_is_zero_when_sd_squared_underflows_to_zero(mean: float, sd: float) -> None:
     from quant.decide.edge import kelly
 
@@ -180,7 +174,6 @@ def test_kelly_is_zero_when_sd_squared_underflows_to_zero(mean: float, sd: float
         (1e300, 1e-10),  # sd^2 normal, the fraction overflows to inf
     ],
 )
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=AssertionError)
 def test_kelly_is_zero_when_sd_squared_is_subnormal_or_the_fraction_is_not_finite(
     mean: float, sd: float
 ) -> None:
@@ -194,7 +187,6 @@ def test_kelly_is_zero_when_sd_squared_is_subnormal_or_the_fraction_is_not_finit
 
 @pytest.mark.spec("ARCH§4.3", "ARCH§13")
 @pytest.mark.parametrize("flag", ["drift_frozen", "daily_loss_lock"])
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=AssertionError)
 def test_the_flags_change_the_record_hash(flag: str) -> None:
     from quant.decide.core import Flags
 
@@ -206,7 +198,6 @@ def test_the_flags_change_the_record_hash(flag: str) -> None:
 
 
 @pytest.mark.spec("ARCH§4.3", "ARCH§13")
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=AssertionError)
 def test_the_account_changes_the_record_hash() -> None:
     from quant.decide.core import Account
 
@@ -225,7 +216,6 @@ CLOSING_DAY = date(2016, 11, 10)
 
 
 @pytest.mark.spec("A3", "SPEC§9", "ARCH§4.2")
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=AssertionError)
 def test_the_closing_bar_decision_never_enters_a_trade() -> None:
     from quant.decide.indicators import IndicatorConfig, IndicatorStream, indicators_for
     from quant.decide.primitives import signal
@@ -280,7 +270,6 @@ def test_the_closing_bar_decision_never_enters_a_trade() -> None:
     ],
     ids=["missing labels", "above 1", "below 0"],
 )
-@pytest.mark.xfail(strict=True, reason="red:B8", raises=pytest.fail.Exception)
 def test_caps_refuse_bad_label_caps_at_construction(label_caps: dict[Label, float]) -> None:
     from quant.decide.sizing import Caps
 

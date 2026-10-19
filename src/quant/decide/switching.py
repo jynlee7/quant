@@ -67,14 +67,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from decimal import Decimal
 from enum import StrEnum
-from fractions import Fraction
 
 from pydantic import Field
 
 from quant.core.model import StrictModel
 from quant.core.regime import Label
+from quant.decide import exact_decimal
 from quant.decide.config import SwitchingConfig
 from quant.decide.health import Cause, Health, health_step
 from quant.hmm.labels import top_label
@@ -212,7 +211,7 @@ def step(
     elif probs is not None:
         label_probs = probs.label_probs
         top = top_label(label_probs)
-        qualifies = Decimal(repr(label_probs[top])) >= Decimal(repr(config.takeover_prob))
+        qualifies = exact_decimal(label_probs[top]) >= exact_decimal(config.takeover_prob)
         if active == top or not qualifies:
             challenger, count = None, 0
         else:
@@ -241,16 +240,16 @@ def step(
             else:
                 reconfirm = 0
         # Fractions of decimal representations keep sums/differences exact under any context.
-        top2 = sorted((Decimal(repr(v)) for v in label_probs.values()), reverse=True)
-        if len(top2) >= 2 and Fraction(top2[0]) - Fraction(top2[1]) <= Fraction(
-            repr(config.uncertainty_gap)
+        top2 = sorted(label_probs.values(), reverse=True)
+        if len(top2) >= 2 and exact_decimal(top2[0]) - exact_decimal(top2[1]) <= exact_decimal(
+            config.uncertainty_gap
         ):
             r5 = True
             m_rule5 = 0.0
         next_probs = probs.next_label_probs
-        if Fraction(repr(next_probs.get(Label.STRESS, 0.0))) + Fraction(
-            repr(next_probs.get(Label.CRASH, 0.0))
-        ) > Fraction(repr(config.derisk_prob)):
+        if exact_decimal(next_probs.get(Label.STRESS, 0.0)) + exact_decimal(
+            next_probs.get(Label.CRASH, 0.0)
+        ) > exact_decimal(config.derisk_prob):
             r4 = True
             m_rule4 = config.derisk_multiplier
         reasons.update(

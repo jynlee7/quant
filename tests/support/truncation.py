@@ -1465,7 +1465,7 @@ class DecisionLayer:
                     assert record.calibration_hash is not None
                     provenance = Provenance(record.calibration_hash, calibration.as_of)
                 records.append(
-                    cached_record(d.tau, self.name, record, provenance, outcome.state.state_hash())
+                    cached_record(d.tau, self.name, record, provenance, record.state_after)
                 )
                 state = outcome.state
         return records
