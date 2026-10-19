@@ -2,6 +2,22 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## Docs · BUY trim at the limit price (decided 2026-10-19)
+
+B8's review found that `decide()` sizes a BUY to the cap exactly at the decision's close, while B9 checks the caps at the order's limit price. Any ask above the close would get a full-size entry vetoed. At a $100 close and a $100.01 ask, the first 500-share leg breaks the 0.5× single-order cap. You chose option (a) on 2026-10-19 ("yes do option a"): execution trims the BUY. No code changed.
+
+- **ARCHITECTURE v1.12 → v1.13, §8.2:** before each attempt's risk check, the order manager trims a BUY to the most whole shares that fit the single-order, label, gross and overnight caps at that attempt's limit price.
+  - It uses a pure helper in `quant.risk.engine`, so the trim and check 3 share the same decimal arithmetic.
+  - A trim never raises a quantity, and a re-quote never goes above the attempt before it.
+  - A trim to zero sends nothing and counts as one intent.
+  - The trimmed order is a new `OrderIntent`, persisted before its check, and the DecisionRecord keeps `decide()`'s intent.
+  - SELLs are never trimmed, and the risk engine is unchanged.
+- **PLAN v1.4 → v1.5, §4 B13:** the trim is in B13's builds, and its red test is in B13's list.
+- **CLAUDE.md** names ARCHITECTURE v1.13 and PLAN v1.5.
+- **Closes** B8's open item on BUY sizing. It is now B13's to build.
+
+**Still open from B8:** your confirmation of SPEC v1.7's readings.
+
 ## B8 · Decisions: playbooks, switching, sizing (done 2026-10-19, tag `b08-done`)
 
 Built on `b08-decide` in two parts, each with its own red, green and review:
