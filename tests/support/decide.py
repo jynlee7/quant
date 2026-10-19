@@ -1,5 +1,6 @@
 """Helpers for B8's decision tests: the release files, label distributions, synthetic price
-bars, a slow reference for the indicators, and a plain reference of the takeover rules.
+bars, a slow reference for the indicators, a plain reference of the takeover rules, and (B8b)
+decide() on the harness's synthetic world (`DecideFixture`).
 
 The references are oracles. Nothing in them streams: each value is recomputed from the whole
 list of bars (or probabilities) before it, with `math.fsum` sums and each EMA in closed form. They
@@ -237,3 +238,205 @@ def close_enough(a: float | None, b: float | None, rel: float = 1e-12) -> bool:
     if a is None or b is None:
         return a is None and b is None
     return abs(a - b) <= rel * max(1.0, abs(a), abs(b))
+
+
+# --- B8b: the release, configs and decide() on the synthetic world -----------------------------
+# The decide tests run on the T-NL1 harness's synthetic world (tests.support.truncation.world():
+# seeded minutes inside FIT, 2016, on the real NYSE calendar), under the lifecycle's start model
+# (the fixture model relabeled to CALM_UP and CHOP), so nothing is fit per test and DEV stays
+# dark. The decision under test is the third of DECISION_DAY (12:46 ET: it can fill, and isn't
+# the last that can), after the model's activation on 2016-11-01 and before its refit.
+
+DECISION_DAY = date(2016, 11, 15)
+DECISION_INDEX = 2
+
+
+@functools.cache
+def r1_release() -> Any:
+    """The repository's release r1 (`quant.decide.playbook.load_release`)."""
+    from quant.decide.playbook import load_release
+
+    return load_release(REPO)
+
+
+def r1_playbook(label: Label) -> Any:
+    """r1's playbook for `label`."""
+    return r1_release().playbook(label)
+
+
+@functools.cache
+def engine_config() -> Any:
+    """The committed config/engine.yaml."""
+    from quant.decide.config import parse_engine_config
+
+    return parse_engine_config(ENGINE_YAML.read_bytes())
+
+
+@functools.cache
+def r1_caps() -> Any:
+    """risk.yaml's limits as decide's `Caps`, the way the driver builds them."""
+    from tests.support.truncation import harness_caps
+
+    return harness_caps(risk_config())
+
+
+@dataclass(frozen=True, eq=False)
+class DecideFixture:
+    """One decision on the synthetic world, and what decide needs for it (module comment).
+
+    - `world`: the harness world; `model`: the lifecycle's start model (two labels);
+    - `decision`, `previous`: the decision under test and the one before it (same session);
+    - `bar`: the decision bar, as the view at its tau shows it; `price_before`: the previous
+      bar's close.
+    """
+
+    world: Any
+    model: Any
+    decision: Any
+    previous: Any
+    bar: HourlyBar
+    price_before: float
+
+    @staticmethod
+    @functools.cache
+    def get() -> DecideFixture:
+        from quant.core.calendar import TradingCalendar
+        from quant.core.schedule import decision_schedule
+        from quant.data.policy import Purpose
+        from tests.support.truncation import lifecycle_spec, world
+
+        w = world()
+        schedule = decision_schedule(TradingCalendar.xnys(), DECISION_DAY)
+        decision, previous = schedule[DECISION_INDEX], schedule[DECISION_INDEX - 1]
+        before, bar = w.store.view(decision.tau, as_of=decision.tau).hourly(
+            "SPY", purpose=Purpose.OPERATE, last=2
+        )
+        assert bar.t_open == decision.bar.t_open
+        assert bar.complete
+        assert not decision.last_fillable
+        assert not decision.reduce_only
+        return DecideFixture(
+            w, lifecycle_spec(w).start, decision, previous, bar, float(before.close)
+        )
+
+    def view(self, decision: Any = None) -> Any:
+        """The world store's view at the decision's tau (as_of = tau)."""
+        d = self.decision if decision is None else decision
+        return self.world.store.view(d.tau, as_of=d.tau)
+
+    def inputs(self, **overrides: Any) -> Any:
+        """DecideInputs for the decision: r1, the start model, no calibration, the committed
+        engine.yaml, risk.yaml's caps, a flat $100,000 account, no flags; `overrides` replace
+        any of them by field name."""
+        from quant.decide.core import Account, DecideInputs, Flags
+
+        fields: dict[str, Any] = {
+            "release": r1_release(),
+            "model": self.model,
+            "calibration": None,
+            "engine": engine_config(),
+            "caps": r1_caps(),
+            "decision": self.decision,
+            "account": Account(equity=100_000.0, position=0),
+            "flags": Flags(),
+            "code_commit": "c0ffee" * 6 + "c0ff",
+        }
+        fields.update(overrides)
+        return DecideInputs(**fields)
+
+    def decide(self, state: Any, view: Any = None, **overrides: Any) -> Any:
+        """`decide(state, view or self.view(...), self.inputs(**overrides))`."""
+        from quant.decide.core import decide
+
+        d = overrides.get("decision", self.decision)
+        return decide(state, self.view(d) if view is None else view, self.inputs(**overrides))
+
+    def cold(self, *, seeded: bool = True) -> Any:
+        """`EngineState.cold(...)` with the harness's seeded edge (f* > 0 for CALM_UP and
+        CHOP), or an empty one."""
+        from quant.decide.state import EngineState
+        from tests.support.truncation import harness_edge
+
+        return EngineState.cold(engine_config().switching, edge=harness_edge() if seeded else None)
+
+    def warm(self) -> Any:
+        """The state after deciding `previous` from a cold start: features, filter and
+        indicators warm through the bar before the decision's. Computed once."""
+        return _warm(self)
+
+    def warm_state(
+        self,
+        *,
+        active: Label | None,
+        trade: Any = None,
+        shadows: Mapping[Label, Any] | None = None,
+        blocked: bool = False,
+    ) -> Any:
+        """`warm()` with switching settled on `active` (no challenger, the cooldown long
+        expired, a full health streak, `blocked`), the live `trade` (flat when None) and
+        `shadows` (the warm ones when None)."""
+        from quant.decide.primitives import TradeState
+
+        warm = self.warm()
+        switching = warm.switching.model_copy(
+            update={
+                "active": active,
+                "challenger": None,
+                "count": 0,
+                "since_switch": None if active is None else 50,
+                "health_streak": SWITCHING.health_recovery_bars,
+                "blocked": blocked and active is not None,
+                "reconfirm": 0,
+            }
+        )
+        return warm.model_copy(
+            update={
+                "switching": switching,
+                "trade": TradeState.flat() if trade is None else trade,
+                "shadows": dict(warm.shadows) if shadows is None else dict(shadows),
+            }
+        )
+
+    def in_trade(self, *, stop_fraction: float = 0.9) -> Any:
+        """A live trade entered on the previous bar at its close, its stop `stop_fraction` of
+        that close (below the decision's price)."""
+        from quant.decide.primitives import TradeState
+
+        return TradeState(
+            in_position=True,
+            armed=True,
+            entry_price=self.price_before,
+            stop=self.price_before * stop_fraction,
+            take_profit=None,
+            bars_in_trade=1,
+            peak_close=self.price_before,
+        )
+
+    def indicators(self, label: Label) -> Any:
+        """A reference: `label`'s playbook indicators for the decision bar, from a fresh
+        IndicatorStream fed every bar the view at tau shows (B8a's code, not decide's)."""
+        from quant.decide.indicators import IndicatorConfig, IndicatorStream, indicators_for
+
+        stream = IndicatorStream(IndicatorConfig.for_playbook(r1_playbook(label)))
+        return indicators_for(stream, self.view(), "SPY", self.decision.bar)
+
+
+@functools.cache
+def _warm(fx: DecideFixture) -> Any:
+    return fx.decide(fx.cold(), decision=fx.previous).state
+
+
+@functools.cache
+def day_states() -> tuple[tuple[Any, Any], ...]:
+    """(decision, the state before it) for every decision of DECISION_DAY, decided in order
+    from a cold start at the session's first (seeded edge, a flat account)."""
+    from quant.core.calendar import TradingCalendar
+    from quant.core.schedule import decision_schedule
+
+    fx = DecideFixture.get()
+    state = fx.cold()
+    out = []
+    for d in decision_schedule(TradingCalendar.xnys(), DECISION_DAY):
+        out.append((d, state))
+        state = fx.decide(state, decision=d).state
+    return tuple(out)

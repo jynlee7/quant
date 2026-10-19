@@ -312,6 +312,7 @@ def test_selection_picks_three_states_and_the_generators_covariance_type(truth_n
     assert result.sanity.passed
 
 
+@pytest.mark.full  # B8b: out of the fast tier for decide's harness layer
 @pytest.mark.spec("SPEC§4", "ARCH§7.1")
 def test_the_chosen_model_is_its_full_window_refit() -> None:
     from quant.hmm.train import train_candidate
@@ -335,6 +336,7 @@ def test_the_chosen_model_is_its_full_window_refit() -> None:
     assert (result.model.fit_start, result.model.fit_end) == (data.fit_start, data.fit_end)
 
 
+@pytest.mark.full  # B8b: out of the fast tier for decide's harness layer
 @pytest.mark.spec("SPEC§4", "ARCH§7.2")
 def test_the_training_record_and_report_are_complete() -> None:
     from quant.core.epoch import to_us
@@ -435,6 +437,7 @@ def _small_run(workers: int | None, *, base_seed: int = R1_BASE_SEED) -> Any:
     ).model
 
 
+@pytest.mark.full  # B8b: out of the fast tier for decide's harness layer
 @pytest.mark.spec("SPEC§4", "ARCH§14")
 def test_the_same_seeds_give_the_same_artifact_hash_across_runs_and_pool_or_serial() -> None:
     serial = _small_run(1)
@@ -689,6 +692,7 @@ def test_selection_fails_when_no_candidate_survives() -> None:
         )
 
 
+@pytest.mark.full  # B8b: out of the fast tier for decide's harness layer
 @pytest.mark.spec("SPEC§4", "ARCH§14")
 def test_pool_workers_start_with_single_threaded_blas(monkeypatch: pytest.MonkeyPatch) -> None:
     """Accelerate ignores threadpoolctl, so the limit must be in each spawned worker's
@@ -751,6 +755,7 @@ def test_pool_tasks_ship_indices_not_rows(monkeypatch: pytest.MonkeyPatch) -> No
     assert max(sizes) < 512
 
 
+@pytest.mark.full  # B8b: out of the fast tier for decide's harness layer
 @pytest.mark.spec("ARCH§7.2", "ARCH§14")
 def test_the_record_names_the_platform_and_the_blas_build() -> None:
     import platform
@@ -780,6 +785,7 @@ def _rolling_quantile(loglik: Any, window: int, q: float) -> float:
     return float(np.quantile(np.array(means), q))
 
 
+@pytest.mark.full  # B8b: out of the fast tier for decide's harness layer
 @pytest.mark.spec("SPEC§4", "SPEC§5", "ARCH§7.2")
 def test_the_record_carries_the_drift_baseline() -> None:
     """Spec §5's live check compares the 35-bar rolling mean of l_t with the 1st percentile of
@@ -797,6 +803,7 @@ def test_the_record_carries_the_drift_baseline() -> None:
     assert drift["threshold"] > float(np.quantile(loglik, 0.01))
 
 
+@pytest.mark.full  # B8b: out of the fast tier for decide's harness layer
 @pytest.mark.spec("SPEC§5", "ARCH§7.2")
 def test_a_refit_records_its_own_drift_baseline() -> None:
     from quant.hmm.train import train_candidate
