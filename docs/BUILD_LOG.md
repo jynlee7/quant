@@ -2,6 +2,174 @@
 
 One entry per finished step (PLAN §2, rule 7): what was built, the tests added, run times, deviations and open items. Newest first. Each step is a branch `bNN-name` with a red commit and a green commit, merged to `main` and tagged `bNN-done`.
 
+## B8 · Decisions: playbooks, switching, sizing (done 2026-10-19, tag `b08-done`)
+
+Built on `b08-decide` in two parts, each with its own red, green and review:
+
+- **B8a:** release r1, the playbook schema, `engine.yaml`, the indicators and primitives, health and switching.
+- **B8b:** edge, sizing, intents, EngineState, the DecisionRecord, `decide()` and the decision layer in the truncation harness.
+
+Claude agents wrote the reds and the review reds. Codex wrote the greens and the review greens, and the orchestrator committed them, since Codex's sandbox can't write `.git`. Codex hit its usage limit just before reporting on the B8b green. The orchestrator audited the tree (test diffs are red-mark removals only) and committed it. A Claude reviewer stood in for Codex in B8b's review.
+
+**Built**
+
+- **Release r1** (P7, PLAN §5):
+  - `strategy.md` is the manifest: r1's features, the HMM search (field for field `r1_train_config()`), the label thresholds, the label → playbook map, and `gate_report: null`.
+  - `playbooks/{CALM_UP,CHOP,STRESS,CRASH}.md` hold PLAN §5's values exactly.
+  - `quant.decide.playbook` reads only the front matter, through a strict, bounded schema. It refuses unknown keys, values out of bounds, a CRASH playbook that isn't flat, and a STRESS `max_size` above 0.25.
+  - The invalidation menu is typed. `release_id` is the canonical SHA-256 of the parsed front matter.
+- **`config/engine.yaml`:** switching, sizing (`kelly_fraction`, `min_edge_bars`, `deadband`, `shadow_cost_bp`) and timing. It is strict, frozen and hashed, and the loader compares it with the committed bytes the caller passes.
+- **`quant.core.yaml`:** one strict YAML loader. It refuses repeated keys at every level and turns malformed YAML and timestamps into ConfigError. The playbooks, the manifest, `engine.yaml` and `risk.yaml` (`quant.risk.limits`) all use it.
+- **Indicators:** streaming EMA fast and slow (the feature stream's `ema`, now public), ATR(n) with the overnight gap, and the N-bar mean and population s.d. of the close. They share the point-in-time feed loop and the bar checks with `features.stream`, so the two can't drift. Overflow is refused as a FeatureError.
+- **Primitives:** `trend_following`, `mean_reversion` and `flat`, long or flat.
+  - The ATR stop is fixed at entry. The take-profit is checked on the close.
+  - After a stop or take-profit, a primitive re-arms only on its own exit condition.
+  - Invalidation is checked before the exit on every trade bar, and an entry is refused while an invalidation already holds.
+- **Health (rule 6):**
+  - **Causes:** features, model, model and calibration provenance, the release, and a missed decision (C6).
+  - **Recovery:** the second healthy bar resumes. The streak is clamped when a restored state exceeds `recovery_bars`.
+- **Switching:** rules 1–5 plus A1 and C4, compared exactly. It keeps a rule trace for every rule, and invalidation blocks clear on a fresh confirmation.
+- **Edge (C12):**
+  - Each playbook's shadow runs every bar.
+  - Its returns are counted under the label active before the bar, with Welford accumulators.
+  - f\* is max(0, mean − s/√n) / s², and 0 below 100 bars, on an s² that isn't a positive normal float, or on a result that isn't finite.
+  - `EdgeBook.seeded` is ready for B11's fit-window backtest.
+- **Sizing:** SPEC §9's formula.
+  - The cap is multiplied by `cap_fraction` (25% with no calibration), and P̃ goes through `calibrated()`.
+  - The zero cases are spec §9's: CRASH, rule 5, halted, rule 6, no active playbook, a block, or a primitive out of position.
+  - A freeze or the lock never increases the target.
+  - The exact deadband exempts forced reductions and exits to 0.
+- **Intents:**
+  - One `OrderIntent` per decision, of at most 0.5× equity, in whole shares floored at the close.
+  - On the last decision that can fill, a forced reduce-only cut to 0.5× (A3). The closing bar only reduces and never enters.
+  - Every BUY carries the trade's stop below the price.
+- **EngineState and the DecisionRecord** (ARCH §4.3, v1.12):
+  - Both are canonical JSON with SHA-256 hashes.
+  - The record carries the account and the flags. `with_verdicts` adds the risk verdicts as plain JSON.
+- **`decide(state, view, inputs)`:** pure.
+  - It warms from the view on a cold start, a model swap, or a stored feature or filter state that doesn't fit, and keeps the switching, trade and edge state.
+  - A restored filter steps on every row the stream takes in, late bars included.
+  - It refuses a view at another τ.
+  - Model and calibration hashes are cached with weak keys.
+- **Truncation harness:** the `DecisionLayer` ("decide") is in the default registry, between calibration and risk.
+  - It decides under the governing model and calibration that the lifecycle's pointers name. That closes B7's open item.
+  - Its edge is seeded synthetically, so it trades. Fills are at the close, and the verdicts come from a fresh RiskEngine.
+  - Each record's provenance is the model's fit end or the calibration's as-of time, whichever is later.
+  - **Two planted leaks** (P3): a decide that reads the view at τ + 1 h is caught by T-NL1 in the decide layer, and a calibration as of after τ is caught by T-NL2.
+
+**Tests:** 455 new, for 1,785 fast in all.
+
+| Group | Tests |
+|---|---|
+| Playbook schema | 157 |
+| Config | 53 |
+| Primitives | 44 |
+| Switching scenario tables | 34 |
+| Release | 22 |
+| Indicators | 15 |
+| Edge | 15 |
+| Sizing | 15 |
+| Intents | 12 |
+| Core | 12 |
+| Health | 8 |
+| State and record | 7 |
+| Property tests (hypothesis) | 6 |
+| Decision-layer harness | 3 |
+| Review regressions | 52 |
+
+The property tests cover: never short, never over a cap or 0.5× in one order, probabilities summing to 1, size 0 in CRASH, uncertain, halted or frozen, and switches following the rules. Seven slow training tests moved to the full tier: six of B4's `test_hmm_train` (the five sharing the cached `three_full` selection, and the pool's single-threaded BLAS) and the same-seed artifact-hash test. `--trace` still covers every claimed id.
+
+**Run times:**
+
+| Measure | Time |
+|---|---|
+| Fast gate | 107 s (1,785 tests, 104–105 s of tests) |
+| Full gate | 2,071 s |
+| Real-bar 200 cuts (full) | 601 s (336 s at B7: the decision layer) |
+| Monthly refits through 2018 (full) | 205 s |
+| Synthetic 200 cuts (full) | 142 s |
+| Synthetic 50 cuts (fast) | 35 s |
+
+**Review:** two rounds, one per sub-step. Each round used the code-review skill and Codex, or a Claude stand-in. Each finding got a red test, then a fix.
+
+- **B8a** (8dc81f5, 17e02a2):
+  - an exit on the same bar hid an invalidation and its block;
+  - rule 4's Decimal sum depended on the ambient precision;
+  - an invalid YAML timestamp escaped as ValueError;
+  - repeated YAML keys were silently accepted, in `risk.yaml` too;
+  - indicator overflow crashed the decision instead of tripping rule 6;
+  - a playbook could enter and be invalidated on the same bar;
+  - a restored health streak above `recovery_bars` raised;
+  - an `IndicatorConfig` with bad spans could be built.
+
+  The cleanups: one shared feed loop and bar check, and dead code removed.
+- **B8b** (b3da118, 2f1e646):
+  - a corrupt filter snapshot crashed `decide()` or was used as a posterior;
+  - a feature state from another config was accepted;
+  - a late bar made the restored filter skip a transition the re-warm takes;
+  - Kelly divided by zero or overflowed on a tiny s.d.;
+  - the record left out the account and the flags;
+  - the closing-bar decision could open a trade;
+  - `Caps` wasn't validated when built.
+
+  The cleanups: less state hashing, weak-keyed caches in place of identity `lru_cache`s that kept 64 models alive, one exact-decimal helper, one test loader, and dead branches removed.
+
+Not fixed, with reasons:
+
+- **(high, needs your call) BUYs are sized to the cap exactly at the decision's close.** B9 checks the caps at the order's limit price, so a limit above that close is vetoed. At $100 and a $100.01 ask, a full entry's first 500-share leg breaks the 0.5× single-order cap. The decision runs 16 minutes after the bar closes, so this would refuse many live entries.
+  - The harness and the happy-path test pin the quote at the close, so neither sees it.
+  - `decide()` can't size on the live quote, because C8 keeps IEX prices out of decisions. The fix belongs where the limit price is set: B13's execution trims a BUY to fit the caps at its limit before the check, or B9 clamps a BUY instead of vetoing it.
+  - Either one changes the order path you approved in B9, so it's your call. It is an open item for B13.
+- **The trade state can drift from the account.** An entry the deadband holds, a vetoed BUY, or the daily-loss flatten leaves `EngineState.trade` in position with fewer shares. The next decision buys toward the target with the trade's original stop, which the stop check keeps honest. B14 reconciles the trade state with fills.
+- **The fast tier is at 104–105 s of 120 s.** The decision layer's 50 cuts are 35 s. The next candidates for `full` are the calibration job tests and the remaining B4 training tests.
+
+**Deviations** (documents updated in this merge)
+
+- **SPEC v1.7, §7–§9:** B8's readings where the spec is silent:
+  - flat playbooks have a null `stop_loss`;
+  - stops are fixed at entry, and a primitive re-arms on its own exit condition;
+  - invalidation runs before the exit, refuses entries while it holds, and its block clears on a fresh 3-bar confirmation;
+  - the closing bar never enters;
+  - the strict YAML loader;
+  - the cooldown count runs during the cooldown;
+  - A1 compares hard caps, and an equal cap counts as risk-increasing;
+  - rule 6's causes, and its streak and cooldown on unhealthy bars;
+  - rule 5 is inclusive at 0.15 and rule 4 strict at 0.25, both exact;
+  - exits to 0 are exempt from the deadband;
+  - shadow costs land on the first held bar and the exit bar, and f\*'s edge cases;
+  - no calibration means 25% of the cap;
+  - one order per decision of at most 0.5×.
+- **ARCHITECTURE v1.12, §4.1 and §4.3:**
+  - `decide(state, view, inputs)`, and what `inputs` holds;
+  - the warm-up and restore rules;
+  - EngineState holds `decide`'s own state, and the risk state stays the RiskEngine's;
+  - the record carries the account and the flags, and the driver adds the verdicts.
+- **CLAUDE.md** cites SPEC v1.7 and ARCHITECTURE v1.12.
+
+**Closed from B5, B7 and B9:**
+
+- the harness records DecisionRecords and state hashes, with `decide()` registered (B5);
+- the decision layer filters under the governing model after a swap (B7);
+- `decide()` emits `OrderIntent` as the risk engine reads it (B9).
+
+**Open items**
+
+- **You, at this report:**
+  - the order-sizing call above;
+  - confirm SPEC v1.7's readings, especially exits ignoring the deadband, the cooldown count running during the cooldown, and how invalidation blocks clear.
+- **B11:**
+  - seed `EdgeBook` from the fit-window backtest;
+  - add the `costs.yaml` fees to shadow returns;
+  - pass the trial ticket to refits;
+  - run `decide()` in the walk-forward.
+- **B13:** the BUY sizing at the limit price (above).
+- **B14:**
+  - build `Caps` from `RiskConfig` and the flags from the RiskEngine;
+  - check `engine.yaml` against `committed_bytes(repo, ENGINE_YAML)` at start;
+  - persist EngineState with the RiskState;
+  - reconcile the trade state with fills.
+- **The full tier** takes 2,071 s, and the real-bar 200 cuts are 601 s of that.
+
 ## B7 · Model lifecycle: refit, drift, calibration (done 2026-10-15, tag `b07-done`)
 
 Built on `b07-lifecycle` in two parts, each with its own red, green and review:
