@@ -1,6 +1,6 @@
 # PLAN — SPY Regime Trader
 
-**Status:** APPROVED v1.4 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does. v1.2 adds step B20, Jev as a shadow advisor (SPEC v1.4 §12a, ARCHITECTURE v1.6), which you approved on 2026-10-13 (§0, §0.3, §1, §4). v1.3 records two calls of yours: B9 may merge before B5–B8, which you decided on 2026-10-13 (§4 B9), and every step merges through a pull request on the private GitHub repo, decided on 2026-10-14 (§2 rule 7). v1.4 aligns B7's drift-edge red-test wording with SPEC §5's strict “more than” thresholds (2026-10-15).
+**Status:** APPROVED v1.5 (Gate 3 of 3) · 2026-10-05. Approved as written: decisions P1–P11 confirmed and clarifications C11–C17 accepted. C11–C17 are now part of SPEC.md v1.2. v1.1 names the view's knowledge time in B2, `PointInTimeView(τ, as_of)`, as ARCHITECTURE §6.2 does. v1.2 adds step B20, Jev as a shadow advisor (SPEC v1.4 §12a, ARCHITECTURE v1.6), which you approved on 2026-10-13 (§0, §0.3, §1, §4). v1.3 records two calls of yours: B9 may merge before B5–B8, which you decided on 2026-10-13 (§4 B9), and every step merges through a pull request on the private GitHub repo, decided on 2026-10-14 (§2 rule 7). v1.4 aligns B7's drift-edge red-test wording with SPEC §5's strict “more than” thresholds (2026-10-15). v1.5 adds B13's BUY trim at the limit price, your call of 2026-10-19 (§4 B13).
 **Builds on:** [SPEC.md](SPEC.md) v1.6 (v1.1 plus this plan's C11–C17, B3's reading of §3, the Jev shadow advisor, B9's resume and kill calls, and B4's reading of §4–§6) and [ARCHITECTURE.md](ARCHITECTURE.md) v1.10 (v1.0 aligned with this plan, notes from B0, B2, B4, B6, B9 and B10, and the Jev shadow advisor), approved 2026-10-05 and amended since; the shadow advisor was approved 2026-10-13
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The build started 2026-10-05 with B0. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
@@ -400,6 +400,7 @@ If r1 fails the gates at CP2, as spec §0 expects, the build continues as planne
     - three attempts for an entry; exits widen until they fill;
     - one GTC protective stop after every fill, cancelled before any sale;
     - partial fills, and idempotent `client_order_id`s;
+    - trimming each BUY attempt to the caps at its limit price, with the risk engine's own arithmetic (ARCHITECTURE §8.2, v1.5);
   - the trade-update stream, with REST polling as backup;
   - reconciliation snapshots;
   - the integration suite on the test account.
@@ -407,6 +408,7 @@ If r1 fails the gates at CP2, as spec §0 expects, the build continues as planne
   - the I5 constructor matrix: mode × URL × checklist state;
   - recorded-response tests for every order path, including 4xx and 5xx errors and timeouts: a retry reuses its `client_order_id` and never double-submits;
   - a stop is present after every fill, and an exit cancels the stop first;
+  - a BUY sized at the close passes the risk engine at an ask above it: trimmed to the most whole shares within every cap. A re-quote never raises the quantity, a trim to zero sends nothing, and SELLs are never trimmed;
   - a reconciliation mismatch halts trading;
   - on the test account: place, replace and cancel orders; the stop's lifecycle; and the kill test, which opens a position, kills it, and verifies flat, no open orders and HALTED within 60 s.
 - **Covers:** spec §10 (order types, broker-side stops, reconciliation), I4, I5, AD3, go-live item 3.
