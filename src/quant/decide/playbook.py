@@ -5,7 +5,7 @@ PLAN §5, P7).
 label. Code reads only each file's YAML front matter: the text between the file's first line,
 which must be exactly `---`, and the next line that is exactly `---`. Everything after that is
 prose for the owner and is ignored, so editing it changes neither a playbook nor the release id.
-The front matter is read with `yaml.safe_load` and must be a mapping. It is then validated
+The front matter is read with `strict_load` and must be a mapping. It is then validated
 through its canonical JSON (`quant.core.canonical.canonical_dumps`, then pydantic's strict JSON
 mode: `PLAYBOOK.validate_json(...)`, `Manifest.model_validate_json(...)`), so labels, times and
 lists are read from their JSON text as everywhere else in the project, and a YAML `.nan` or
@@ -70,7 +70,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, Self
 
-import yaml
 from pydantic import (
     AfterValidator,
     AwareDatetime,
@@ -87,6 +86,7 @@ from quant.core.clock import ensure_utc
 from quant.core.errors import CanonicalJSONError, ConfigError
 from quant.core.model import StrictModel
 from quant.core.regime import Label
+from quant.core.yaml import strict_load
 from quant.features.menu import FeatureConfig
 from quant.hmm.labels import LabelThresholds
 
@@ -334,7 +334,7 @@ def parse_front_matter(text: str) -> dict[str, Any]:
     """The YAML front matter of a release file, as a mapping.
 
     The file's first line must be exactly `---` (no BOM, no leading blank line), and a later
-    line must be exactly `---`; the text between them is read with `yaml.safe_load`. ConfigError
+    line must be exactly `---`; the text between them is read with `strict_load`. ConfigError
     when the opening or closing `---` is missing, the YAML doesn't parse, or it isn't a mapping
     (an empty block, a list or a scalar). The body after the closing line is never parsed.
     """
@@ -345,10 +345,7 @@ def parse_front_matter(text: str) -> dict[str, Any]:
         end = lines[1:].index("---") + 1
     except ValueError:
         raise ConfigError("front matter is missing its closing ---") from None
-    try:
-        data = yaml.safe_load("\n".join(lines[1:end]))
-    except yaml.YAMLError as exc:
-        raise ConfigError(str(exc)) from exc
+    data = strict_load("\n".join(lines[1:end]))
     if not isinstance(data, dict):
         raise ConfigError("front matter must be a mapping")
     return data
@@ -427,6 +424,4 @@ def load_release(root: Path) -> Release:
             pbs[label] = parse_playbook(read(root / rel))
         except ConfigError as exc:
             raise ConfigError(f"{root / rel}: {exc}") from exc
-        if pbs[label].label != label:
-            raise ConfigError(f"{root / rel}: expected label {label.value}")
     return release_of(manifest, pbs)

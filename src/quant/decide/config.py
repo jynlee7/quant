@@ -38,13 +38,13 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Final
 
-import yaml
 from pydantic import Field, ValidationError
 
 from quant.core.canonical import sha256_hex
 from quant.core.errors import ConfigError
 from quant.core.model import StrictModel
 from quant.core.schedule import Timing
+from quant.core.yaml import strict_load
 
 ENGINE_YAML: Final = "config/engine.yaml"
 """Where the file lives, relative to the repository root."""
@@ -126,7 +126,7 @@ class EngineConfig(StrictModel):
 
 
 def parse_engine_config(data: bytes) -> EngineConfig:
-    """The EngineConfig in `data`, YAML text (`yaml.safe_load`).
+    """The EngineConfig in `data`, YAML text (`strict_load`).
 
     ConfigError, naming the problem, for text that isn't UTF-8 or YAML, a top level that isn't
     a mapping, an unknown or missing key at any level, a value of the wrong type or out of its
@@ -135,11 +135,11 @@ def parse_engine_config(data: bytes) -> EngineConfig:
     Timing). No pydantic ValidationError escapes: each becomes a ConfigError.
     """
     try:
-        values = yaml.safe_load(data.decode("utf-8"))
+        values = strict_load(data.decode("utf-8"))
         if not isinstance(values, dict):
             raise ConfigError("engine.yaml must contain a mapping")
         config = EngineConfig.model_validate(values)
-    except (UnicodeError, yaml.YAMLError, ValidationError) as exc:
+    except (UnicodeError, ValidationError) as exc:
         raise ConfigError(f"invalid engine.yaml: {exc}") from exc
     config.timing.timing()
     return config

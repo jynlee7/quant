@@ -69,6 +69,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from fractions import Fraction
 
 from pydantic import Field
 
@@ -203,14 +204,12 @@ def step(
     blocked, reconfirm = state.blocked, state.reconfirm
     switched = derisk = False
     r1 = r2 = r3 = r4 = r5 = False
-    reasons = {rule: "not evaluated" for rule in RuleId}
+    reasons: dict[RuleId, str] = {}
     m_rule4 = m_rule5 = 1.0
     if cause is not None:
         challenger, count, reconfirm = None, 0, 0
         reasons = {rule: f"unhealthy: {cause.value}" for rule in RuleId}
-    else:
-        if probs is None:
-            raise ValueError("healthy bars require probs")
+    elif probs is not None:
         label_probs = probs.label_probs
         top = top_label(label_probs)
         qualifies = Decimal(repr(label_probs[top])) >= Decimal(repr(config.takeover_prob))
@@ -241,14 +240,17 @@ def step(
                     blocked, reconfirm = False, 0
             else:
                 reconfirm = 0
+        # Fractions of decimal representations keep sums/differences exact under any context.
         top2 = sorted((Decimal(repr(v)) for v in label_probs.values()), reverse=True)
-        if len(top2) >= 2 and top2[0] - top2[1] <= Decimal(repr(config.uncertainty_gap)):
+        if len(top2) >= 2 and Fraction(top2[0]) - Fraction(top2[1]) <= Fraction(
+            repr(config.uncertainty_gap)
+        ):
             r5 = True
             m_rule5 = 0.0
         next_probs = probs.next_label_probs
-        if Decimal(repr(next_probs.get(Label.STRESS, 0.0))) + Decimal(
+        if Fraction(repr(next_probs.get(Label.STRESS, 0.0))) + Fraction(
             repr(next_probs.get(Label.CRASH, 0.0))
-        ) > Decimal(repr(config.derisk_prob)):
+        ) > Fraction(repr(config.derisk_prob)):
             r4 = True
             m_rule4 = config.derisk_multiplier
         reasons.update(
@@ -279,13 +281,11 @@ def step(
         RuleTrace(RuleId.R1, r1, reasons[RuleId.R1]),
         RuleTrace(RuleId.R2, r2, reasons[RuleId.R2]),
         RuleTrace(RuleId.R3, r3, reasons[RuleId.R3]),
-        RuleTrace(RuleId.A1, switched and derisk, reasons[RuleId.A1]),
+        RuleTrace(RuleId.A1, derisk, reasons[RuleId.A1]),
         RuleTrace(RuleId.R5, r5, reasons[RuleId.R5]),
         RuleTrace(RuleId.R4, r4, reasons[RuleId.R4]),
     )
-    return SwitchOutcome(
-        new, active, switched, switched and derisk, health, blocked, m_rule4, m_rule5, trace
-    )
+    return SwitchOutcome(new, active, switched, derisk, health, blocked, m_rule4, m_rule5, trace)
 
 
 def invalidate(state: SwitchState) -> SwitchState:

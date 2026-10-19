@@ -19,12 +19,14 @@ entry_z and fast/slow are compared strictly both ways, a bar never has both an e
 In a trade (the state's `in_position`), in this order:
 
 1. `bars_in_trade` += 1 and `peak_close` = max(peak_close, close).
-2. **Stop**: the bar's low <= `stop` -> out, reason STOP. The stop is fixed at entry,
+2. **Invalidation**, when label_prob is given: check every condition on the updated trade;
+   a hit closes it with reason INVALIDATED and Step.invalidation naming the hit.
+3. **Stop**: the bar's low <= `stop` -> out, reason STOP. The stop is fixed at entry,
    `entry_price - stop_loss x ATR(at entry)`, and never trails.
-3. **Take-profit** (when the playbook's `take_profit` isn't null): the close >= `take_profit`,
+4. **Take-profit** (when the playbook's `take_profit` isn't null): the close >= `take_profit`,
    fixed at entry as `entry_price + take_profit x ATR(at entry)` -> out, reason TAKE_PROFIT.
-4. **Exit signal** -> out, reason EXIT.
-5. Otherwise HOLD.
+5. **Exit signal** -> out, reason EXIT.
+6. Otherwise HOLD.
 
 Flat (not in a trade):
 
@@ -43,9 +45,9 @@ condition holds, which re-arms it on that bar (the reason stays STOP or TAKE_PRO
 leaves it flat and armed. No bar both exits and enters. `flat` playbooks always return
 `TradeState.flat()` with reason FLAT.
 
-**Invalidation** (`check_invalidation`, spec §7): evaluated on every bar the playbook is still in
-a trade after `step`, over the state `step` returned. Each of the playbook's conditions, in its
-listed order; the first that holds is the hit:
+**Invalidation** (`check_invalidation`, spec §7): evaluated inside `step` on every trade bar,
+after updating its age and peak and before any exit, when label_prob is given. Conditions run
+in their listed order; the first that holds is the hit:
 
 - `label_prob_below`: `Decimal(repr(label_prob)) < Decimal(repr(threshold))` (exactly the
   threshold doesn't fire);
@@ -53,9 +55,10 @@ listed order; the first that holds is the hit:
 - `bars_in_trade_exceeds`: bars_in_trade > bars;
 - `trade_drawdown_exceeds`: (peak_close - close) / peak_close > fraction.
 
-A hit exits the position (decide sets the target to 0 and calls `close_trade`) and blocks entries
+A hit exits the position; decide sets the target to 0 and blocks entries
 under that playbook until a fresh takeover (quant.decide.switching.invalidate, design call 6).
-The shadow edge book (B8b) runs `step` without invalidation.
+Flat entries are refused while label_prob_below or close_below_ema holds, without a block.
+The shadow edge book (B8b) runs `step` with label_prob=None, without invalidation.
 """
 
 from __future__ import annotations
@@ -83,6 +86,7 @@ class Reason(StrEnum):
     ENTER = "enter"
     HOLD = "hold"
     EXIT = "exit"
+    INVALIDATED = "invalidated"
     STOP = "stop"
     TAKE_PROFIT = "take_profit"
     REARM = "rearm"
@@ -144,6 +148,7 @@ class Step:
 
     state: TradeState
     reason: Reason
+    invalidation: InvalidationHit | None = None
 
     @property
     def in_position(self) -> bool:
@@ -204,6 +209,7 @@ def step(
     bar: HourlyBar,
     *,
     entries_allowed: bool = True,
+    label_prob: float | None = None,
 ) -> Step:
     """One bar of the lifecycle in the module docstring. Pure: `state` is not changed.
     `entries_allowed` False (rule 6, an invalidation block, no active label, a frozen or locked
@@ -218,6 +224,11 @@ def step(
     if state.in_position:
         bars = state.bars_in_trade + 1
         peak = max(state.peak_close or bar.close, bar.close)
+        state = state.model_copy(update={"bars_in_trade": bars, "peak_close": peak})
+        if label_prob is not None:
+            hit = check_invalidation(playbook, state, values, bar, label_prob=label_prob)
+            if hit is not None:
+                return Step(close_trade(state), Reason.INVALIDATED, hit)
         if state.stop is None:
             raise ValueError("an open trade must have a stop")
         if bar.low <= state.stop:
@@ -228,9 +239,7 @@ def step(
             )
         if reading.exit:
             return Step(close_trade(state), Reason.EXIT)
-        return Step(
-            state.model_copy(update={"bars_in_trade": bars, "peak_close": peak}), Reason.HOLD
-        )
+        return Step(state, Reason.HOLD)
     if not state.armed:
         if reading.exit:
             return Step(state.model_copy(update={"armed": True}), Reason.REARM)
@@ -242,6 +251,12 @@ def step(
             return Step(state, Reason.UNDEFINED)
         if not entries_allowed:
             return Step(state, Reason.BLOCKED)
+        if label_prob is not None:
+            for condition in playbook.invalidation:
+                if (condition.kind == "label_prob_below" and label_prob < condition.threshold) or (
+                    condition.kind == "close_below_ema" and bar.close < values.ema[condition.span]
+                ):
+                    return Step(state, Reason.BLOCKED)
         tp = (
             None
             if playbook.take_profit is None
@@ -266,7 +281,17 @@ def close_trade(state: TradeState) -> TradeState:
     """The flat, armed state after a forced exit (an invalidation, rule 6, a switch away):
     every trade field cleared. Re-arming waits only after a stop or take-profit (design call
     7); an invalidated playbook is kept out by its block instead (design call 6)."""
-    return TradeState.flat()
+    return state.model_copy(
+        update={
+            "in_position": False,
+            "armed": True,
+            "entry_price": None,
+            "stop": None,
+            "take_profit": None,
+            "bars_in_trade": 0,
+            "peak_close": None,
+        }
+    )
 
 
 def check_invalidation(
@@ -278,9 +303,9 @@ def check_invalidation(
     label_prob: float,
 ) -> InvalidationHit | None:
     """The first of `playbook.invalidation`'s conditions that holds on this bar (module
-    docstring), or None. Always None when `state` isn't in a trade. `state` is the one `step`
-    returned for this bar; `label_prob` is the filtered P(playbook.label) on this bar (0 for a
-    label the model lacks). KeyError when a `close_below_ema` span is missing from
+    docstring), or None. Always None when `state` isn't in a trade. `state` has this bar's
+    updated age and peak, before exits; `label_prob` is the filtered P(playbook.label) on this
+    bar (0 for a label the model lacks). KeyError when a `close_below_ema` span is missing from
     `values.ema`."""
     if not state.in_position:
         return None

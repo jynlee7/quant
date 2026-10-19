@@ -99,12 +99,12 @@ def health_step(streak: int, cause: Cause | None, *, recovery_bars: int) -> Heal
     """Rule 6 on one bar, from the previous bar's `streak`: an unhealthy bar (a cause) gives
     streak 0, not operating; a healthy one gives `min(streak + 1, recovery_bars)`, operating
     when that is `recovery_bars`. ValueError, its message naming `recovery_bars` or `streak`,
-    for `recovery_bars < 1` or a streak outside [0, recovery_bars]. The cold streak is
+    for `recovery_bars < 1` or a negative streak. The cold streak is
     `recovery_bars` (C4), so a run's first healthy bar operates."""
     if recovery_bars < 1:
         raise ValueError("recovery_bars must be >= 1")
-    if not 0 <= streak <= recovery_bars:
-        raise ValueError("streak must be between 0 and recovery_bars")
+    if streak < 0:
+        raise ValueError("streak must be >= 0")
     if cause is not None:
         return Health(cause, 0, False)
     s = min(streak + 1, recovery_bars)

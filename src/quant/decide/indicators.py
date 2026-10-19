@@ -35,7 +35,8 @@ stream continues bit for bit. The tests compare with a slow reference within 1e-
 
 **Missing and bad bars**, as the feature stream treats them: `update` refuses an incomplete bar
 (`complete` False), a bar whose t_open isn't strictly after the last bar's, a price that isn't
-finite and > 0, low above min(open, close) or high below max(open, close), with FeatureError
+finite and > 0, low above min(open, close), high below max(open, close), invalid volume,
+or arithmetic overflow, with FeatureError
 (a ModelError, so rule 6 applies) and the state exactly as it was. The stream then continues
 from its previous bar, so the next bar's true range spans the gap. `indicators_for` skips
 incomplete bars as `features_for` does.
@@ -46,20 +47,19 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from quant.core.calendar import BarSpec
 from quant.core.canonical import sha256_hex
-from quant.core.epoch import from_us, to_us
+from quant.core.epoch import from_us
 from quant.core.errors import ConfigError, FeatureError
 from quant.core.model import StrictModel
 from quant.data.frames import HourlyBar
-from quant.data.policy import Purpose
 from quant.data.view import PointInTimeView
 from quant.decide.playbook import Playbook
-from quant.features.stream import ema
+from quant.features.stream import ema, feed_through, validate_bar
 
 
 class IndicatorConfig(StrictModel):
@@ -69,13 +69,20 @@ class IndicatorConfig(StrictModel):
     - `atr_bars`: n for ATR(n), or None for no ATR;
     - `window`: N for the mean, s.d. and z, or None for none (N >= 2 when set).
 
-    The constructor of `IndicatorStream` refuses (ConfigError) spans that aren't ascending and
-    distinct, a span, `atr_bars` or `window` below its minimum.
+    The config refuses EMA spans that aren't ascending, distinct and positive with
+    ConfigError. Field validation enforces the minima of `atr_bars` and `window`.
     """
 
     ema_spans: tuple[int, ...]
     atr_bars: int | None = Field(ge=1)
     window: int | None = Field(ge=2)
+
+    @field_validator("ema_spans")
+    @classmethod
+    def valid_spans(cls, spans: tuple[int, ...]) -> tuple[int, ...]:
+        if list(spans) != sorted(set(spans)) or any(s < 1 for s in spans):
+            raise ConfigError("ema_spans must be ascending, distinct and positive")
+        return spans
 
     @classmethod
     def for_playbook(cls, playbook: Playbook) -> IndicatorConfig:
@@ -152,9 +159,6 @@ class IndicatorStream:
     def __init__(self, config: IndicatorConfig) -> None:
         """A stream under `config` that has consumed no bar. ConfigError for a config the
         IndicatorConfig docstring refuses."""
-        spans = config.ema_spans
-        if list(spans) != sorted(set(spans)) or any(s < 1 for s in spans):
-            raise ConfigError("ema_spans must be ascending, distinct and positive")
         self._config = config
         self._state = IndicatorState(
             config_hash=config.config_hash(),
@@ -180,19 +184,7 @@ class IndicatorStream:
         as it was, for the bars the module docstring refuses. Every value is a float64, so an
         int price can't change the state's canonical JSON."""
         state, config = self._state, self._config
-        t = to_us(bar.t_open)
-        try:
-            opening, high, low, close = (float(x) for x in (bar.open, bar.high, bar.low, bar.close))
-        except (TypeError, ValueError):
-            raise FeatureError("bar prices must be numeric") from None
-        if (
-            not bar.complete
-            or (state.last_t_open is not None and t <= state.last_t_open)
-            or any(not math.isfinite(x) or x <= 0 for x in (opening, high, low, close))
-            or low > min(opening, close)
-            or high < max(opening, close)
-        ):
-            raise FeatureError(f"incomplete, unordered or invalid OHLC bar at {bar.t_open}")
+        t, _, high, low, close, _ = validate_bar(bar, state.last_t_open)
         emas = {str(s): ema(close, state.ema.get(str(s)), s) for s in config.ema_spans}
         tr = (
             high - low
@@ -207,19 +199,28 @@ class IndicatorStream:
         if config.window is not None:
             closes.append(close)
             closes = closes[-config.window :]
-        atr = (
-            math.fsum(true_ranges) / config.atr_bars
-            if config.atr_bars is not None and len(true_ranges) == config.atr_bars
-            else None
-        )
-        mean = sd = z = None
-        if config.window is not None and len(closes) == config.window:
-            mean = math.fsum(closes) / config.window
-            sd = math.sqrt(math.fsum((x - mean) ** 2 for x in closes) / config.window)
-            if len(set(closes)) == 1:
-                mean, sd = close, 0.0
-            z = None if sd == 0.0 else (close - mean) / sd
-        self._state = IndicatorState(
+        try:
+            atr = (
+                math.fsum(true_ranges) / config.atr_bars
+                if config.atr_bars is not None and len(true_ranges) == config.atr_bars
+                else None
+            )
+            mean = sd = z = None
+            if config.window is not None and len(closes) == config.window:
+                mean = math.fsum(closes) / config.window
+                sd = math.sqrt(math.fsum((x - mean) ** 2 for x in closes) / config.window)
+                if len(set(closes)) == 1:
+                    mean, sd = close, 0.0
+                z = None if sd == 0.0 else (close - mean) / sd
+        except (OverflowError, ValueError) as exc:
+            raise FeatureError("indicator arithmetic overflow") from exc
+        if any(
+            x is not None and not math.isfinite(x)
+            for x in (*emas.values(), *true_ranges, atr, mean, sd, z)
+        ):
+            raise FeatureError("indicator arithmetic overflow")
+        # Inputs and computed values are checked above; avoid revalidating growing windows.
+        self._state = IndicatorState.model_construct(
             config_hash=state.config_hash,
             last_t_open=t,
             prev_close=close,
@@ -245,7 +246,8 @@ class IndicatorStream:
         window), `true_ranges` longer than n (or non-empty without an ATR), a true range below
         0, a close or prev_close not > 0, or some but not all of `last_t_open` and `prev_close`
         set."""
-        if state.config_hash != config.config_hash():
+        out = cls(config)
+        if state.config_hash != out._state.config_hash:
             raise ConfigError("indicator state config_hash differs from config")
         if (config.window is None and state.closes) or (
             config.window is not None and len(state.closes) > config.window
@@ -264,7 +266,6 @@ class IndicatorStream:
         expected = set() if state.last_t_open is None else {str(s) for s in config.ema_spans}
         if set(state.ema) != expected:
             raise ConfigError("ema keys do not match the configured spans and stream state")
-        out = cls(config)
         out._state = state.model_copy(deep=True)
         return out
 
@@ -282,14 +283,4 @@ def indicators_for(
     incomplete, or already consumed; and when the stream refuses a bar (feeding stops there).
     Bars consumed before an error stay consumed.
     """
-    last = stream.last_t_open
-    since = None if last is None else last + timedelta(microseconds=1)
-    for candidate in view.hourly(symbol, purpose=Purpose.OPERATE, since=since):
-        if candidate.t_open > bar.t_open:
-            break
-        if not candidate.complete:
-            continue
-        values = stream.update(candidate)
-        if candidate.t_open == bar.t_open:
-            return values
-    raise FeatureError(f"decision bar {bar.t_open} is missing, incomplete or already consumed")
+    return feed_through(stream.last_t_open, stream.update, view, symbol, bar)

@@ -49,7 +49,6 @@ from tests.support.decide import (
 from tests.support.risk import RISK_YAML
 from tests.unit.test_decide_primitives import in_trade, playbook, values
 
-RED = "red:B8"
 CALM, CHOP, STRESS, CRASH = Label.CALM_UP, Label.CHOP, Label.STRESS, Label.CRASH
 
 
@@ -57,7 +56,6 @@ CALM, CHOP, STRESS, CRASH = Label.CALM_UP, Label.CHOP, Label.STRESS, Label.CRASH
 
 
 @pytest.mark.spec("SPEC§7", "SPEC§8")
-@pytest.mark.xfail(strict=True, reason=RED, raises=TypeError)
 def test_an_invalidation_on_an_exit_bar_is_an_invalidation_and_blocks() -> None:
     from quant.decide.primitives import Reason, TradeState, step
     from quant.decide.switching import SwitchState, invalidate
@@ -103,7 +101,6 @@ def test_an_invalidation_on_an_exit_bar_is_an_invalidation_and_blocks() -> None:
 
 
 @pytest.mark.spec("SPEC§7")
-@pytest.mark.xfail(strict=True, reason=RED, raises=TypeError)
 def test_invalidation_counts_this_bar_on_every_trade_bar() -> None:
     from quant.decide.primitives import Reason, step
 
@@ -138,7 +135,6 @@ def test_invalidation_counts_this_bar_on_every_trade_bar() -> None:
         ([{"kind": "close_below_ema", "span": 50}], 0.9, {35: 101.0, 50: 104.0, 175: 100.0}),
     ],
 )
-@pytest.mark.xfail(strict=True, reason=RED, raises=TypeError)
 def test_an_entry_is_refused_while_an_invalidation_holds(
     invalidation: list[dict[str, Any]] | None, label_prob: float, ema: dict[int, float]
 ) -> None:
@@ -175,7 +171,6 @@ def _switch(label_probs: dict[Label, float], next_probs: dict[Label, float], pre
 
 
 @pytest.mark.spec("SPEC§8")
-@pytest.mark.xfail(strict=True, reason=RED, raises=AssertionError)
 def test_rule_4_sums_exactly_at_any_ambient_precision() -> None:
     from quant.decide.switching import RuleId
 
@@ -188,7 +183,6 @@ def test_rule_4_sums_exactly_at_any_ambient_precision() -> None:
 
 
 @pytest.mark.spec("SPEC§8")
-@pytest.mark.xfail(strict=True, reason=RED, raises=AssertionError)
 def test_rules_4_and_5_do_not_depend_on_the_ambient_context() -> None:
     from quant.decide.switching import RuleId
 
@@ -209,7 +203,6 @@ BAD_TIME = "2026-13-19T00:00:00Z"
 
 
 @pytest.mark.spec("SPEC§7", "ARCH§9.2")
-@pytest.mark.xfail(strict=True, reason=RED, raises=ValueError)
 def test_an_invalid_timestamp_in_a_playbook_is_a_config_error() -> None:
     from quant.decide.playbook import parse_playbook
 
@@ -219,7 +212,6 @@ def test_an_invalid_timestamp_in_a_playbook_is_a_config_error() -> None:
 
 
 @pytest.mark.spec("ARCH§9.2", "P7")
-@pytest.mark.xfail(strict=True, reason=RED, raises=ValueError)
 def test_an_invalid_timestamp_in_the_manifest_is_a_config_error() -> None:
     from quant.decide.playbook import parse_manifest
 
@@ -229,7 +221,6 @@ def test_an_invalid_timestamp_in_the_manifest_is_a_config_error() -> None:
 
 
 @pytest.mark.spec("ARCH§9.2", "SPEC§8")
-@pytest.mark.xfail(strict=True, reason=RED, raises=ValueError)
 def test_an_invalid_timestamp_in_a_release_gives_cause_release(tmp_path: Path) -> None:
     from quant.decide.health import Cause, cause_of
     from quant.decide.playbook import load_release
@@ -246,7 +237,6 @@ def test_an_invalid_timestamp_in_a_release_gives_cause_release(tmp_path: Path) -
 
 
 @pytest.mark.spec("ARCH§9.2")
-@pytest.mark.xfail(strict=True, reason=RED, raises=ValueError)
 def test_an_invalid_timestamp_in_engine_yaml_is_a_config_error() -> None:
     from quant.decide.config import parse_engine_config
 
@@ -258,7 +248,6 @@ def test_an_invalid_timestamp_in_engine_yaml_is_a_config_error() -> None:
 
 
 @pytest.mark.spec("SPEC§10", "D13")
-@pytest.mark.xfail(strict=True, reason=RED, raises=ValueError)
 def test_an_invalid_timestamp_in_risk_yaml_is_a_config_error() -> None:
     from quant.risk.limits import parse_risk_config
 
@@ -289,7 +278,6 @@ def _edit(text: str, old: str, new: str) -> str:
         ),
     ],
 )
-@pytest.mark.xfail(strict=True, reason=RED, raises=pytest.fail.Exception)
 def test_a_repeated_key_in_a_playbook_is_a_config_error(old: str, new: str) -> None:
     from quant.decide.playbook import parse_playbook
 
@@ -307,7 +295,6 @@ def test_a_repeated_key_in_a_playbook_is_a_config_error(old: str, new: str) -> N
         ("  CHOP: playbooks/CHOP.md", "  CHOP: playbooks/CHOP.md\n  CHOP: playbooks/CHOP.md"),
     ],
 )
-@pytest.mark.xfail(strict=True, reason=RED, raises=pytest.fail.Exception)
 def test_a_repeated_key_in_the_manifest_is_a_config_error(old: str, new: str) -> None:
     from quant.decide.playbook import parse_manifest
 
@@ -324,7 +311,6 @@ def test_a_repeated_key_in_the_manifest_is_a_config_error(old: str, new: str) ->
         ("timing:\n", "timing:\n  feed_delay_min: 15\n  decision_delay_min: 16\ntiming:\n"),
     ],
 )
-@pytest.mark.xfail(strict=True, reason=RED, raises=pytest.fail.Exception)
 def test_a_repeated_key_in_engine_yaml_is_a_config_error(old: str, new: str) -> None:
     from quant.decide.config import parse_engine_config
 
@@ -342,7 +328,6 @@ def test_a_repeated_key_in_engine_yaml_is_a_config_error(old: str, new: str) -> 
         ("  poll_s: 1.0 ", "  poll_s: 2.0\n  poll_s: 1.0 "),  # in kill
     ],
 )
-@pytest.mark.xfail(strict=True, reason=RED, raises=pytest.fail.Exception)
 def test_a_repeated_key_in_risk_yaml_is_a_config_error(old: str, new: str) -> None:
     from quant.risk.limits import parse_risk_config
 
@@ -372,7 +357,6 @@ def _huge_int(i: int) -> Any:
     ],
     ids=["variance", "atr-sum", "int-price"],
 )
-@pytest.mark.xfail(strict=True, reason=RED, raises=OverflowError)
 def test_an_overflowing_bar_is_refused_as_unhealthy(first: Any, second: Any) -> None:
     from quant.decide.health import Cause, cause_of
     from quant.decide.indicators import IndicatorConfig, IndicatorStream
@@ -390,7 +374,6 @@ def test_an_overflowing_bar_is_refused_as_unhealthy(first: Any, second: Any) -> 
 
 
 @pytest.mark.spec("SPEC§8", "C2")
-@pytest.mark.xfail(strict=True, reason=RED, raises=ValueError)
 def test_a_streak_above_recovery_bars_is_clamped() -> None:
     from quant.decide.health import Cause, Health, health_step
 
@@ -400,7 +383,6 @@ def test_a_streak_above_recovery_bars_is_clamped() -> None:
 
 
 @pytest.mark.spec("SPEC§8", "C2")
-@pytest.mark.xfail(strict=True, reason=RED, raises=ValueError)
 def test_a_state_restored_under_a_shorter_recovery_keeps_switching() -> None:
     from quant.decide.config import SwitchingConfig
     from quant.decide.switching import SwitchState, step
@@ -418,7 +400,6 @@ def test_a_state_restored_under_a_shorter_recovery_keeps_switching() -> None:
 
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize("spans", [(175, 35), (35, 35), (0,), (-5, 35)])
-@pytest.mark.xfail(strict=True, reason=RED, raises=pytest.fail.Exception)
 def test_indicator_config_itself_refuses_bad_spans(spans: tuple[int, ...]) -> None:
     from quant.decide.indicators import IndicatorConfig
 
