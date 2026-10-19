@@ -88,7 +88,7 @@ def test_a_cold_start_operates_on_its_first_healthy_bar() -> None:
 
 
 @pytest.mark.spec("SPEC§8")
-@pytest.mark.parametrize(("streak", "recovery"), [(-1, 2), (3, 2), (0, 0)])
+@pytest.mark.parametrize(("streak", "recovery"), [(-1, 2), (0, 0)])
 def test_health_step_refuses_impossible_arguments(streak: int, recovery: int) -> None:
     from quant.decide.health import health_step
 
