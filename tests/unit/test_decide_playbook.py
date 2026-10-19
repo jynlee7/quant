@@ -21,8 +21,6 @@ from quant.core.errors import ConfigError
 from quant.core.regime import Label
 from tests.support.decide import PLAYBOOKS, front_matter, playbook_text
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 DOWN, UP = -math.inf, math.inf
 
 
@@ -63,7 +61,6 @@ def parse(front: dict[str, Any]) -> Any:
 # --- r1's files -----------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5", "P7")
 @pytest.mark.parametrize("label", list(Label))
 def test_each_r1_playbook_validates(label: Label) -> None:
@@ -73,7 +70,6 @@ def test_each_r1_playbook_validates(label: Label) -> None:
     assert playbook.created_at == datetime(2026, 10, 19, tzinfo=UTC)
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_the_prose_body_is_ignored() -> None:
     from quant.decide.playbook import parse_playbook
@@ -89,7 +85,6 @@ def test_the_prose_body_is_ignored() -> None:
 # --- unknown and missing keys ---------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize(
     ("label", "where"),
@@ -116,7 +111,6 @@ def test_an_unknown_key_is_refused(label: Label, where: str) -> None:
         parse(front)
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize(
     "key",
@@ -141,7 +135,6 @@ def test_every_key_is_required(label: Label, key: str) -> None:
         parse(front)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize("param", ["fast", "slow", "atr_bars"], ids=lambda p: f"trend-{p}")
 def test_a_missing_trend_param_is_refused(param: str) -> None:
@@ -151,7 +144,6 @@ def test_a_missing_trend_param_is_refused(param: str) -> None:
         parse(front)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize("param", ["n", "entry_z", "exit_z", "atr_bars"])
 def test_a_missing_mean_reversion_param_is_refused(param: str) -> None:
@@ -232,7 +224,6 @@ def _case_id(case: tuple[Label, str, Any]) -> str:
     return f"{case[0].value}-{case[1]}={case[2]!r}"
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize("case", ACCEPTED, ids=_case_id)
 def test_a_value_at_its_bound_is_accepted(case: tuple[Label, str, Any]) -> None:
@@ -244,7 +235,6 @@ def test_a_value_at_its_bound_is_accepted(case: tuple[Label, str, Any]) -> None:
     assert node == value
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize("case", REFUSED, ids=_case_id)
 def test_a_value_just_past_its_bound_is_refused(case: tuple[Label, str, Any]) -> None:
@@ -253,7 +243,6 @@ def test_a_value_just_past_its_bound_is_refused(case: tuple[Label, str, Any]) ->
         parse(changed(label, path, value))
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_trend_fast_must_be_below_slow() -> None:
     front = base(Label.CALM_UP)
@@ -264,7 +253,6 @@ def test_trend_fast_must_be_below_slow() -> None:
     assert parse(front).params.fast == 69
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_mean_reversion_exit_z_must_be_below_entry_z() -> None:
     front = base(Label.CHOP)
@@ -275,7 +263,6 @@ def test_mean_reversion_exit_z_must_be_below_entry_z() -> None:
     assert parse(front).params.exit_z == below(0.75)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize(
     ("condition", "accepted"),
@@ -304,7 +291,6 @@ def test_the_invalidation_menu_is_fixed(condition: dict[str, Any], accepted: boo
             parse(front)
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_an_empty_invalidation_list_is_allowed_for_a_trading_playbook() -> None:
     front = base(Label.CALM_UP)
@@ -315,7 +301,6 @@ def test_an_empty_invalidation_list_is_allowed_for_a_trading_playbook() -> None:
 # --- types: no coercion ---------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize(
     ("path", "value"),
@@ -346,7 +331,6 @@ def test_a_value_of_the_wrong_type_is_refused(path: str, value: Any) -> None:
         parse(changed(Label.CALM_UP, path, value))
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_created_at_with_an_offset_is_stored_in_utc() -> None:
     plus_two = datetime(2026, 10, 19, 2, tzinfo=timezone(timedelta(hours=2)))
@@ -358,7 +342,6 @@ def test_created_at_with_an_offset_is_stored_in_utc() -> None:
 # --- strategies and label rules -------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "D9")
 @pytest.mark.parametrize("strategy", ["short_trend", "pairs", "momentum", ""])
 def test_only_the_three_primitives_exist(strategy: str) -> None:
@@ -367,7 +350,6 @@ def test_only_the_three_primitives_exist(strategy: str) -> None:
         parse(changed(Label.CALM_UP, "strategy", strategy))
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_params_must_match_the_strategy() -> None:
     # trend params under mean_reversion, and the reverse, are unknown keys of the other.
@@ -377,7 +359,6 @@ def test_params_must_match_the_strategy() -> None:
         parse(changed(Label.CHOP, "strategy", "trend_following"))
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "D8", "PLAN§5")
 @pytest.mark.parametrize("source", [Label.CALM_UP, Label.CHOP])
 def test_a_crash_playbook_must_be_flat(source: Label) -> None:
@@ -387,7 +368,6 @@ def test_a_crash_playbook_must_be_flat(source: Label) -> None:
     assert parse(base(Label.CRASH)).strategy == "flat"
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "D8", "PLAN§5")
 @pytest.mark.parametrize("source", [Label.CALM_UP, Label.CHOP])
 def test_stress_may_trade_at_most_a_quarter(source: Label) -> None:
@@ -400,7 +380,6 @@ def test_stress_may_trade_at_most_a_quarter(source: Label) -> None:
             parse(front)
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize("label", [Label.CALM_UP, Label.CHOP])
 def test_max_size_above_a_labels_cap_is_not_refused(label: Label) -> None:
@@ -409,7 +388,6 @@ def test_max_size_above_a_labels_cap_is_not_refused(label: Label) -> None:
     assert parse(changed(label, "max_size", 1.0)).max_size == 1.0
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "D8")
 @pytest.mark.parametrize(
     ("path", "value"),
@@ -427,7 +405,6 @@ def test_a_flat_playbook_holds_nothing(label: Label, path: str, value: Any) -> N
         parse(changed(label, path, value))
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_a_playbook_is_frozen() -> None:
     from pydantic import ValidationError
@@ -442,7 +419,6 @@ def test_a_playbook_is_frozen() -> None:
 # --- front matter ---------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize(
     "text",
@@ -464,7 +440,6 @@ def test_front_matter_must_be_a_mapping_between_two_dashed_lines(text: str) -> N
         parse_front_matter(text)
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_front_matter_is_the_yaml_between_the_first_two_dashed_lines() -> None:
     from quant.decide.playbook import parse_front_matter

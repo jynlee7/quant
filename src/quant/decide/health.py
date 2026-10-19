@@ -32,6 +32,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from quant.core.clock import ensure_utc
+from quant.core.errors import ConfigError, FeatureError, ModelError
+
 
 class Cause(StrEnum):
     """Why a bar is unhealthy (module docstring). The record names it."""
@@ -62,14 +65,20 @@ class Health:
     @property
     def healthy(self) -> bool:
         """`cause is None`."""
-        raise NotImplementedError
+        return self.cause is None
 
 
 def cause_of(error: BaseException) -> Cause:
     """The Cause a decision-time error stands for: FEATURES for a FeatureError, MODEL for any
     other ModelError, RELEASE for a ConfigError. Any other exception is a bug, not a health
     failure: it is re-raised as it is."""
-    raise NotImplementedError
+    if isinstance(error, FeatureError):
+        return Cause.FEATURES
+    if isinstance(error, ModelError):
+        return Cause.MODEL
+    if isinstance(error, ConfigError):
+        return Cause.RELEASE
+    raise error
 
 
 def provenance_cause(
@@ -78,7 +87,12 @@ def provenance_cause(
     """MODEL_PROVENANCE when `model_fit_end >= tau`, else CALIBRATION_PROVENANCE when a
     calibration is given and `calibration_as_of >= tau`, else None (no calibration at all is
     healthy: sizing then uses C13's failed cap). ClockError for a naive datetime."""
-    raise NotImplementedError
+    tau = ensure_utc(tau)
+    if ensure_utc(model_fit_end) >= tau:
+        return Cause.MODEL_PROVENANCE
+    if calibration_as_of is not None and ensure_utc(calibration_as_of) >= tau:
+        return Cause.CALIBRATION_PROVENANCE
+    return None
 
 
 def health_step(streak: int, cause: Cause | None, *, recovery_bars: int) -> Health:
@@ -87,4 +101,11 @@ def health_step(streak: int, cause: Cause | None, *, recovery_bars: int) -> Heal
     when that is `recovery_bars`. ValueError, its message naming `recovery_bars` or `streak`,
     for `recovery_bars < 1` or a streak outside [0, recovery_bars]. The cold streak is
     `recovery_bars` (C4), so a run's first healthy bar operates."""
-    raise NotImplementedError
+    if recovery_bars < 1:
+        raise ValueError("recovery_bars must be >= 1")
+    if not 0 <= streak <= recovery_bars:
+        raise ValueError("streak must be between 0 and recovery_bars")
+    if cause is not None:
+        return Health(cause, 0, False)
+    s = min(streak + 1, recovery_bars)
+    return Health(None, s, s >= recovery_bars)

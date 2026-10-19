@@ -279,8 +279,8 @@ class FeatureStream:
             values.append(_log(volume / median_volume) if median_volume > 0 else math.nan)
         fast, slow = state.ema_fast, state.ema_slow
         if config.trend is not None:
-            fast = _ema(close, fast, config.trend.fast)
-            slow = _ema(close, slow, config.trend.slow)
+            fast = ema(close, fast, config.trend.fast)
+            slow = ema(close, slow, config.trend.slow)
             if not all(math.isfinite(ema) and ema > 0 for ema in (fast, slow)):
                 raise FeatureError(f"feature bar at {bar.t_open.isoformat()} overflows float64")
             values.append(_log(fast / slow))
@@ -610,7 +610,8 @@ def _last(history: list[float], count: int) -> list[float]:
     return history[max(0, len(history) - count) :]
 
 
-def _ema(close: float, previous: float | None, span: int) -> float:
+def ema(close: float, previous: float | None, span: int) -> float:
+    """EMA of the close, seeded by the first observation."""
     if previous is None:
         return close
     alpha = 2.0 / (span + 1)

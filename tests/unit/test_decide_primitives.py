@@ -18,8 +18,6 @@ from quant.core.canonical import canonical_dumps
 from quant.core.regime import Label
 from tests.support.decide import REPO, priced
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 
 def values(
     i: int, *, ema: dict[int, float] | None = None, atr: float | None = 2.0, z: float | None = None
@@ -77,7 +75,6 @@ def in_trade(
 # --- signals --------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5", "D9")
 @pytest.mark.parametrize(
     ("fast", "slow", "close", "entry", "exit_"),
@@ -100,7 +97,6 @@ def test_trend_following_signal(
     assert (got.entry, got.exit, got.defined) == (entry, exit_, True)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5", "D9")
 @pytest.mark.parametrize(
     ("z", "entry", "exit_"),
@@ -123,7 +119,6 @@ def test_mean_reversion_signal(z: float, entry: bool, exit_: bool) -> None:
     assert (got.entry, got.exit, got.defined) == (entry, exit_, True)
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_mean_reversion_without_z_has_no_signal() -> None:
     from quant.decide.playbook import MeanReversionParams
@@ -134,7 +129,6 @@ def test_mean_reversion_without_z_has_no_signal() -> None:
     assert (got.entry, got.exit, got.defined) == (False, False, False)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "D8")
 def test_flat_never_enters() -> None:
     from quant.decide.primitives import flat
@@ -146,7 +140,6 @@ def test_flat_never_enters() -> None:
 # --- the lifecycle --------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_an_entry_fixes_the_stop_from_the_entry_bars_atr() -> None:
     from quant.decide.primitives import Reason, step
@@ -165,7 +158,6 @@ def test_an_entry_fixes_the_stop_from_the_entry_bars_atr() -> None:
     assert got.state.stop == 98.0 - 3.0 * 2.0
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_the_stop_never_trails() -> None:
     from quant.decide.primitives import Reason, step
@@ -181,7 +173,6 @@ def test_the_stop_never_trails() -> None:
     assert state.peak_close == 111.0
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize(
     ("low", "stopped"), [(98.0, True), (97.0, True), (98.00000000000001, False)]
@@ -195,7 +186,6 @@ def test_the_stop_is_hit_when_the_low_reaches_it(low: float, stopped: bool) -> N
     assert got.in_position is not stopped
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_take_profit_exits_on_the_close() -> None:
     from quant.decide.primitives import Reason, step
@@ -212,7 +202,6 @@ def test_take_profit_exits_on_the_close() -> None:
     assert not hit.state.armed
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_the_stop_comes_before_take_profit_and_the_exit_signal() -> None:
     from quant.decide.primitives import Reason, step
@@ -224,7 +213,6 @@ def test_the_stop_comes_before_take_profit_and_the_exit_signal() -> None:
     assert got.reason == Reason.STOP
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_a_stopped_primitive_rearms_only_on_its_exit_condition() -> None:
     # Design call 7: a stop-out doesn't re-enter on the next bar while the entry still holds.
@@ -245,7 +233,6 @@ def test_a_stopped_primitive_rearms_only_on_its_exit_condition() -> None:
     assert again.reason == Reason.ENTER
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_a_stop_bar_that_shows_the_exit_condition_rearms_on_it() -> None:
     from quant.decide.primitives import Reason, step
@@ -259,7 +246,6 @@ def test_a_stop_bar_that_shows_the_exit_condition_rearms_on_it() -> None:
     assert again.reason == Reason.ENTER
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_a_signal_exit_stays_armed() -> None:
     from quant.decide.primitives import Reason, step
@@ -275,7 +261,6 @@ def test_a_signal_exit_stays_armed() -> None:
     assert back.reason == Reason.ENTER
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8")
 def test_blocked_entries_wait_and_a_blocked_trade_is_not_forced_out() -> None:
     from quant.decide.primitives import Reason, step
@@ -291,7 +276,6 @@ def test_blocked_entries_wait_and_a_blocked_trade_is_not_forced_out() -> None:
     assert held.in_position
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize("atr", [None, 0.0])
 def test_no_entry_without_a_positive_atr(atr: float | None) -> None:
@@ -303,7 +287,6 @@ def test_no_entry_without_a_positive_atr(atr: float | None) -> None:
     assert not got.in_position
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "D8", "D9")
 @pytest.mark.parametrize("label", [Label.STRESS, Label.CRASH])
 def test_a_flat_playbook_never_holds(label: Label) -> None:
@@ -315,7 +298,6 @@ def test_a_flat_playbook_never_holds(label: Label) -> None:
     assert got.state == TradeState.flat()
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_the_cold_trade_state_is_flat_and_armed() -> None:
     from quant.decide.primitives import TradeState, close_trade
@@ -326,7 +308,6 @@ def test_the_cold_trade_state_is_flat_and_armed() -> None:
     assert close_trade(in_trade(102.0, 98.0, bars=5, peak=110.0)) == cold
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_step_refuses_values_of_another_bar() -> None:
     from quant.decide.primitives import step
@@ -335,7 +316,6 @@ def test_step_refuses_values_of_another_bar() -> None:
         step(playbook(Label.CALM_UP), flat_state(), trend(1, 101.0, 100.0), priced(0, 102.0))
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_stop_and_take_profit_levels() -> None:
     from quant.decide.primitives import stop_level, take_profit_level
@@ -353,7 +333,6 @@ def _check(pb: Any, state: Any, i: int, close: float, label_prob: float, **ind: 
     return check_invalidation(pb, state, values(i, **ind), priced(i, close), label_prob=label_prob)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize(
     ("label_prob", "hit"), [(0.29999999999999993, True), (0.30, False), (0.9, False), (0.0, True)]
@@ -367,7 +346,6 @@ def test_label_prob_below_fires_strictly_below_its_threshold(label_prob: float, 
         assert got.reason
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 @pytest.mark.parametrize(("bars", "hit"), [(21, False), (22, True)])
 def test_bars_in_trade_exceeds_fires_past_its_count(bars: int, hit: bool) -> None:
@@ -378,7 +356,6 @@ def test_bars_in_trade_exceeds_fires_past_its_count(bars: int, hit: bool) -> Non
         assert got.condition.kind == "bars_in_trade_exceeds"
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize(("close", "hit"), [(104.0, False), (103.99999999999999, True)])
 def test_close_below_ema_fires_strictly_below_the_ema(close: float, hit: bool) -> None:
@@ -387,7 +364,6 @@ def test_close_below_ema_fires_strictly_below_the_ema(close: float, hit: bool) -
     assert (got is not None) == hit
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize(("close", "hit"), [(90.0, False), (89.99, True), (100.0, False)])
 def test_trade_drawdown_exceeds_fires_past_its_fraction(close: float, hit: bool) -> None:
@@ -399,7 +375,6 @@ def test_trade_drawdown_exceeds_fires_past_its_fraction(close: float, hit: bool)
     assert (got is not None) == hit
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_the_first_listed_condition_is_the_hit_and_flat_has_none() -> None:
     chop = playbook(Label.CHOP)  # bars_in_trade_exceeds 21, then label_prob_below 0.30

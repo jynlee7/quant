@@ -21,8 +21,6 @@ from quant.core.regime import Label
 from quant.decide.health import Cause
 from tests.support.decide import CAPS, SWITCHING, RefBar, probs, ref_actives, top
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 _bars = st.lists(
     st.one_of(
         st.tuples(st.sampled_from(list(Label)), st.sampled_from([0.5, 0.69, 0.70, 0.8, 0.95])),
@@ -48,7 +46,6 @@ def _run(seq: list[tuple[Label, float] | None]) -> list[Any]:
     return out
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "A1", "C4", "D5")
 @settings(max_examples=30)
 @given(_bars)
@@ -61,7 +58,6 @@ def test_the_active_label_follows_the_rules(seq: list[tuple[Label, float] | None
     assert [o.active for o in out] == reference
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "A1", "D5")
 @settings(max_examples=30)
 @given(_bars)

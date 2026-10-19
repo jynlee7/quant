@@ -20,8 +20,6 @@ from quant.core.errors import ConfigError
 from quant.core.schedule import Timing
 from tests.support.decide import ENGINE_YAML
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 
 def committed() -> bytes:
     return ENGINE_YAML.read_bytes()
@@ -40,7 +38,6 @@ def parse(data: dict[str, Any] | bytes) -> Any:
     return parse_engine_config(raw)
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "SPEC§8", "D5", "A1")
 def test_the_committed_file_holds_spec_8s_switching_values() -> None:
     from quant.decide.config import load_engine_config
@@ -52,7 +49,6 @@ def test_the_committed_file_holds_spec_8s_switching_values() -> None:
     assert s.health_recovery_bars == 2
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "SPEC§9", "C12")
 def test_the_committed_file_holds_spec_9s_sizing_values() -> None:
     from quant.decide.config import load_engine_config
@@ -66,7 +62,6 @@ def test_the_committed_file_holds_spec_9s_sizing_values() -> None:
     )
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "D2")
 def test_the_timing_is_the_schedules_default() -> None:
     from quant.decide.config import load_engine_config
@@ -76,7 +71,6 @@ def test_the_timing_is_the_schedules_default() -> None:
     assert config.timing.timing() == Timing()
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 def test_the_config_hash_is_of_the_parsed_values() -> None:
     config = parse(committed())
@@ -89,7 +83,6 @@ def test_the_config_hash_is_of_the_parsed_values() -> None:
     assert parse(bumped).config_hash() != config.config_hash()
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 def test_a_file_that_differs_from_the_committed_bytes_is_refused(tmp_path: Path) -> None:
     from quant.decide.config import load_engine_config
@@ -104,7 +97,6 @@ def test_a_file_that_differs_from_the_committed_bytes_is_refused(tmp_path: Path)
         load_engine_config(tmp_path / "missing.yaml", committed=committed())
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 def test_the_config_is_frozen() -> None:
     from pydantic import ValidationError
@@ -168,7 +160,6 @@ REFUSED = {
 }
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "SPEC§8", "SPEC§9")
 @pytest.mark.parametrize("case", sorted(REFUSED))
 def test_a_bad_engine_config_is_refused(case: str) -> None:
@@ -176,7 +167,6 @@ def test_a_bad_engine_config_is_refused(case: str) -> None:
         parse(REFUSED[case])
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 @pytest.mark.parametrize(
     "raw", [b"\xff\xfe", b"switching: [unclosed", b"- a list\n", b"", b"just a string\n"]
@@ -186,7 +176,6 @@ def test_text_that_isnt_a_yaml_mapping_is_refused(raw: bytes) -> None:
         parse(raw)
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "SPEC§8")
 @pytest.mark.parametrize(
     ("section", "key", "value"),

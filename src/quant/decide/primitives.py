@@ -61,6 +61,7 @@ The shadow edge book (B8b) runs `step` without invalidation.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 
 from pydantic import Field
@@ -126,7 +127,15 @@ class TradeState(StrictModel):
     @classmethod
     def flat(cls) -> TradeState:
         """Flat, armed, every trade field None and `bars_in_trade` 0 (C4: a run starts flat)."""
-        raise NotImplementedError
+        return cls(
+            in_position=False,
+            armed=True,
+            entry_price=None,
+            stop=None,
+            take_profit=None,
+            bars_in_trade=0,
+            peak_close=None,
+        )
 
 
 @dataclass(frozen=True)
@@ -138,7 +147,7 @@ class Step:
 
     @property
     def in_position(self) -> bool:
-        raise NotImplementedError
+        return self.state.in_position
 
 
 @dataclass(frozen=True)
@@ -152,33 +161,40 @@ class InvalidationHit:
 def trend_following(params: TrendParams, values: IndicatorValues, close: float) -> Signal:
     """The trend signal of the module docstring from `values.ema[fast]` and `values.ema[slow]`.
     KeyError when `values` lacks either span (a stream configured for another playbook)."""
-    raise NotImplementedError
+    fast, slow = values.ema[params.fast], values.ema[params.slow]
+    return Signal(entry=fast > slow and close > fast, exit=fast < slow, defined=True)
 
 
 def mean_reversion(params: MeanReversionParams, values: IndicatorValues) -> Signal:
     """The mean-reversion signal of the module docstring from `values.z`; undefined while z is
     None."""
-    raise NotImplementedError
+    if values.z is None:
+        return Signal(False, False, False)
+    return Signal(entry=values.z <= -params.entry_z, exit=values.z >= -params.exit_z, defined=True)
 
 
 def flat() -> Signal:
     """No entry, no exit, defined: the flat primitive holds nothing."""
-    raise NotImplementedError
+    return Signal(False, False, True)
 
 
 def signal(playbook: Playbook, values: IndicatorValues, close: float) -> Signal:
     """The signal of `playbook`'s primitive (dispatch on its strategy)."""
-    raise NotImplementedError
+    if playbook.strategy == "trend_following":
+        return trend_following(playbook.params, values, close)
+    if playbook.strategy == "mean_reversion":
+        return mean_reversion(playbook.params, values)
+    return flat()
 
 
 def stop_level(entry_price: float, atr: float, multiple: float) -> float:
     """`entry_price - multiple * atr`."""
-    raise NotImplementedError
+    return entry_price - multiple * atr
 
 
 def take_profit_level(entry_price: float, atr: float, multiple: float) -> float:
     """`entry_price + multiple * atr`."""
-    raise NotImplementedError
+    return entry_price + multiple * atr
 
 
 def step(
@@ -194,14 +210,63 @@ def step(
     account) suppresses an ENTER as BLOCKED; it never forces an exit (decide does that with
     `close_trade`). ValueError, its message naming `t_open`, when `values.t_open` isn't
     `bar.t_open`."""
-    raise NotImplementedError
+    if values.t_open != bar.t_open:
+        raise ValueError("indicator t_open must match bar t_open")
+    if playbook.strategy == "flat":
+        return Step(TradeState.flat(), Reason.FLAT)
+    reading = signal(playbook, values, bar.close)
+    if state.in_position:
+        bars = state.bars_in_trade + 1
+        peak = max(state.peak_close or bar.close, bar.close)
+        if state.stop is None:
+            raise ValueError("an open trade must have a stop")
+        if bar.low <= state.stop:
+            return Step(close_trade(state).model_copy(update={"armed": reading.exit}), Reason.STOP)
+        if state.take_profit is not None and bar.close >= state.take_profit:
+            return Step(
+                close_trade(state).model_copy(update={"armed": reading.exit}), Reason.TAKE_PROFIT
+            )
+        if reading.exit:
+            return Step(close_trade(state), Reason.EXIT)
+        return Step(
+            state.model_copy(update={"bars_in_trade": bars, "peak_close": peak}), Reason.HOLD
+        )
+    if not state.armed:
+        if reading.exit:
+            return Step(state.model_copy(update={"armed": True}), Reason.REARM)
+        return Step(state, Reason.DISARMED)
+    if not reading.defined:
+        return Step(state, Reason.UNDEFINED)
+    if reading.entry:
+        if values.atr is None or values.atr <= 0:
+            return Step(state, Reason.UNDEFINED)
+        if not entries_allowed:
+            return Step(state, Reason.BLOCKED)
+        tp = (
+            None
+            if playbook.take_profit is None
+            else take_profit_level(bar.close, values.atr, playbook.take_profit)
+        )
+        return Step(
+            TradeState(
+                in_position=True,
+                armed=True,
+                entry_price=bar.close,
+                stop=stop_level(bar.close, values.atr, playbook.stop_loss),
+                take_profit=tp,
+                bars_in_trade=0,
+                peak_close=bar.close,
+            ),
+            Reason.ENTER,
+        )
+    return Step(state, Reason.WAIT)
 
 
 def close_trade(state: TradeState) -> TradeState:
     """The flat, armed state after a forced exit (an invalidation, rule 6, a switch away):
     every trade field cleared. Re-arming waits only after a stop or take-profit (design call
     7); an invalidated playbook is kept out by its block instead (design call 6)."""
-    raise NotImplementedError
+    return TradeState.flat()
 
 
 def check_invalidation(
@@ -217,4 +282,29 @@ def check_invalidation(
     returned for this bar; `label_prob` is the filtered P(playbook.label) on this bar (0 for a
     label the model lacks). KeyError when a `close_below_ema` span is missing from
     `values.ema`."""
-    raise NotImplementedError
+    if not state.in_position:
+        return None
+    for condition in playbook.invalidation:
+        if condition.kind == "label_prob_below" and Decimal(repr(label_prob)) < Decimal(
+            repr(condition.threshold)
+        ):
+            return InvalidationHit(
+                condition, f"label probability {label_prob} < {condition.threshold}"
+            )
+        if condition.kind == "close_below_ema" and bar.close < values.ema[condition.span]:
+            return InvalidationHit(
+                condition, f"close {bar.close} < EMA({condition.span}) {values.ema[condition.span]}"
+            )
+        if condition.kind == "bars_in_trade_exceeds" and state.bars_in_trade > condition.bars:
+            return InvalidationHit(
+                condition, f"bars in trade {state.bars_in_trade} > {condition.bars}"
+            )
+        if condition.kind == "trade_drawdown_exceeds":
+            peak = state.peak_close
+            if peak is None or peak <= 0:
+                raise ValueError("an open trade must have a positive peak_close")
+            if (peak - bar.close) / peak > condition.fraction:
+                return InvalidationHit(
+                    condition, f"trade drawdown {(peak - bar.close) / peak} > {condition.fraction}"
+                )
+    return None

@@ -34,11 +34,15 @@ of the file's content is a ConfigError naming the problem.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Final
 
-from pydantic import Field
+import yaml
+from pydantic import Field, ValidationError
 
+from quant.core.canonical import sha256_hex
+from quant.core.errors import ConfigError
 from quant.core.model import StrictModel
 from quant.core.schedule import Timing
 
@@ -99,7 +103,10 @@ class TimingConfig(StrictModel):
         """`Timing(feed_delay=timedelta(minutes=feed_delay_min),
         decision_delay=timedelta(minutes=decision_delay_min))`. ConfigError (from Timing) when
         the delays are inconsistent. r1's file gives `Timing()`, the schedule's defaults."""
-        raise NotImplementedError
+        return Timing(
+            feed_delay=timedelta(minutes=self.feed_delay_min),
+            decision_delay=timedelta(minutes=self.decision_delay_min),
+        )
 
 
 class EngineConfig(StrictModel):
@@ -115,7 +122,7 @@ class EngineConfig(StrictModel):
         `quant.core.canonical.sha256_hex(self)`. It hashes the parsed values, so comments,
         whitespace and key order in the file don't change it, and any changed value does. It
         goes into every DecisionRecord (ARCHITECTURE §9.2)."""
-        raise NotImplementedError
+        return sha256_hex(self)
 
 
 def parse_engine_config(data: bytes) -> EngineConfig:
@@ -127,7 +134,15 @@ def parse_engine_config(data: bytes) -> EngineConfig:
     config's `timing.timing()` is built once here, so a config that parses always has a valid
     Timing). No pydantic ValidationError escapes: each becomes a ConfigError.
     """
-    raise NotImplementedError
+    try:
+        values = yaml.safe_load(data.decode("utf-8"))
+        if not isinstance(values, dict):
+            raise ConfigError("engine.yaml must contain a mapping")
+        config = EngineConfig.model_validate(values)
+    except (UnicodeError, yaml.YAMLError, ValidationError) as exc:
+        raise ConfigError(f"invalid engine.yaml: {exc}") from exc
+    config.timing.timing()
+    return config
 
 
 def load_engine_config(path: Path, *, committed: bytes) -> EngineConfig:
@@ -139,4 +154,10 @@ def load_engine_config(path: Path, *, committed: bytes) -> EngineConfig:
     can't be read, and whatever `parse_engine_config` refuses. The same contract as
     `quant.risk.limits.load_risk_config`.
     """
-    raise NotImplementedError
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(str(exc)) from exc
+    if data != committed:
+        raise ConfigError(f"{path} differs from its committed bytes")
+    return parse_engine_config(data)

@@ -65,12 +65,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Final, Literal, Self
 
-from pydantic import AfterValidator, AwareDatetime, Field, TypeAdapter, model_validator
+import yaml
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
+from quant.core.canonical import canonical_dumps, sha256_hex
 from quant.core.clock import ensure_utc
+from quant.core.errors import CanonicalJSONError, ConfigError
 from quant.core.model import StrictModel
 from quant.core.regime import Label
 from quant.features.menu import FeatureConfig
@@ -150,7 +164,9 @@ class TrendParams(StrictModel):
     def _fast_below_slow(self) -> Self:
         """Return self when fast < slow; otherwise raise ValueError naming both (pydantic
         reports a ValidationError). Within the bounds that refuses only 70 / 70."""
-        raise NotImplementedError
+        if self.fast >= self.slow:
+            raise ValueError("fast must be below slow")
+        return self
 
 
 class MeanReversionParams(StrictModel):
@@ -165,7 +181,9 @@ class MeanReversionParams(StrictModel):
     def _exit_below_entry(self) -> Self:
         """Return self when exit_z < entry_z; otherwise raise ValueError naming both. Within
         the bounds that refuses exit_z in [0.5, 1.0] with entry_z <= exit_z."""
-        raise NotImplementedError
+        if self.exit_z >= self.entry_z:
+            raise ValueError("exit_z must be below entry_z")
+        return self
 
 
 class FlatParams(StrictModel):
@@ -190,7 +208,11 @@ class _PlaybookBase(StrictModel):
         a CRASH playbook must be `flat`, and a STRESS playbook's `max_size` must be <= 0.25
         (compared on the decimal value, `Decimal(repr(max_size))`, so exactly 0.25 passes).
         Every subclass runs it."""
-        raise NotImplementedError
+        if self.label == Label.CRASH and not isinstance(self, FlatPlaybook):
+            raise ValueError("CRASH must be flat")
+        if self.label == Label.STRESS and Decimal(repr(self.max_size)) > Decimal("0.25"):
+            raise ValueError("STRESS max_size must be <= 0.25")
+        return self
 
 
 class TrendPlaybook(_PlaybookBase):
@@ -224,7 +246,9 @@ class FlatPlaybook(_PlaybookBase):
     @model_validator(mode="after")
     def _holds_nothing(self) -> Self:
         """Return self when `max_size == 0.0` and `invalidation == ()`; otherwise ValueError."""
-        raise NotImplementedError
+        if self.max_size != 0.0 or self.invalidation != ():
+            raise ValueError("flat holds nothing")
+        return self
 
 
 Playbook = TrendPlaybook | MeanReversionPlaybook | FlatPlaybook
@@ -273,8 +297,19 @@ class Manifest(StrictModel):
     features: FeatureConfig
     hmm: HmmSearch
     label_thresholds: LabelThresholds
-    playbooks: dict[Label, str]
+    playbooks: Mapping[Label, str]
     gate_report: str | None
+
+    @field_validator("playbooks", mode="after")
+    @classmethod
+    def _freeze_playbooks(cls, value: Mapping[Label, str]) -> Mapping[Label, str]:
+        """Own an immutable copy, so the release hash cannot drift after loading."""
+        return MappingProxyType(dict(value))
+
+    @field_serializer("playbooks")
+    def _serialize_playbooks(self, value: Mapping[Label, str]) -> dict[Label, str]:
+        """Keep the manifest's canonical JSON map independent of its storage type."""
+        return dict(value)
 
 
 # --- the release ----------------------------------------------------------------------------
@@ -292,7 +327,7 @@ class Release:
 
     def playbook(self, label: Label) -> Playbook:
         """The playbook for `label` (every label has one)."""
-        raise NotImplementedError
+        return self.playbooks[label]
 
 
 def parse_front_matter(text: str) -> dict[str, Any]:
@@ -303,33 +338,62 @@ def parse_front_matter(text: str) -> dict[str, Any]:
     when the opening or closing `---` is missing, the YAML doesn't parse, or it isn't a mapping
     (an empty block, a list or a scalar). The body after the closing line is never parsed.
     """
-    raise NotImplementedError
+    lines = text.split("\n")
+    if not lines or lines[0] != "---":
+        raise ConfigError("front matter must begin with --- on the first line")
+    try:
+        end = lines[1:].index("---") + 1
+    except ValueError:
+        raise ConfigError("front matter is missing its closing ---") from None
+    try:
+        data = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError as exc:
+        raise ConfigError(str(exc)) from exc
+    if not isinstance(data, dict):
+        raise ConfigError("front matter must be a mapping")
+    return data
 
 
 def parse_playbook(text: str) -> Playbook:
     """The playbook in a playbook file's text: its front matter validated by `PLAYBOOK`.
     ConfigError, naming the problem, for whatever `parse_front_matter` refuses and for any
     schema failure (each pydantic ValidationError becomes a ConfigError)."""
-    raise NotImplementedError
+    front = parse_front_matter(text)
+    try:
+        return PLAYBOOK.validate_json(canonical_dumps(front))
+    except (ValidationError, CanonicalJSONError) as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def parse_manifest(text: str) -> Manifest:
     """The manifest in `strategy.md`'s text: its front matter validated as a `Manifest`.
     ConfigError as `parse_playbook`."""
-    raise NotImplementedError
+    front = parse_front_matter(text)
+    try:
+        return Manifest.model_validate_json(canonical_dumps(front))
+    except (ValidationError, CanonicalJSONError) as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def release_id_of(manifest: Manifest, playbooks: Mapping[Label, Playbook]) -> str:
     """`sha256_hex({"manifest": manifest, "playbooks": {label.value: playbook}})` over every
     Label (module docstring). ConfigError unless `playbooks` has exactly the four labels."""
-    raise NotImplementedError
+    if set(playbooks) != set(Label):
+        raise ConfigError("playbooks must contain exactly every Label")
+    return sha256_hex(
+        {"manifest": manifest, "playbooks": {label.value: playbooks[label] for label in Label}}
+    )
 
 
 def release_of(manifest: Manifest, playbooks: Mapping[Label, Playbook]) -> Release:
     """A Release of parsed parts, with its `release_id_of`. ConfigError unless `playbooks` has
     exactly the four labels and each playbook's `label` is its key. The mapping is copied, so
     the caller's dict can't change the release."""
-    raise NotImplementedError
+    rid = release_id_of(manifest, playbooks)
+    for label, pb in playbooks.items():
+        if pb.label != label:
+            raise ConfigError(f"playbook {label.value} declares label {pb.label.value}")
+    return Release(manifest, MappingProxyType({label: playbooks[label] for label in Label}), rid)
 
 
 def load_release(root: Path) -> Release:
@@ -341,4 +405,28 @@ def load_release(root: Path) -> Release:
     `playbooks/<LABEL>.md` (a missing label, two labels to one file, another path); or a
     playbook's `label` isn't the label the map sends to its file. Never reads anything else.
     """
-    raise NotImplementedError
+
+    def read(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ConfigError(f"{path}: {exc}") from exc
+
+    try:
+        manifest = parse_manifest(read(root / STRATEGY_MD))
+    except ConfigError as exc:
+        raise ConfigError(f"{root / STRATEGY_MD}: {exc}") from exc
+    if set(manifest.playbooks) != set(Label):
+        raise ConfigError("manifest playbooks must map every Label")
+    pbs = {}
+    for label in Label:
+        rel = manifest.playbooks[label]
+        if rel != f"{PLAYBOOK_DIR}/{label.value}.md":
+            raise ConfigError(f"invalid playbook path for {label.value}: {rel}")
+        try:
+            pbs[label] = parse_playbook(read(root / rel))
+        except ConfigError as exc:
+            raise ConfigError(f"{root / rel}: {exc}") from exc
+        if pbs[label].label != label:
+            raise ConfigError(f"{root / rel}: expected label {label.value}")
+    return release_of(manifest, pbs)

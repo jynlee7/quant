@@ -14,12 +14,9 @@ import pytest
 
 from quant.core.errors import ClockError, ConfigError, FeatureError, ModelError
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 TAU = datetime(2018, 3, 6, 15, 46, tzinfo=UTC)
 
 
-@RED
 @pytest.mark.spec("SPEC§8")
 def test_errors_map_to_causes() -> None:
     from quant.decide.health import Cause, cause_of
@@ -32,7 +29,6 @@ def test_errors_map_to_causes() -> None:
         cause_of(bug)
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "SPEC§6")
 def test_a_model_or_calibration_not_older_than_tau_is_unhealthy() -> None:
     from quant.decide.health import Cause, provenance_cause
@@ -55,7 +51,6 @@ def test_a_model_or_calibration_not_older_than_tau_is_unhealthy() -> None:
         provenance_cause(TAU.replace(tzinfo=None), model_fit_end=before, calibration_as_of=None)
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C2", "C6")
 def test_operation_resumes_on_the_second_healthy_bar() -> None:
     from quant.decide.health import Cause, health_step
@@ -79,7 +74,6 @@ def test_operation_resumes_on_the_second_healthy_bar() -> None:
     ]
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C4")
 def test_a_cold_start_operates_on_its_first_healthy_bar() -> None:
     from quant.decide.config import SwitchingConfig
@@ -93,7 +87,6 @@ def test_a_cold_start_operates_on_its_first_healthy_bar() -> None:
     assert health_step(cold.health_streak, None, recovery_bars=2).operating
 
 
-@RED
 @pytest.mark.spec("SPEC§8")
 @pytest.mark.parametrize(("streak", "recovery"), [(-1, 2), (3, 2), (0, 0)])
 def test_health_step_refuses_impossible_arguments(streak: int, recovery: int) -> None:
@@ -103,7 +96,6 @@ def test_health_step_refuses_impossible_arguments(streak: int, recovery: int) ->
         health_step(streak, None, recovery_bars=recovery)
 
 
-@RED
 @pytest.mark.spec("SPEC§8")
 @pytest.mark.parametrize("recovery", [1, 3])
 def test_the_recovery_count_comes_from_config(recovery: int) -> None:

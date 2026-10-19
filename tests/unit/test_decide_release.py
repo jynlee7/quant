@@ -19,10 +19,7 @@ from quant.core.errors import ConfigError
 from quant.core.regime import Label
 from tests.support.decide import REPO, copy_release, front_matter, playbook_text
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
 
-
-@RED
 @pytest.mark.spec("P7", "PLAN§5", "SPEC§7", "D8")
 def test_r1_calm_up_is_plan_5s_trend_following() -> None:
     from quant.decide.playbook import LabelProbBelow, TrendParams, TrendPlaybook, load_release
@@ -36,7 +33,6 @@ def test_r1_calm_up_is_plan_5s_trend_following() -> None:
     assert playbook.invalidation == (LabelProbBelow(kind="label_prob_below", threshold=0.30),)
 
 
-@RED
 @pytest.mark.spec("P7", "PLAN§5", "SPEC§7", "D8")
 def test_r1_chop_is_plan_5s_mean_reversion() -> None:
     from quant.decide.playbook import (
@@ -57,7 +53,6 @@ def test_r1_chop_is_plan_5s_mean_reversion() -> None:
     )
 
 
-@RED
 @pytest.mark.spec("P7", "PLAN§5", "SPEC§7", "D8")
 @pytest.mark.parametrize("label", [Label.STRESS, Label.CRASH])
 def test_r1_stress_and_crash_stand_aside(label: Label) -> None:
@@ -70,7 +65,6 @@ def test_r1_stress_and_crash_stand_aside(label: Label) -> None:
     assert playbook.invalidation == ()
 
 
-@RED
 @pytest.mark.spec("P7", "PLAN§5", "ARCH§9.2")
 def test_r1_manifest_names_the_codes_r1_configs() -> None:
     from quant.decide.playbook import load_release
@@ -88,7 +82,6 @@ def test_r1_manifest_names_the_codes_r1_configs() -> None:
     assert manifest.gate_report is None
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "SPEC§7")
 def test_the_release_id_is_the_hash_of_the_parsed_front_matters() -> None:
     from quant.decide.playbook import load_release, parse_manifest, parse_playbook
@@ -105,7 +98,6 @@ def test_the_release_id_is_the_hash_of_the_parsed_front_matters() -> None:
     assert set(release.playbooks) == set(Label)
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "SPEC§7")
 def test_prose_never_changes_the_release_id_but_front_matter_does(tmp_path: Path) -> None:
     from quant.decide.playbook import load_release
@@ -123,7 +115,6 @@ def test_prose_never_changes_the_release_id_but_front_matter_does(tmp_path: Path
     assert load_release(root).release_id != original
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 def test_a_release_is_immutable() -> None:
     from pydantic import ValidationError
@@ -139,7 +130,6 @@ def test_a_release_is_immutable() -> None:
         release.manifest.release = "r2"
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 def test_release_of_hashes_parsed_parts_like_the_loader() -> None:
     from quant.decide.playbook import load_release, release_id_of, release_of
@@ -220,7 +210,6 @@ def _edit_manifest(root: Path, edit: object) -> None:
     (root / "strategy.md").write_text(playbook_text(front), "utf-8")
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2", "SPEC§7")
 @pytest.mark.parametrize(
     "spoil",
@@ -250,7 +239,6 @@ def test_the_loader_refuses_a_broken_release(tmp_path: Path, spoil: object) -> N
         load_release(root)
 
 
-@RED
 @pytest.mark.spec("ARCH§9.2")
 def test_the_loader_refuses_a_missing_manifest(tmp_path: Path) -> None:
     from quant.decide.playbook import load_release

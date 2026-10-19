@@ -28,8 +28,6 @@ from tests.support.decide import (
     ref_indicators,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 SPANS = (14, 35, 175)
 
 
@@ -45,7 +43,6 @@ def stream(cfg: Any = None) -> Any:
     return IndicatorStream(cfg if cfg is not None else config())
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_every_value_matches_the_slow_reference() -> None:
     bars = market_bars()
@@ -63,7 +60,6 @@ def test_every_value_matches_the_slow_reference() -> None:
         assert close_enough(got.z, ref.z)
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "SPEC§7")
 def test_the_emas_are_the_feature_streams_bit_for_bit() -> None:
     from quant.features.menu import r1_features
@@ -79,7 +75,6 @@ def test_the_emas_are_the_feature_streams_bit_for_bit() -> None:
         assert got.ema[175] == state.ema_slow
 
 
-@RED
 @pytest.mark.spec("PLAN§5", "SPEC§7")
 def test_the_opening_bars_true_range_includes_the_overnight_gap() -> None:
     bars = market_bars(9)
@@ -97,7 +92,6 @@ def test_the_opening_bars_true_range_includes_the_overnight_gap() -> None:
     assert s.snapshot().true_ranges[-1] == 6.0
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_atr_and_z_are_undefined_until_their_windows_fill() -> None:
     bars = priced_series([100.0 + (i % 5) for i in range(40)])
@@ -109,7 +103,6 @@ def test_atr_and_z_are_undefined_until_their_windows_fill() -> None:
         assert got.ema[14] is not None
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_z_is_undefined_when_every_close_in_the_window_is_equal() -> None:
     s = stream(config(spans=(), atr=None, window=14))
@@ -125,7 +118,6 @@ def test_z_is_undefined_when_every_close_in_the_window_is_equal() -> None:
     assert moved.z > 0
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_an_unconfigured_indicator_is_none() -> None:
     s = stream(config(spans=(), atr=None, window=None))
@@ -137,7 +129,6 @@ def test_an_unconfigured_indicator_is_none() -> None:
     assert (got.atr, got.mean, got.sd, got.z) == (None, None, None, None)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "ARCH§4.3")
 def test_a_restored_stream_continues_bit_for_bit() -> None:
     from quant.decide.indicators import IndicatorState, IndicatorStream
@@ -157,7 +148,6 @@ def test_a_restored_stream_continues_bit_for_bit() -> None:
     assert canonical_dumps(whole.snapshot()) == canonical_dumps(restored.snapshot())
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_restore_refuses_a_state_of_another_config() -> None:
     from quant.decide.indicators import IndicatorStream
@@ -172,7 +162,6 @@ def test_restore_refuses_a_state_of_another_config() -> None:
         IndicatorStream.restore(config(), too_long)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8")
 def test_incomplete_and_bad_bars_are_refused_and_leave_the_state() -> None:
     bars = market_bars(20)
@@ -197,7 +186,6 @@ def test_incomplete_and_bad_bars_are_refused_and_leave_the_state() -> None:
     assert got.t_open == bars[11].t_open
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 @pytest.mark.parametrize(
     ("spans", "atr", "window"), [((35, 14), 35, 35), ((35, 35), 35, 35), ((0,), 35, 35)]
@@ -211,7 +199,6 @@ def test_the_stream_refuses_a_bad_config(
         IndicatorStream(IndicatorConfig(ema_spans=spans, atr_bars=atr, window=window))
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "PLAN§5")
 def test_each_r1_playbook_gets_the_indicators_it_needs() -> None:
     from quant.decide.indicators import IndicatorConfig
@@ -227,7 +214,6 @@ def test_each_r1_playbook_gets_the_indicators_it_needs() -> None:
         assert (flat.ema_spans, flat.atr_bars, flat.window) == ((), None, None)
 
 
-@RED
 @pytest.mark.spec("SPEC§7")
 def test_a_close_below_ema_invalidation_adds_its_span() -> None:
     from quant.decide.indicators import IndicatorConfig
@@ -244,7 +230,6 @@ def test_a_close_below_ema_invalidation_adds_its_span() -> None:
     assert IndicatorConfig.for_playbook(with_ema).ema_spans == (35, 50, 175)
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8")
 def test_indicators_for_reads_the_point_in_time_view() -> None:
     from quant.core.calendar import TradingCalendar

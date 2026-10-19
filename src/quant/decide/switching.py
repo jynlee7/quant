@@ -67,6 +67,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 
 from pydantic import Field
@@ -74,7 +75,8 @@ from pydantic import Field
 from quant.core.model import StrictModel
 from quant.core.regime import Label
 from quant.decide.config import SwitchingConfig
-from quant.decide.health import Cause, Health
+from quant.decide.health import Cause, Health, health_step
+from quant.hmm.labels import top_label
 
 
 class RuleId(StrEnum):
@@ -134,7 +136,15 @@ class SwitchState(StrictModel):
     def cold(cls, config: SwitchingConfig) -> SwitchState:
         """A run's first state (C4): no active label, no challenger, no switch yet, a full
         health streak (`config.health_recovery_bars`, design call 5), not blocked."""
-        raise NotImplementedError
+        return cls(
+            active=None,
+            challenger=None,
+            count=0,
+            since_switch=None,
+            health_streak=config.health_recovery_bars,
+            blocked=False,
+            reconfirm=0,
+        )
 
 
 @dataclass(frozen=True)
@@ -164,11 +174,11 @@ class SwitchOutcome:
     def entries_allowed(self) -> bool:
         """Entries may happen under the active playbook on this bar: operating, a label is
         active, and it isn't blocked."""
-        raise NotImplementedError
+        return self.health.operating and self.active is not None and not self.blocked
 
     def fired(self, rule: RuleId) -> bool:
         """Whether `rule` fired on this bar."""
-        raise NotImplementedError
+        return next(t.fired for t in self.trace if t.rule == rule)
 
 
 def step(
@@ -183,7 +193,99 @@ def step(
     `probs`; an unhealthy bar's `probs` may be None and are ignored if given. ValueError, its
     message naming `probs` or `caps`, for a healthy bar without probs or with empty
     `label_probs`, or `caps` that don't hold every Label."""
-    raise NotImplementedError
+    if set(caps) != set(Label):
+        raise ValueError("caps must contain every Label")
+    if cause is None and (probs is None or not probs.label_probs):
+        raise ValueError("healthy bars require nonempty label probs")
+    since = None if state.since_switch is None else state.since_switch + 1
+    health = health_step(state.health_streak, cause, recovery_bars=config.health_recovery_bars)
+    active, challenger, count = state.active, state.challenger, state.count
+    blocked, reconfirm = state.blocked, state.reconfirm
+    switched = derisk = False
+    r1 = r2 = r3 = r4 = r5 = False
+    reasons = {rule: "not evaluated" for rule in RuleId}
+    m_rule4 = m_rule5 = 1.0
+    if cause is not None:
+        challenger, count, reconfirm = None, 0, 0
+        reasons = {rule: f"unhealthy: {cause.value}" for rule in RuleId}
+    else:
+        if probs is None:
+            raise ValueError("healthy bars require probs")
+        label_probs = probs.label_probs
+        top = top_label(label_probs)
+        qualifies = Decimal(repr(label_probs[top])) >= Decimal(repr(config.takeover_prob))
+        if active == top or not qualifies:
+            challenger, count = None, 0
+        else:
+            r1 = True
+            if challenger == top:
+                count += 1
+            else:
+                challenger, count = top, 1
+            r2 = count >= config.persistence_bars
+            cooled = since is None or since >= config.cooldown_bars
+            if active is None:
+                takeover = r2
+            elif caps[top] < caps[active]:
+                takeover = derisk = True
+            else:
+                takeover = r2 and cooled
+                r3 = r2 and not cooled
+            if takeover:
+                active, challenger, count, since, switched = top, None, 0, 0, True
+                blocked, reconfirm = False, 0
+        if blocked and not switched:
+            if active == top and qualifies:
+                reconfirm += 1
+                if reconfirm >= config.persistence_bars:
+                    blocked, reconfirm = False, 0
+            else:
+                reconfirm = 0
+        top2 = sorted((Decimal(repr(v)) for v in label_probs.values()), reverse=True)
+        if len(top2) >= 2 and top2[0] - top2[1] <= Decimal(repr(config.uncertainty_gap)):
+            r5 = True
+            m_rule5 = 0.0
+        next_probs = probs.next_label_probs
+        if Decimal(repr(next_probs.get(Label.STRESS, 0.0))) + Decimal(
+            repr(next_probs.get(Label.CRASH, 0.0))
+        ) > Decimal(repr(config.derisk_prob)):
+            r4 = True
+            m_rule4 = config.derisk_multiplier
+        reasons.update(
+            {
+                RuleId.R1: f"top={top.value}, probability={label_probs[top]}, qualifies={qualifies}",
+                RuleId.R2: f"challenger persistence {'met' if r2 else 'not met'} ({config.persistence_bars} bars)",
+                RuleId.R3: f"cooldown {'veto' if r3 else 'no veto'}; previous age={state.since_switch}",
+                RuleId.A1: "lower-cap takeover" if derisk else "no lower-cap takeover",
+                RuleId.R5: f"top two probabilities={top2[:2]}, inclusive gap={config.uncertainty_gap}",
+                RuleId.R4: f"next STRESS={next_probs.get(Label.STRESS, 0.0)}, CRASH={next_probs.get(Label.CRASH, 0.0)}; threshold > {config.derisk_prob}",
+            }
+        )
+    if cause is None:
+        reasons[RuleId.R6] = (
+            f"healthy streak={health.streak}/{config.health_recovery_bars}; operating={health.operating}"
+        )
+    new = SwitchState(
+        active=active,
+        challenger=challenger,
+        count=count,
+        since_switch=since,
+        health_streak=health.streak,
+        blocked=blocked,
+        reconfirm=reconfirm,
+    )
+    trace = (
+        RuleTrace(RuleId.R6, not health.operating, reasons[RuleId.R6]),
+        RuleTrace(RuleId.R1, r1, reasons[RuleId.R1]),
+        RuleTrace(RuleId.R2, r2, reasons[RuleId.R2]),
+        RuleTrace(RuleId.R3, r3, reasons[RuleId.R3]),
+        RuleTrace(RuleId.A1, switched and derisk, reasons[RuleId.A1]),
+        RuleTrace(RuleId.R5, r5, reasons[RuleId.R5]),
+        RuleTrace(RuleId.R4, r4, reasons[RuleId.R4]),
+    )
+    return SwitchOutcome(
+        new, active, switched, switched and derisk, health, blocked, m_rule4, m_rule5, trace
+    )
 
 
 def invalidate(state: SwitchState) -> SwitchState:
@@ -191,4 +293,6 @@ def invalidate(state: SwitchState) -> SwitchState:
     count 0, counted from the next bar. Called by decide after an invalidation hit on this bar.
     Blocking a blocked label restarts its count. ValueError, its message naming the `active`
     label, when no label is active."""
-    raise NotImplementedError
+    if state.active is None:
+        raise ValueError("no active")
+    return state.model_copy(update={"blocked": True, "reconfirm": 0})

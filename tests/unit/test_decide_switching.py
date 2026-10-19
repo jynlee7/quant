@@ -21,8 +21,6 @@ from quant.decide.health import Cause
 from quant.decide.switching import BarProbs
 from tests.support.decide import CAPS, SWITCHING, bar, probs, top
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 CALM, CHOP, STRESS, CRASH = Label.CALM_UP, Label.CHOP, Label.STRESS, Label.CRASH
 SICK = Cause.FEATURES  # an unhealthy bar
 
@@ -74,7 +72,6 @@ def many(label: Label, n: int, p: float = 0.8) -> list[Bar]:
 # --- rules 1-3: takeover, persistence, cooldown ---------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "D5", "C4")
 def test_a_three_bar_takeover_held_back_by_the_cooldown() -> None:
     # CHOP takes over cold at bar 2. CALM_UP (a higher cap: risk-increasing) qualifies from
@@ -89,7 +86,6 @@ def test_a_three_bar_takeover_held_back_by_the_cooldown() -> None:
     assert not out[9].derisk
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "D5")
 def test_an_interrupted_challenger_starts_counting_again() -> None:
     # CHOP is active from bar 2 and the cooldown is long over by bar 10. CALM_UP qualifies on
@@ -104,7 +100,6 @@ def test_an_interrupted_challenger_starts_counting_again() -> None:
     assert switches(out) == [2, 12]  # exactly 0.70 qualifies
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "A1")
 def test_equal_caps_are_risk_increasing() -> None:
     # Design call 4: only a lower cap is a de-risk. With STRESS capped like CHOP, CHOP -> STRESS
@@ -115,7 +110,6 @@ def test_equal_caps_are_risk_increasing() -> None:
     assert fired(out, "A1") == []
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C4")
 @pytest.mark.parametrize("label", list(Label))
 def test_a_cold_start_needs_three_bars_even_for_crash(label: Label) -> None:
@@ -126,7 +120,6 @@ def test_a_cold_start_needs_three_bars_even_for_crash(label: Label) -> None:
     assert fired(out, "A1") == []
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C4")
 def test_no_label_is_active_without_a_full_takeover() -> None:
     # The top label changes every two bars: nothing ever takes over from cold.
@@ -141,7 +134,6 @@ def test_no_label_is_active_without_a_full_takeover() -> None:
 # --- A1: de-risk after one bar, ignoring the cooldown ---------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "A1", "D5")
 def test_an_a1_derisk_switch_after_one_bar_ignores_the_cooldown() -> None:
     # CALM_UP takes over at 2. STRESS (cap 0.25 < 1.0) switches on its first qualifying bar,
@@ -155,14 +147,12 @@ def test_an_a1_derisk_switch_after_one_bar_ignores_the_cooldown() -> None:
     assert fired(out, "R3") == [7, 8, 9, 10]
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "A1")
 def test_a_derisk_challenger_still_needs_seventy_percent() -> None:
     out = run([*many(CALM, 3), top(STRESS, 0.69), top(STRESS, 0.69), top(STRESS, 0.70)])
     assert actives(out) == [None, None, CALM, CALM, CALM, STRESS]
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "A1")
 def test_a_derisk_into_chop_from_calm_up() -> None:
     # CHOP's cap (0.5) is below CALM_UP's (1.0): one bar, no cooldown.
@@ -174,7 +164,6 @@ def test_a_derisk_into_chop_from_calm_up() -> None:
 # --- health, rule 6 -------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C2")
 def test_rule_6_acts_on_its_bar_and_recovers_on_the_second_healthy_one() -> None:
     out = run([*many(CALM, 3), SICK, top(CALM), top(CALM), top(CALM)])
@@ -190,7 +179,6 @@ def test_rule_6_acts_on_its_bar_and_recovers_on_the_second_healthy_one() -> None
         assert 3 not in fired(out, rule)
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "D5")
 def test_an_unhealthy_bar_resets_the_challenger() -> None:
     head = many(CHOP, 10)
@@ -198,7 +186,6 @@ def test_an_unhealthy_bar_resets_the_challenger() -> None:
     assert switches(out) == [2, 15]
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "D5")
 def test_the_cooldown_advances_through_unhealthy_bars() -> None:
     # Switch at 2; unhealthy 3-5; CALM_UP qualifies 6, 7, 8 (3 bars at 8, but only 6 bars since
@@ -217,7 +204,6 @@ def test_the_cooldown_advances_through_unhealthy_bars() -> None:
 # --- rule 5: uncertainty --------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8")
 @pytest.mark.parametrize(
     ("dist", "uncertain"),
@@ -237,7 +223,6 @@ def test_rule_5_fires_within_the_gap_inclusive(dist: dict[Label, float], uncerta
     assert out[4].m_rule5 == 1.0  # the next bar is certain again: no hysteresis
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C4")
 def test_rule_5_fires_without_an_active_label() -> None:
     out = run([bar({CALM: 0.55, CHOP: 0.40, STRESS: 0.03, CRASH: 0.02})])
@@ -248,7 +233,6 @@ def test_rule_5_fires_without_an_active_label() -> None:
 # --- rule 4: early de-risk ------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8")
 @pytest.mark.parametrize(
     ("nxt", "derisk"),
@@ -271,7 +255,6 @@ def test_rule_4_halves_the_multiplier_on_its_bar(nxt: dict[Label, float], derisk
 # --- the trace ------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8")
 def test_every_bar_traces_every_rule_in_order() -> None:
     from quant.decide.switching import RuleId
@@ -287,7 +270,6 @@ def test_every_bar_traces_every_rule_in_order() -> None:
 # --- invalidation blocks --------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8")
 def test_an_invalidation_blocks_entries_until_a_fresh_three_bar_reconfirmation() -> None:
     # CALM_UP active at 2, invalidated after bar 4. Bars 5, 6, 7 qualify it again: the block
@@ -308,7 +290,6 @@ def test_an_invalidation_blocks_entries_until_a_fresh_three_bar_reconfirmation()
     assert switches(out) == [2]
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8")
 def test_a_reconfirmation_is_consecutive_and_needs_seventy_percent() -> None:
     seq = [*many(CALM, 5), top(CALM), top(CALM, 0.6), *many(CALM, 3)]
@@ -319,7 +300,6 @@ def test_a_reconfirmation_is_consecutive_and_needs_seventy_percent() -> None:
     assert [o.blocked for o in out][5:] == [True, True, True, True, False]
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8", "D5")
 def test_the_reconfirmation_ignores_the_cooldown() -> None:
     # Invalidated right after the takeover bar: bars 3, 4, 5 re-confirm, inside the cooldown.
@@ -327,7 +307,6 @@ def test_the_reconfirmation_ignores_the_cooldown() -> None:
     assert [o.blocked for o in out] == [False, False, False, True, True, False]
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8", "A1")
 def test_a_switch_away_and_a_takeover_back_clears_the_block() -> None:
     # Invalidated after 4; STRESS de-risks at 5 (the block goes with the switch); CALM_UP
@@ -338,7 +317,6 @@ def test_a_switch_away_and_a_takeover_back_clears_the_block() -> None:
     assert out[12].entries_allowed
 
 
-@RED
 @pytest.mark.spec("SPEC§7", "SPEC§8")
 def test_invalidate_needs_an_active_label() -> None:
     from quant.decide.switching import SwitchState, invalidate
@@ -350,7 +328,6 @@ def test_invalidate_needs_an_active_label() -> None:
 # --- the state and the inputs ---------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C4")
 def test_the_cold_state() -> None:
     from quant.decide.switching import SwitchState
@@ -360,7 +337,6 @@ def test_the_cold_state() -> None:
     assert (cold.health_streak, cold.blocked, cold.reconfirm) == (2, False, 0)
 
 
-@RED
 @pytest.mark.spec("SPEC§8")
 def test_step_refuses_bad_inputs() -> None:
     from quant.decide.switching import SwitchState, step
@@ -375,7 +351,6 @@ def test_step_refuses_bad_inputs() -> None:
         step(cold, top(CALM), cause=None, config=SWITCHING, caps=partial)
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "ARCH§4.3")
 def test_the_state_round_trips_through_canonical_json() -> None:
     from quant.core.canonical import canonical_dumps, canonical_loads
