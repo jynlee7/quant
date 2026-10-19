@@ -8,6 +8,7 @@ rather than against itself. scikit-learn's IsotonicRegression is the reference f
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -165,3 +166,35 @@ def covered_share(n: int, *, misses_every: int = 10) -> Bools:
     """Bar t's realized F1 is inside the interval forecast at t - 1 unless t % misses_every is
     0: over any run of whole tens of pairs, 90% coverage."""
     return np.arange(n) % misses_every != 0
+
+
+# --- B8b: real calibrations for sizing ---------------------------------------------------------
+# A series starting here ends, at 1,200 hourly bars, before the decide tests' decision in
+# 2016-11, so a calibration of it may serve that decision (T-NL2).
+SIZING_START = datetime(2016, 9, 1, 13, 30, tzinfo=UTC)
+SIZING_BARS = 1200
+
+
+@functools.cache
+def sizing_calibration(*, outcome_passes: bool = True, start: datetime = SIZING_START) -> Any:
+    """A real Calibration (`quant.eval.calibration.build_calibration`, r1's config) of
+    SIZING_BARS bars from `start`, as of the hour after the last: CALM_UP's forecast is the
+    square root of the true probability, so its raw metrics fail and isotonic knots recalibrate
+    it to a pass (P~ differs from P); CHOP's likewise. With `outcome_passes` the outcome check
+    covers 90% of bars and passes; otherwise every bar is covered, the check fails, and every
+    label is capped at the failed cap (C13)."""
+    from quant.core.calibration import CalibrationSource, r1_calibration_config
+    from quant.eval.calibration import build_calibration
+
+    n = SIZING_BARS
+    forecast, _ = forecaster(n, 5, distort=np.sqrt)
+    s = series(
+        n,
+        label_forecast=forecast,
+        covered=covered_share(n) if outcome_passes else None,
+        seed=5,
+        start=start,
+    )
+    return build_calibration(
+        s, as_of=after(n, start), source=CalibrationSource.BACKTEST, config=r1_calibration_config()
+    )

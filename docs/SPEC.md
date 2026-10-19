@@ -1,6 +1,6 @@
 # SPEC — SPY Regime Trader
 
-**Status:** APPROVED v1.6 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). v1.4 adds Jev, TypeSafe AI's typed-decision model, as a shadow advisor that is logged next to the HMM, scored only on forward paper bars and never affects a decision: layer L1s and invariant I7 (§1), §12a, and a known risk (§16). You approved it on 2026-10-13. v1.5 says that a resume after the kill switch re-bases peak equity to the equity at the resume, so the next 10% drawdown is measured from there (§10); you decided it on 2026-10-13. v1.5 also records your calls of 2026-10-14: a kill that can't finish leaves a broker-side stop under the shares it couldn't sell, a kill outside regular hours places one under any shares no stop covers, and a working exit for the whole position stands in for the stop for at most 5 minutes (§10). v1.6 spells out how B4 reads §4–§6: instability measured on the standardized rows, candidates whose restarts all fail set aside, inclusive sanity edges, the drift baseline every model records, and the filter's log-likelihood, missing bars, absorbing labels and entropy (2026-10-14). Each one is tagged where it lands.
+**Status:** APPROVED v1.7 (Gate 1 of 3) · 2026-10-05. v1.0 was approved as written: defaults D1–D13 confirmed, amendments A1–A4 accepted, and D11 stays a per-trade hit rate. v1.1 folds in the architecture's clarifications C1–C10, and v1.2 folds in the plan's clarifications C11–C17, all accepted 2026-10-05. v1.3 spells out how B3 reads §3: the one feature stream, how slot histories count sessions, and the exact statistics (2026-10-06). v1.4 adds Jev, TypeSafe AI's typed-decision model, as a shadow advisor that is logged next to the HMM, scored only on forward paper bars and never affects a decision: layer L1s and invariant I7 (§1), §12a, and a known risk (§16). You approved it on 2026-10-13. v1.5 says that a resume after the kill switch re-bases peak equity to the equity at the resume, so the next 10% drawdown is measured from there (§10); you decided it on 2026-10-13. v1.5 also records your calls of 2026-10-14: a kill that can't finish leaves a broker-side stop under the shares it couldn't sell, a kill outside regular hours places one under any shares no stop covers, and a working exit for the whole position stands in for the stop for at most 5 minutes (§10). v1.6 spells out how B4 reads §4–§6: instability measured on the standardized rows, candidates whose restarts all fail set aside, inclusive sanity edges, the drift baseline every model records, and the filter's log-likelihood, missing bars, absorbing labels and entropy (2026-10-14). v1.7 spells out how B8 reads §7–§9 where they are silent: flat playbooks, fixed stops and re-arming, when invalidation runs and how its block clears, the cooldown count, A1's caps, rule 6's causes, exact rule 4 and 5 edges, the deadband's exits, shadow-return costs and the single order per decision (2026-10-19). Each one is tagged where it lands.
 **Process:** brainstorm ✅ → spec ✅ → architecture ✅ → plan ✅ → **test-first build** ▶ → review → ship
 The spec, the architecture and the [plan](PLAN.md) are approved, and the build started 2026-10-05. Progress is in [BUILD_LOG.md](BUILD_LOG.md).
 
@@ -166,6 +166,14 @@ Five numeric features per bar, computed only from rows with `available_at < τ`:
 - **Required fields:** strategy, bounded params, entry, exit, `stop_loss` (ATR multiple, mandatory), `take_profit` (ATR multiple or none), `max_size` (fraction of equity, clamped to the label's hard cap), version, created_at, and `invalidation`. Invalidation conditions are typed and come from a fixed menu: `label_prob_below`, `close_below_ema`, `bars_in_trade_exceeds` and `trade_drawdown_exceeds`.
 - **Invalidation** exits the position and blocks new entries under that playbook until a fresh takeover re-confirms the label.
 - **CRASH** is flat in code. Its hard cap is 0, so no playbook can trade it.
+- **How B8 reads this section (v1.7):**
+  1. A `flat` playbook holds nothing, so its `stop_loss` and `take_profit` are null, its `max_size` is 0 and its invalidation list is empty. Every other strategy must give an ATR `stop_loss`. The key is required either way.
+  2. A stop is fixed at entry, at the entry decision's close minus `stop_loss` × ATR, and never trails. A take-profit is checked on each decision's close.
+  3. After a stop or a take-profit, a primitive enters again only after it has seen its own exit condition (trend: fast < slow; mean reversion: z ≥ −exit_z). So it can't re-enter on the next bar while the entry condition still holds.
+  4. Invalidation is checked on every bar in a trade, against the trade as it stands on that bar, before the exit signal. A bar that both invalidates and exits counts as an invalidation. An entry is refused (with no block) while `label_prob_below` or `close_below_ema` already holds.
+  5. The block clears when the label is confirmed afresh: either it is taken over again after a switch away, or the still-active label is again top with P ≥ 0.70 for 3 consecutive bars after the invalidation, with no cooldown.
+  6. The closing-bar decision never opens a trade. Exits and stops still work on it.
+  7. Front matter, `engine.yaml` and `risk.yaml` are read by one strict YAML loader that refuses repeated keys and malformed timestamps.
 - Opus writes and revises playbooks. The harness validates the schema, runs the gates and promotes. Opus never grades its own work.
 
 ## 8. Switching engine
@@ -184,6 +192,13 @@ Every bar is evaluated in this order:
 
 Rules 4–6 act on the bar that triggers them. They never wait for hysteresis.
 
+**How B8 reads this section (v1.7):**
+
+- **Takeover:** the challenger's 3-bar count keeps running during the cooldown, and the switch comes on the first bar where both conditions hold. The cooldown expires 7 decision bars after the switch bar.
+- **A1:** "lower-risk" means a lower hard cap in `risk.yaml`, and an equal cap counts as risk-increasing. A de-risk switch restarts the cooldown. With no active label (C4), even CRASH needs the full 3 bars.
+- **Rule 6:** an unhealthy bar has no label probabilities, so it resets the challenger's count, and the cooldown still runs. The bar is unhealthy when its features or its filter state are refused, its model was fit at or after τ, its calibration is as of τ or later, or the release fails to load. Normal operation resumes on the second consecutive healthy bar, and a cold start begins recovered. A drift freeze is not rule 6: it blocks entries and increases only.
+- **Rules 4 and 5:** "within 0.15" includes 0.15, and rule 4's "> 0.25" is strict. Both are compared exactly, on the decimal values the probabilities print as.
+
 ## 9. Sizing
 
 ```
@@ -195,6 +210,13 @@ target = min(cap[label], playbook.max_size, 0.25·f*) × P̃(active) × (1 − H
 - **P̃(active)** is the filtered probability of the active label after the calibration check below.
 - **The size is 0** in CRASH, when uncertain, while halted, while drift-frozen (for new entries), and whenever the playbook has no entry signal.
 - **Deadband:** the position is resized only when the gap between target and current is at least 10% of equity. Reductions forced by rules 4–6 or by risk limits always execute.
+- **How B8 reads this section (v1.7):**
+  - **The deadband:** an exit to 0 (signal exit, stop, take-profit, invalidation) is exempt, like a forced reduction. Otherwise a stub held under 10% would outlive its own exit rule. The 10% compares exact decimal values.
+  - **Shadow returns:** bar t's return is pos₍t−1₎ × (C_t / C_{t−1} − 1). A stop inside the bar exits at min(open, stop). The entry cost (`engine.yaml`'s `shadow_cost_bp`, 2 bp) is charged on the first bar held and the exit cost on the exit bar, so a round trip pays both sides on bars that count. B11 adds the fees from `costs.yaml`.
+  - **f\*:** f\* = max(0, mean − s/√n) / s², with s the sample s.d. It is 0 when n < 100, when s² isn't a positive normal float, or when the result isn't finite.
+  - **With no calibration at all,** every label fails (C13): its cap is 25% of the hard cap, and P̃ is the raw probability.
+  - **Drift freeze and the daily-loss lock:** neither lets the target exceed the current exposure.
+  - **Orders:** a decision sends at most one order, BUY or SELL, of at most 0.5× equity, in whole shares floored at the decision's close. The last decision that can fill caps the target at 0.5× (A3), and that cut is a forced reduction. The closing-bar decision only reduces.
 - **Calibration** (A4) must pass before P̃ can scale size above a floor:
   - per label: Brier score, Brier skill against the base rate, a 10-bin reliability curve, and ECE, all measured against the ex-post smoothed label;
   - outcome check: how often actual returns fall inside the one-bar-ahead predictive interval. It takes the central 90% interval for F1 over the latest 1,000 out-of-sample bars and passes when coverage is between 87.6% and 92.4%, the 99% binomial band. A failure caps every label at 25% of its cap (C13);

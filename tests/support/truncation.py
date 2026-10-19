@@ -64,6 +64,13 @@ calibration, with the calibration's as-of time as its Provenance, so T-NL2 holds
 τ that uses them. Their artifacts live in one session-wide, content-addressed directory
 (`lifecycle_artifacts`).
 
+**The decision layer (B8b).** `DecisionLayer` runs `decide()` itself, the pure core of ARCHITECTURE
+§4.1, under the governing model and calibration the lifecycle layers name, from a cold
+EngineState per run, with the risk verdicts on its own intents and a simulated account filled by
+them. Its records are DecisionRecords (canonical bytes) and its `state` the EngineState hash
+(ARCHITECTURE §13); its provenance is the later of the model's fit end and the calibration's
+as-of time.
+
 **The fixture model (B6 review).** Its rows are the first model's own
 (`quant.jobs.first_model.training_data`), read at τ = as_of = its fit_end, so the harness and
 production can't disagree on which bars feed a model or how returns pair.
@@ -115,17 +122,29 @@ from quant.data.market_db import HISTORY, BarStore
 from quant.data.policy import FIT_START, Purpose
 from quant.data.validate import MOVE_KIND, DataFlag
 from quant.data.view import PointInTimeView
+from quant.decide.config import ENGINE_YAML, EngineConfig, parse_engine_config
+from quant.decide.core import Account, DecideInputs, Flags, decide
+from quant.decide.edge import EdgeBook
+from quant.decide.playbook import Release, load_release
+from quant.decide.sizing import Caps
+from quant.decide.state import EngineState
 from quant.features.menu import FeatureConfig, r1_features
 from quant.features.scaler import Scaler
 from quant.features.stream import FeatureMatrix, FeatureStream, compute_features, features_for
 from quant.hmm.drift import r1_drift_thresholds
 from quant.hmm.filter import ForwardFilter
 from quant.hmm.labels import LabelTable, LabelThresholds, StateLabel, classify, r1_thresholds
-from quant.hmm.model import HmmModel, save_model
+from quant.hmm.model import HmmModel, load_model, save_model
 from quant.hmm.select import Candidate
 from quant.hmm.train import TrainConfig, TrainingData, r1_train_config, train_candidate
 from quant.jobs.first_model import training_data
-from quant.risk.engine import MemorySpentApprovals, RiskApprovedOrder, RiskEngine, Veto
+from quant.risk.engine import (
+    MemorySpentApprovals,
+    RiskApprovedOrder,
+    RiskEngine,
+    RiskVerdict,
+    Veto,
+)
 from quant.risk.limits import RiskConfig
 from quant.store.ops import OpsStore
 from tests.support.bars import SYMBOL, revise_close, synthetic_days
@@ -193,8 +212,9 @@ CALIBRATION_GRID: Final = tuple(k / 20 for k in range(21))
 # calm_d 1.5, which labels its two states CALM_UP and CHOP (`lifecycle_spec`).
 START_THRESHOLDS: Final = LabelThresholds(crash_v=1.75, stress_v=1.25, stress_d=-0.5, calm_d=1.5)
 
-# The full tier's real bars (PLAN P4): the repository's market.db.
-MARKET_DB: Final = Path(__file__).resolve().parents[2] / "var" / "market.db"
+# The repository root, and the full tier's real bars (PLAN P4): the repository's market.db.
+REPO: Final = Path(__file__).resolve().parents[2]
+MARKET_DB: Final = REPO / "var" / "market.db"
 # An as_of that knows every version a market.db holds, for reading one to build a world.
 KNOWS_ALL: Final = datetime(2100, 1, 1, tzinfo=UTC)
 
@@ -769,26 +789,37 @@ class RiskLayer:
                     order,
                     context(clock.now(), equity=RISK_EQUITY, bid=price, ask=price, limit=price),
                 )
-                output: dict[str, Any] = {"intent": order.model_dump(mode="python")}
-                if isinstance(verdict, Veto):
-                    output.update(
-                        verdict="veto",
-                        check=verdict.check,
-                        reason=verdict.reason,
-                        halts=verdict.halts,
-                    )
-                else:
-                    output.update(
-                        verdict="approved" if isinstance(verdict, RiskApprovedOrder) else "pending"
-                    )
-                    for key in ("quantity", "limit_price", "notional", "issued_at", "expires_at"):
-                        output[key] = getattr(verdict, key)
-                    if isinstance(verdict, RiskApprovedOrder):
-                        output.update(flagged=verdict.flagged, halts=verdict.halts)
+                output: dict[str, Any] = {
+                    "intent": order.model_dump(mode="python"),
+                    **verdict_output(verdict),
+                }
                 records.append(
                     cached_record(d.tau, self.name, output, state=sha256_hex(engine.state))
                 )
         return records
+
+
+def verdict_output(verdict: RiskVerdict) -> dict[str, Any]:
+    """A risk verdict as the harness records it, without its token and µs ids: for a
+    RiskApprovedOrder {"verdict": "approved", "quantity", "limit_price", "notional",
+    "issued_at", "expires_at", "flagged", "halts"}; for a PendingApproval {"verdict": "pending",
+    "quantity", "limit_price", "notional", "issued_at", "expires_at"}; for a Veto {"verdict":
+    "veto", "check", "reason", "halts"}."""
+    if isinstance(verdict, Veto):
+        return {
+            "verdict": "veto",
+            "check": verdict.check,
+            "reason": verdict.reason,
+            "halts": verdict.halts,
+        }
+    output: dict[str, Any] = {
+        "verdict": "approved" if isinstance(verdict, RiskApprovedOrder) else "pending"
+    }
+    for key in ("quantity", "limit_price", "notional", "issued_at", "expires_at"):
+        output[key] = getattr(verdict, key)
+    if isinstance(verdict, RiskApprovedOrder):
+        output.update(flagged=verdict.flagged, halts=verdict.halts)
+    return output
 
 
 class ActionsLayer:
@@ -1207,7 +1238,7 @@ class CalibrationLayer:
     shows.
 
     The filter layer still runs the fixture model; the governing model's own filter, swapped at
-    each activation, is the engine's (B8, B14)."""
+    each activation, runs inside `decide()` in the decision layer (B8b)."""
 
     name: Final = "calibration"
 
@@ -1261,6 +1292,190 @@ class CalibrationLayer:
                 cached_record(d.tau, self.name, output, Provenance(digest, calibration.as_of))
             )
         return records
+
+
+# --- the decision layer (B8b) ------------------------------------------------------------------
+# The decision layer's code commit, for its records: any fixed string.
+HARNESS_COMMIT: Final = "0" * 40
+# The decision layer's seeded edge (spec §9: the first model's accumulators come from a fit-window
+# backtest, B11): a synthetic sequence with a positive edge for each trading label, so f* > 0 and
+# decide sizes and trades in the synthetic world. Synthetic numbers, never P&L on DEV.
+EDGE_SEED_RETURNS: Final = (0.003, -0.001) * 100
+
+
+def harness_edge() -> EdgeBook:
+    """The EdgeBook every decision run starts from: EDGE_SEED_RETURNS for CALM_UP and CHOP,
+    nothing for the flat labels."""
+    return EdgeBook.seeded({Label.CALM_UP: EDGE_SEED_RETURNS, Label.CHOP: EDGE_SEED_RETURNS})
+
+
+def harness_caps(config: RiskConfig) -> Caps:
+    """risk.yaml's limits as the driver hands them to decide (decide never imports risk)."""
+    return Caps(
+        label_caps={label: config.label_caps.cap(label) for label in Label},
+        max_position=config.max_gross_exposure,
+        overnight_cap=config.overnight_cap,
+        single_order_cap=config.single_order_cap,
+    )
+
+
+@cache
+def harness_release() -> Release:
+    """The repository's release r1 (strategy.md and playbooks/)."""
+    return load_release(REPO)
+
+
+@cache
+def harness_engine() -> EngineConfig:
+    """The committed config/engine.yaml."""
+    return parse_engine_config((REPO / ENGINE_YAML).read_bytes())
+
+
+class DecisionLayer:
+    """`decide()` (B8b; ARCHITECTURE §4.1, §13), the engine loop the other layers lead up to,
+    closing B5's open item "replace the per-layer records with DecisionRecords and state
+    hashes" and B7's "the filter layer still runs the fixture model".
+
+    Per run: one `EngineState.cold(engine.switching, edge=harness_edge())`, a simulated account
+    of RISK_EQUITY (fixed) holding `position` shares (0 at the start), and a fresh
+    `RiskEngine(config)` in PAPER mode on its own SimClock with MemorySpentApprovals, as the risk
+    layer runs one. Per decision, in order:
+
+    - a decision whose upstream refit record is cold (before the activation) records
+      {"decision": null}, cold, and leaves the state as it is;
+    - otherwise `decide(state, self.view_for(source, d), inputs)` under the **governing model**
+      (`model_for`: the refit record's model pointer, loaded from `artifacts / "models"`) and
+      calibration (`calibration_for`: the refit record's calibration pointer, from
+      `artifacts / "calibrations"`), r1's release, the committed engine.yaml, the caps
+      (`harness_caps`), the account, and the flags (drift_frozen from the refit record's
+      "frozen"; never halted, locked or missed), with HARNESS_COMMIT;
+    - each intent is checked as the risk layer checks its seeded one: the clock moves to
+      `d.executes_at` + 1 s, the engine starts that session with RISK_EQUITY when it is later
+      than its current one, and the context has the account's position in broker and book,
+      RISK_EQUITY, a quote bid = ask = limit = the record's price, `healthy` the record's
+      operating, `drift_frozen` the flag. An approved order fills at once at that price: a BUY
+      adds its quantity to the position, a SELL takes the approved quantity off;
+    - the record is the DecisionRecord with those verdicts (`with_verdicts`, each
+      `verdict_output`), its provenance the later of the model's (hash, fit_end) and the
+      calibration's (hash, as_of), so T-NL2 needs both before τ; its `state` is the new
+      EngineState's `state_hash()`.
+
+    `view_for`, `model_for` and `calibration_for` are what planted leaks override."""
+
+    name: Final = "decide"
+
+    def __init__(
+        self,
+        *,
+        risk: RiskConfig | None = None,
+        artifacts: Path | None = None,
+    ) -> None:
+        self.risk = risk_config() if risk is None else risk
+        self._artifacts = artifacts
+
+    @property
+    def artifacts(self) -> Path:
+        return lifecycle_artifacts() if self._artifacts is None else self._artifacts
+
+    def view_for(self, source: Source, d: Decision) -> PointInTimeView:
+        """The view decide reads: `source.view(d.tau)`."""
+        return source.view(d.tau)
+
+    def model_for(self, d: Decision, refit: Record) -> HmmModel:
+        """The model governing at τ: the refit record's pointer, loaded once per hash."""
+        return _model_at(self.artifacts / "models" / str(refit.output["model"]))
+
+    def calibration_for(self, d: Decision, refit: Record) -> Calibration | None:
+        """The calibration governing at τ: the refit record's pointer, or None."""
+        digest = refit.output.get("calibration")
+        return None if digest is None else _calibration(self.artifacts / "calibrations" / digest)
+
+    def run(
+        self,
+        source: Source,
+        decisions: Sequence[Decision],
+        upstream: Mapping[str, Sequence[Record]],
+    ) -> list[Record]:
+        if not decisions:
+            return []
+        release, engine_config = harness_release(), harness_engine()
+        caps = harness_caps(self.risk)
+        state = EngineState.cold(engine_config.switching, edge=harness_edge())
+        position = 0
+        clock = SimClock(decisions[0].tau)
+        risk = RiskEngine(
+            self.risk,
+            clock=clock,
+            mode=TradingMode.PAPER,
+            calendar=TradingCalendar.xnys(),
+            spent=MemorySpentApprovals(),
+        )
+        records = []
+        # Records, verdicts and state hashes are compared, not the logs.
+        with capture_logs():
+            for d, refit in zip(decisions, upstream["refit"], strict=True):
+                if refit.cold:
+                    records.append(cached_record(d.tau, self.name, {"decision": None}, cold=True))
+                    continue
+                model = self.model_for(d, refit)
+                calibration = self.calibration_for(d, refit)
+                frozen = bool(refit.output["frozen"])
+                inputs = DecideInputs(
+                    release=release,
+                    model=model,
+                    calibration=calibration,
+                    engine=engine_config,
+                    caps=caps,
+                    decision=d,
+                    account=Account(equity=RISK_EQUITY, position=position),
+                    flags=Flags(drift_frozen=frozen),
+                    code_commit=HARNESS_COMMIT,
+                )
+                outcome = decide(state, self.view_for(source, d), inputs)
+                verdicts = []
+                price = outcome.record.target.price
+                for order in outcome.intents:
+                    assert price is not None, "decide sized an intent without a price"
+                    clock.advance_to(d.executes_at + timedelta(seconds=1))
+                    day = clock.now().date()
+                    if risk.state.session is None or day > risk.state.session:
+                        risk.start_session(day, equity=RISK_EQUITY)
+                    verdict = risk.check(
+                        order,
+                        context(
+                            clock.now(),
+                            position=position,
+                            equity=RISK_EQUITY,
+                            bid=price,
+                            ask=price,
+                            limit=price,
+                            healthy=outcome.record.health.operating,
+                            drift_frozen=frozen,
+                        ),
+                    )
+                    verdicts.append(verdict_output(verdict))
+                    if isinstance(verdict, RiskApprovedOrder):
+                        position += (
+                            verdict.quantity if order.side is Side.BUY else -verdict.quantity
+                        )
+                record = outcome.record.with_verdicts(verdicts)
+                # The record names both artifacts by hash; the provenance is the later one.
+                provenance = Provenance(record.model_hash, model.fit_end)
+                if calibration is not None and calibration.as_of > model.fit_end:
+                    assert record.calibration_hash is not None
+                    provenance = Provenance(record.calibration_hash, calibration.as_of)
+                records.append(
+                    cached_record(d.tau, self.name, record, provenance, record.state_after)
+                )
+                state = outcome.state
+        return records
+
+
+@lru_cache(maxsize=64)
+def _model_at(directory: Path) -> HmmModel:
+    """`load_model(directory)`, once per directory: a directory is named by the model's
+    artifact hash, which `load_model` checks."""
+    return load_model(directory)
 
 
 @lru_cache(maxsize=256)
@@ -1401,8 +1616,9 @@ def fixture_model(fit_end: datetime, spec: WorldSpec = SYNTHETIC) -> HmmModel:
 def default_registry(world: World, *, risk_seed: int = 0) -> Registry:
     """The clean decision path in order: ViewLayer, FeaturesLayer(world.config, world.scaler,
     activation=world.activation), FilterLayer(world.model, activation=world.activation),
-    RefitLayer(world) and CalibrationLayer() (B7b), RiskLayer(the committed risk.yaml,
-    seed=risk_seed), ActionsLayer. Later steps add their layers here (CLAUDE.md rule 4)."""
+    RefitLayer(world) and CalibrationLayer() (B7b), DecisionLayer() (B8b), RiskLayer(the
+    committed risk.yaml, seed=risk_seed), ActionsLayer. Later steps add their layers here
+    (CLAUDE.md rule 4)."""
     return Registry(
         (
             ViewLayer(),
@@ -1410,6 +1626,7 @@ def default_registry(world: World, *, risk_seed: int = 0) -> Registry:
             FilterLayer(world.model, activation=world.activation),
             RefitLayer(world),
             CalibrationLayer(),
+            DecisionLayer(),
             RiskLayer(risk_config(), seed=risk_seed),
             ActionsLayer(),
         )

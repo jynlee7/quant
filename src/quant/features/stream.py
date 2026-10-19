@@ -87,7 +87,7 @@ from __future__ import annotations
 import bisect
 import math
 import statistics
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Final
@@ -230,23 +230,7 @@ class FeatureStream:
         close and its place in the histories.
         """
         state, config = self._state, self._config
-        t_open = to_us(bar.t_open)
-        try:  # float64 from here on, so an int volume or price never reaches the state
-            open_, high, low, close, volume = (
-                float(value) for value in (bar.open, bar.high, bar.low, bar.close, bar.volume)
-            )
-        except (TypeError, ValueError, OverflowError):
-            raise FeatureError(f"invalid feature bar at {bar.t_open.isoformat()}") from None
-        if (
-            not bar.complete
-            or (state.last_t_open is not None and t_open <= state.last_t_open)
-            or any(not math.isfinite(p) or p <= 0 for p in (open_, high, low, close))
-            or low > min(open_, close)
-            or high < max(open_, close)
-            or not math.isfinite(volume)
-            or volume < 0
-        ):
-            raise FeatureError(f"invalid or incomplete feature bar at {bar.t_open.isoformat()}")
+        t_open, _, high, low, close, volume = validate_bar(bar, state.last_t_open)
 
         # Everything is computed before the state changes, so a refused bar leaves it as it was.
         n = config.slot_sessions
@@ -279,8 +263,8 @@ class FeatureStream:
             values.append(_log(volume / median_volume) if median_volume > 0 else math.nan)
         fast, slow = state.ema_fast, state.ema_slow
         if config.trend is not None:
-            fast = _ema(close, fast, config.trend.fast)
-            slow = _ema(close, slow, config.trend.slow)
+            fast = ema(close, fast, config.trend.fast)
+            slow = ema(close, slow, config.trend.slow)
             if not all(math.isfinite(ema) and ema > 0 for ema in (fast, slow)):
                 raise FeatureError(f"feature bar at {bar.t_open.isoformat()} overflows float64")
             values.append(_log(fast / slow))
@@ -353,7 +337,8 @@ class FeatureStream:
         only when its oldest number is 1 and only in one slot (the stream's first bar has no
         return or range), else one per number.
         """
-        if state.config_hash != config.config_hash():
+        stream = cls(config)
+        if state.config_hash != stream._state.config_hash:
             raise ConfigError("feature state belongs to a different config")
         slots = {slot.value for slot in Slot}
         for history, enabled in (
@@ -433,8 +418,16 @@ class FeatureStream:
             )
         ):
             raise ConfigError("an empty stream must have empty histories")
-        stream = cls(config)
-        stream._state = state.model_copy(deep=True)
+        # All leaves are immutable scalars; detach histories without traversing each leaf.
+        stream._state = state.model_copy(
+            update={
+                "returns": list(state.returns),
+                "slot_numbers": {k: list(v) for k, v in state.slot_numbers.items()},
+                "slot_returns": {k: list(v) for k, v in state.slot_returns.items()},
+                "slot_ranges": {k: list(v) for k, v in state.slot_ranges.items()},
+                "slot_volumes": {k: list(v) for k, v in state.slot_volumes.items()},
+            }
+        )
         return stream
 
 
@@ -550,7 +543,14 @@ def compute_features(bars: Sequence[HourlyBar], config: FeatureConfig) -> Featur
     )
 
 
-def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar: BarSpec) -> Floats:
+def features_for(
+    stream: FeatureStream,
+    view: PointInTimeView,
+    symbol: str,
+    bar: BarSpec,
+    *,
+    on_row: Callable[[FeatureRow], None] | None = None,
+) -> Floats:
     """The feature vector for the decision on `bar`, read through the point-in-time view (I1).
 
     Reads `symbol`'s hourly bars from `view` with purpose OPERATE: all of them for a stream that
@@ -558,6 +558,7 @@ def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar:
     and oldest first, each of them that opens at or before `bar.t_open`; later ones are left for
     later decisions. Incomplete bars are skipped as missing data, as in `compute_features`.
     Returns the `vector()` of `bar`'s row.
+    If supplied, `on_row` observes every consumed row in order, including partial progress.
 
     Raises FeatureError, a model error (rule 6 applies), when `bar` isn't among the bars fed:
     it isn't visible in the view (missing, or not yet available at the view's tau), it is
@@ -566,17 +567,58 @@ def features_for(stream: FeatureStream, view: PointInTimeView, symbol: str, bar:
     propagates, and feeding stops there). Bars consumed before an error stay consumed, so a
     caller that keeps the stream's snapshot keeps them.
     """
-    last = stream.last_t_open
+
+    def update(candidate: HourlyBar) -> FeatureRow:
+        row = stream.update(candidate)
+        if on_row is not None:
+            on_row(row)
+        return row
+
+    return feed_through(stream.last_t_open, update, view, symbol, bar).vector()
+
+
+def feed_through[T](
+    last: datetime | None,
+    update: Callable[[HourlyBar], T],
+    view: PointInTimeView,
+    symbol: str,
+    bar: BarSpec,
+) -> T:
+    """Feed visible complete bars through the decision bar, preserving partial progress."""
     since = None if last is None else last + timedelta(microseconds=1)
     for candidate in view.hourly(symbol, purpose=Purpose.OPERATE, since=since):
         if candidate.t_open > bar.t_open:
             break
         if not candidate.complete:
             continue
-        row = stream.update(candidate)
+        row = update(candidate)
         if candidate.t_open == bar.t_open:
-            return row.vector()
+            return row
     raise FeatureError(f"decision bar at {bar.t_open.isoformat()} is missing or already consumed")
+
+
+def validate_bar(
+    bar: HourlyBar, last_t_open: int | None
+) -> tuple[int, float, float, float, float, float]:
+    """Validate ordering, completeness and float64 OHLCV before either stream mutates."""
+    t_open = to_us(bar.t_open)
+    try:  # float64 from here on, so an int volume or price never reaches the state
+        open_, high, low, close, volume = (
+            float(value) for value in (bar.open, bar.high, bar.low, bar.close, bar.volume)
+        )
+    except (TypeError, ValueError, OverflowError):
+        raise FeatureError(f"invalid feature bar at {bar.t_open.isoformat()}") from None
+    if (
+        not bar.complete
+        or (last_t_open is not None and t_open <= last_t_open)
+        or any(not math.isfinite(p) or p <= 0 for p in (open_, high, low, close))
+        or low > min(open_, close)
+        or high < max(open_, close)
+        or not math.isfinite(volume)
+        or volume < 0
+    ):
+        raise FeatureError(f"invalid or incomplete feature bar at {bar.t_open.isoformat()}")
+    return t_open, open_, high, low, close, volume
 
 
 def freeze_arrays(instance: object, *names: str) -> None:
@@ -610,7 +652,8 @@ def _last(history: list[float], count: int) -> list[float]:
     return history[max(0, len(history) - count) :]
 
 
-def _ema(close: float, previous: float | None, span: int) -> float:
+def ema(close: float, previous: float | None, span: int) -> float:
+    """EMA of the close, seeded by the first observation."""
     if previous is None:
         return close
     alpha = 2.0 / (span + 1)

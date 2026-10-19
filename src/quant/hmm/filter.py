@@ -381,8 +381,13 @@ class ForwardFilter:
         K entries, or exp(log_probs) doesn't sum to 1 within 1e-9.
         """
         result = cls(model)
+        result.restore_state(state)
+        return result
+
+    def restore_state(self, state: FilterState) -> None:
+        """Restore a posterior using the same checks as restore, reusing model constants."""
         if (
-            state.model_hash != result._model_hash
+            state.model_hash != self._model_hash
             or state.bars < 0
             or (state.log_probs is None) != (state.bars == 0)
         ):
@@ -391,6 +396,8 @@ class ForwardFilter:
             logs = np.array(
                 [float("-inf") if p is None else p for p in state.log_probs], dtype=np.float64
             )
-            result._log_probs = _check_log_probs(logs, model.params.n_states)
-        result._bars = state.bars
-        return result
+            logs = _check_log_probs(logs, self._model.params.n_states)
+        else:
+            logs = None
+        self._log_probs = logs
+        self._bars = state.bars

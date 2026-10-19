@@ -13,12 +13,12 @@ import subprocess
 from pathlib import Path
 from typing import Final
 
-import yaml
 from pydantic import Field, ValidationError, model_validator
 
 from quant.core.errors import ConfigError
 from quant.core.model import StrictModel
 from quant.core.regime import Label
+from quant.core.yaml import strict_load
 
 RISK_YAML: Final = "config/risk.yaml"
 """Where the file lives, relative to the repository root."""
@@ -150,16 +150,16 @@ class RiskConfig(StrictModel):
 
 
 def parse_risk_config(data: bytes) -> RiskConfig:
-    """The RiskConfig in `data`, YAML text (yaml.safe_load). ConfigError, naming the problem,
+    """The RiskConfig in `data`, YAML text (strict_load). ConfigError, naming the problem,
     for text that isn't UTF-8 or YAML, a top level that isn't a mapping, an unknown or missing
     key, a value of the wrong type, or limits that fail RiskConfig's checks. YAML integers are
     accepted for float fields; nothing else is coerced."""
     try:
-        values = yaml.safe_load(data.decode("utf-8"))
+        values = strict_load(data.decode("utf-8"))
         if not isinstance(values, dict):
             raise ConfigError("risk.yaml must contain a mapping")
         return RiskConfig.model_validate(values)
-    except (UnicodeError, yaml.YAMLError, ValidationError) as exc:
+    except (UnicodeError, ValidationError) as exc:
         raise ConfigError(f"invalid risk.yaml: {exc}") from exc
 
 

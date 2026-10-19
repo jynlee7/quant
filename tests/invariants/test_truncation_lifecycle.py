@@ -91,6 +91,7 @@ def _full_run() -> Any:
 
 @pytest.mark.spec("T-NL1", "T-NL2")
 def test_the_lifecycle_layers_follow_the_filter_in_the_default_registry() -> None:
+    # B8b: the decision layer follows them, before the risk layer.
     w = world()
     assert default_registry(w).names == (
         "view",
@@ -98,6 +99,7 @@ def test_the_lifecycle_layers_follow_the_filter_in_the_default_registry() -> Non
         "filter",
         "refit",
         "calibration",
+        "decide",
         "risk",
         "actions",
     )
