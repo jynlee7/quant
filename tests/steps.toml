@@ -49,3 +49,13 @@ covers = [
     "ARCH§6.2", "ARCH§7.1", "ARCH§7.3", "ARCH§7.5", "ARCH§9.2",
     "SPEC§9", "A4", "C13", "ARCH§7.4", "T-NL1", "T-NL2",
 ]
+
+# B8a (release r1 and its loader, the playbook schema, engine.yaml, the indicators and the
+# primitives with ATR stops, take-profit, re-arm and invalidation, health's rule 6, switching's
+# rules 1-5, A1 and invalidation blocks) claims these; B8b adds sizing with C12's Kelly, intents,
+# EngineState, DecisionRecord, decide() and the decision layer of T-NL1 and T-NL2.
+[steps.B8]
+covers = [
+    "SPEC§7", "SPEC§8", "SPEC§9", "D2", "D5", "D8", "D9", "A1", "C2", "C4", "C6", "C12", "P7",
+    "PLAN§5", "ARCH§4.2", "ARCH§4.3", "ARCH§9.2",
+]

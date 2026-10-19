@@ -1,0 +1,25 @@
+# Engine configuration (ARCHITECTURE §9.2): switching thresholds, sizing constants and timing.
+# L3 config: it changes only through a reviewed commit, its hash goes into every DecisionRecord,
+# and the engine refuses to start if the file differs from the committed version.
+
+# Switching (SPEC §8, A1, D5). Probabilities are filtered label probabilities.
+switching:
+  takeover_prob: 0.70         # rules 1-3: a challenger takes over at P >= 0.70 as the top label ...
+  persistence_bars: 3         # ... on 3 consecutive bars (1 for a lower-cap label, A1) ...
+  cooldown_bars: 7            # ... once 7 decision bars have passed since the last switch (D5)
+  derisk_prob: 0.25           # rule 4: next-bar P(STRESS) + P(CRASH) > 0.25 ...
+  derisk_multiplier: 0.5      # ... caps the size multiplier at 0.5
+  uncertainty_gap: 0.15       # rule 5: top two label probabilities within 0.15: size 0
+  health_recovery_bars: 2     # rule 6: normal operation resumes on the 2nd healthy bar
+
+# Sizing (SPEC §9, C12).
+sizing:
+  kelly_fraction: 0.25        # target uses 0.25 x f*
+  min_edge_bars: 100          # f* = 0 with fewer counted shadow-return bars
+  deadband: 0.10              # resize only when |target - current| >= 0.10 of equity
+  shadow_cost_bp: 2.0         # charged per change of shadow position (ARCHITECTURE §10)
+
+# Timing (D2): minutes after a bar closes.
+timing:
+  feed_delay_min: 15          # the bar is available
+  decision_delay_min: 16      # the decision runs
