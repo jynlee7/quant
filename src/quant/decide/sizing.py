@@ -48,13 +48,16 @@ Everything here is pure. Comparisons on configured thresholds are exact on the d
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
+from fractions import Fraction
 from typing import Final
 
 from pydantic import Field
 
-from quant.core.calibration import Calibration, r1_calibration_config
+from quant.core.calibration import PROBABILITY_SLACK, Calibration, r1_calibration_config
+from quant.core.canonical import sha256_hex
 from quant.core.model import StrictModel
 from quant.core.regime import Label
 from quant.decide.config import SizingConfig
@@ -83,11 +86,15 @@ class Caps(StrictModel):
     def cap(self, label: Label | None) -> float:
         """`label_caps[label]`, or 0.0 for None (no active label sizes nothing). ValueError
         when `label_caps` doesn't hold every Label exactly once with a value in [0, 1]."""
-        raise NotImplementedError
+        if set(self.label_caps) != set(Label) or any(
+            not 0.0 <= v <= 1.0 for v in self.label_caps.values()
+        ):
+            raise ValueError("label_caps must hold every Label in [0, 1]")
+        return 0.0 if label is None else float(self.label_caps[label])
 
     def caps_hash(self) -> str:
         """`quant.core.canonical.sha256_hex(self)`."""
-        raise NotImplementedError
+        return sha256_hex(self)
 
 
 @dataclass(frozen=True)
@@ -136,7 +143,41 @@ def size(
     `label_prob` or `entropy` lies outside [0, 1] (`label_prob` within the calibration's
     rounding slack is clipped, as `Calibration.calibrated` clips it), or `f_star` is negative;
     ModelError from `Calibration.calibrated` for a probability it refuses."""
-    raise NotImplementedError
+    if playbook.label != label:
+        raise ValueError("playbook must be the label's")
+    if not 0.0 <= cap <= 1.0:
+        raise ValueError("cap must be in [0, 1]")
+    if not (-PROBABILITY_SLACK <= label_prob <= 1 + PROBABILITY_SLACK):
+        raise ValueError("label_prob must be a probability")
+    if not 0.0 <= entropy <= 1.0:
+        raise ValueError("entropy must be in [0, 1]")
+    if not f_star >= 0:
+        raise ValueError("f_star must be >= 0")
+    if calibration is None:
+        frac = NO_CALIBRATION_CAP
+        p = min(1.0, max(0.0, float(label_prob)))
+    else:
+        frac = calibration.cap_fraction(label)
+        p = calibration.calibrated(label, float(label_prob))
+    kelly = config.kelly_fraction * f_star
+    base = min(cap * frac, playbook.max_size, kelly)
+    value = base * p * (1.0 - entropy) * m_rule4 * m_rule5
+    value = min(1.0, max(0.0, value))
+    return Sizing(
+        label,
+        cap,
+        frac,
+        playbook.max_size,
+        f_star,
+        kelly,
+        base,
+        float(label_prob),
+        p,
+        entropy,
+        m_rule4,
+        m_rule5,
+        value,
+    )
 
 
 class ZeroReason(StrEnum):
@@ -182,14 +223,43 @@ def target(
     None, BLOCKED, OUT_OF_POSITION when not `in_position`); else `size(active, cap=caps.cap(
     active), ...)` and its value. `playbook`, `label_prob` and `entropy` may be None only when a
     ZeroReason applies; otherwise ValueError naming the missing one. Pure."""
-    raise NotImplementedError
+    for cond, reason in (
+        (halted, ZeroReason.HALTED),
+        (not operating, ZeroReason.UNHEALTHY),
+        (active is None, ZeroReason.NO_ACTIVE),
+        (blocked, ZeroReason.BLOCKED),
+        (not in_position, ZeroReason.OUT_OF_POSITION),
+    ):
+        if cond:
+            return Target(0.0, reason, None)
+    if active is None:
+        return Target(0.0, ZeroReason.NO_ACTIVE, None)
+    if playbook is None:
+        raise ValueError("playbook is required")
+    if label_prob is None:
+        raise ValueError("label_prob is required")
+    if entropy is None:
+        raise ValueError("entropy is required")
+    s = size(
+        active,
+        playbook=playbook,
+        cap=caps.cap(active),
+        calibration=calibration,
+        f_star=f_star,
+        label_prob=label_prob,
+        entropy=entropy,
+        m_rule4=m_rule4,
+        m_rule5=m_rule5,
+        config=config,
+    )
+    return Target(s.value, None, s)
 
 
 def exceeds_deadband(target: float, current: float, deadband: float) -> bool:
     """|target - current| >= deadband, exactly on the decimal values: `abs(Fraction(repr(
     target)) - Fraction(repr(current))) >= Fraction(repr(deadband))`, so 0.35 against 0.25 is a
     gap of exactly 0.10 and resizes (float subtraction gives 0.09999999999999998)."""
-    raise NotImplementedError
+    return abs(_x(target) - _x(current)) >= _x(deadband)
 
 
 @dataclass(frozen=True)
@@ -236,4 +306,20 @@ def rebalance(
     it. ValueError, its message naming it, when
     `target`, `current` or `ceiling` isn't finite and >= 0 (the system is long or flat, D9).
     Pure."""
-    raise NotImplementedError
+    for name, v in (("target", target), ("current", current), ("ceiling", ceiling)):
+        if not (math.isfinite(v) and v >= 0):
+            raise ValueError(f"{name} must be finite and >= 0")
+    t = min(target, ceiling)
+    limited = False
+    if (frozen or locked or reduce_only) and t > current:
+        t = current
+        limited = True
+    forced = _x(t) < _x(current) and (rule_forced or halted or _x(current) > _x(ceiling))
+    if t != current and (forced or t == 0.0 or exceeds_deadband(t, current, deadband)):
+        return Rebalance(t, True, ceiling, limited, forced, False)
+    return Rebalance(current, False, ceiling, limited, forced, t != current)
+
+
+def _x(v: float) -> Fraction:
+    """Exact decimal value, independent of the ambient decimal context."""
+    return Fraction(repr(float(v)))

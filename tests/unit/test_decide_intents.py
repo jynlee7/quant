@@ -33,7 +33,6 @@ from tests.support.risk import (
     last_fillable,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
 STOP = 95.0
 
 
@@ -59,7 +58,6 @@ def _order(**overrides: object) -> OrderIntent | None:
 # --- one order, whole shares -----------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "SPEC§10")
 def test_a_full_entry_scales_in_at_half_of_equity_per_order() -> None:
     first = _order()
@@ -72,7 +70,6 @@ def test_a_full_entry_scales_in_at_half_of_equity_per_order() -> None:
     assert _order(shares=1000) is None  # there
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "SPEC§10", "D9")
 def test_a_full_exit_also_takes_two_orders_and_never_sells_more_than_is_held() -> None:
     first = _order(desired=0.0, shares=1000)
@@ -85,7 +82,6 @@ def test_a_full_exit_also_takes_two_orders_and_never_sells_more_than_is_held() -
     assert (last.side, last.quantity) == (Side.SELL, 37)
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "SPEC§10")
 def test_shares_are_whole_and_floored_on_decimal_values() -> None:
     from quant.decide.intents import target_shares
@@ -104,7 +100,6 @@ def test_shares_are_whole_and_floored_on_decimal_values() -> None:
             target_shares(**kwargs)  # type: ignore[arg-type]
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2")
 def test_no_intent_when_no_whole_share_moves() -> None:
     assert _order(desired=0.0005) is None  # half a share
@@ -117,7 +112,6 @@ def test_no_intent_when_no_whole_share_moves() -> None:
 # --- the decision's times ----------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("A3", "ARCH§5", "SPEC§10")
 @pytest.mark.parametrize(
     ("day", "et"), [(DAY, (15, 46)), (HALF_DAY, (12, 46))], ids=["full_day", "half_day"]
@@ -138,7 +132,6 @@ def test_the_overnight_cap_applies_on_the_last_fillable_decision(
     assert ceiling(earlier, caps, Label.CALM_UP) == 1.0
 
 
-@RED
 @pytest.mark.spec("A3", "ARCH§5", "SPEC§9")
 def test_the_overnight_cut_is_a_forced_reduce_only_sell() -> None:
     from quant.decide.intents import ceiling
@@ -168,7 +161,6 @@ def test_the_overnight_cut_is_a_forced_reduce_only_sell() -> None:
     )
 
 
-@RED
 @pytest.mark.spec("A3", "ARCH§5", "SPEC§9")
 @pytest.mark.parametrize("day", [DAY, HALF_DAY], ids=["full_day", "half_day"])
 def test_the_closing_bar_decision_only_reduces_and_executes_at_the_next_open(day: date) -> None:
@@ -186,7 +178,6 @@ def test_the_closing_bar_decision_only_reduces_and_executes_at_the_next_open(day
 # --- the intent as the RiskEngine reads it ----------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "ARCH§4.4", "SPEC§7", "SPEC§10")
 def test_a_buy_carries_the_trades_stop_below_the_price() -> None:
     buy = _order(stop=STOP)
@@ -202,7 +193,6 @@ def test_a_buy_carries_the_trades_stop_below_the_price() -> None:
             _order(stop=bad)
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "SPEC§8")
 def test_the_intent_names_its_decision_label_and_rule_five() -> None:
     from quant.core.ids import decision_id
@@ -220,7 +210,6 @@ def test_the_intent_names_its_decision_label_and_rule_five() -> None:
     assert OrderIntent.model_validate(buy.model_dump()) == buy
 
 
-@RED
 @pytest.mark.spec("ARCH§4.2", "ARCH§4.4", "I4", "SPEC§10")
 def test_a_happy_path_intent_passes_the_risk_engines_checks() -> None:
     d = decisions()[0]

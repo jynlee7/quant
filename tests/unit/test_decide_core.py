@@ -32,7 +32,6 @@ from quant.hmm.filter import ForwardFilter
 from tests.support.calibration import SIZING_START, sizing_calibration
 from tests.support.decide import DECISION_DAY, DecideFixture, r1_release
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
 # Another model for the swap: the fixture model fit a month earlier (its window ends
 # 2016-10-01, a New York midnight, before every decision here).
 OTHER_FIT_END = datetime(2016, 10, 1, 4, tzinfo=UTC)
@@ -63,7 +62,6 @@ def _reference(fx: DecideFixture, model: Any) -> tuple[Any, list[float], Any, An
 # --- warm-up and model swap ------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§6", "C4", "ARCH§4.2", "ARCH§4.1")
 def test_a_cold_start_warms_features_and_filter_from_the_fit_start_through_the_view() -> None:
     fx = DecideFixture.get()
@@ -85,7 +83,6 @@ def test_a_cold_start_warms_features_and_filter_from_the_fit_start_through_the_v
     assert set(out.state.indicators) == {Label.CALM_UP, Label.CHOP}
 
 
-@RED
 @pytest.mark.spec("SPEC§6", "ARCH§4.3", "ARCH§7.3", "C7")
 def test_a_model_swap_warms_afresh_and_keeps_switching_trade_and_edge() -> None:
     from tests.support.truncation import fixture_model
@@ -114,7 +111,6 @@ def test_a_model_swap_warms_afresh_and_keeps_switching_trade_and_edge() -> None:
     assert out.state.edge == state.edge
 
 
-@RED
 @pytest.mark.spec("SPEC§6", "ARCH§4.2")
 def test_a_warm_state_steps_once_per_decision() -> None:
     fx = DecideFixture.get()
@@ -154,7 +150,6 @@ def _forbid(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(time, "monotonic", refuse)
 
 
-@RED
 @pytest.mark.spec("ARCH§4.1", "K6", "ARCH§14", "I1")
 def test_decide_runs_without_files_network_or_clock_and_repeats_its_record_hash(
     monkeypatch: pytest.MonkeyPatch,
@@ -185,7 +180,6 @@ def test_decide_runs_without_files_network_or_clock_and_repeats_its_record_hash(
     store.close()
 
 
-@RED
 @pytest.mark.spec("ARCH§4.1", "I1")
 def test_decide_leaves_its_state_alone_and_refuses_a_view_at_another_time() -> None:
     fx = DecideFixture.get()
@@ -202,7 +196,6 @@ def test_decide_leaves_its_state_alone_and_refuses_a_view_at_another_time() -> N
 # --- rule 6 ----------------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "T-NL2", "C2", "SPEC§9")
 def test_a_model_fit_past_tau_is_unhealthy_and_sizes_nothing() -> None:
     fx = DecideFixture.get()
@@ -219,7 +212,6 @@ def test_a_model_fit_past_tau_is_unhealthy_and_sizes_nothing() -> None:
     assert out.intents == ()
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "T-NL2", "ARCH§7.4", "SPEC§9")
 def test_a_calibration_as_of_tau_or_later_is_unhealthy() -> None:
     fx = DecideFixture.get()
@@ -233,7 +225,6 @@ def test_a_calibration_as_of_tau_or_later_is_unhealthy() -> None:
     assert all(i.side is Side.SELL for i in out.intents)
 
 
-@RED
 @pytest.mark.spec("SPEC§8", "C6", "C2")
 def test_a_missed_decision_replays_unhealthy_and_recovers_on_the_second_healthy_bar() -> None:
     from quant.decide.core import Flags
@@ -255,7 +246,6 @@ def test_a_missed_decision_replays_unhealthy_and_recovers_on_the_second_healthy_
 # --- sizing through decide -------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_decide_sizes_zero_without_an_edge() -> None:
     from quant.decide.edge import EdgeBook
@@ -271,7 +261,6 @@ def test_decide_sizes_zero_without_an_edge() -> None:
     assert out.record.target.sizing["f_star"] == 0.0
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "ARCH§7.4", "T-NL2")
 def test_decide_reads_the_calibration_for_the_cap_fraction_and_p_tilde() -> None:
     fx = DecideFixture.get()
@@ -296,7 +285,6 @@ def test_decide_reads_the_calibration_for_the_cap_fraction_and_p_tilde() -> None
     assert uncalibrated.target.sizing["cap_fraction"] == 0.25
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§10", "C5")
 def test_halted_frozen_and_locked_never_buy_and_halted_sells_reduce_only() -> None:
     from quant.decide.core import Account, Flags
@@ -333,7 +321,6 @@ def _run(
     return out
 
 
-@RED
 @pytest.mark.spec("A3", "ARCH§5", "SPEC§9", "D9")
 def test_through_the_session_the_closing_bar_only_reduces_and_nothing_goes_short() -> None:
     fx = DecideFixture.get()

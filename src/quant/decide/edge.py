@@ -43,6 +43,7 @@ EngineState (ARCHITECTURE §4.3).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -53,7 +54,7 @@ from quant.core.regime import Label
 from quant.data.frames import HourlyBar
 from quant.decide.indicators import IndicatorValues
 from quant.decide.playbook import Playbook
-from quant.decide.primitives import Reason, TradeState
+from quant.decide.primitives import Reason, TradeState, step
 
 
 class EdgeStats(StrictModel):
@@ -67,34 +68,50 @@ class EdgeStats(StrictModel):
     @classmethod
     def empty(cls) -> EdgeStats:
         """n 0, mean 0.0, m2 0.0."""
-        raise NotImplementedError
+        return cls(n=0, mean=0.0, m2=0.0)
 
     def add(self, x: float) -> EdgeStats:
         """The accumulator after one more return `x`, by Welford's update (module docstring).
         Pure: `self` is unchanged. ValueError, its message saying "finite", for a non-finite
         `x`."""
-        raise NotImplementedError
+        if not math.isfinite(x):
+            raise ValueError("return must be finite")
+        n = self.n + 1
+        d = x - self.mean
+        mean = self.mean + d / n
+        m2 = self.m2 + d * (x - mean)
+        if not (math.isfinite(mean) and math.isfinite(m2)):
+            raise ValueError("accumulated returns must be finite")
+        return EdgeStats(n=n, mean=mean, m2=max(m2, 0.0))
 
     @property
     def variance(self) -> float | None:
         """The sample variance m2 / (n - 1); None when n < 2."""
-        raise NotImplementedError
+        return None if self.n < 2 else self.m2 / (self.n - 1)
 
     @property
     def sd(self) -> float | None:
         """The sample standard deviation, sqrt(variance); None when n < 2."""
-        raise NotImplementedError
+        v = self.variance
+        return None if v is None else math.sqrt(v)
 
     def f_star(self, *, min_bars: int) -> float:
         """`kelly(n, mean, sd, min_bars=min_bars)`: 0.0 when n < min_bars or n < 2."""
-        raise NotImplementedError
+        if self.n < 2:
+            return 0.0
+        return kelly(self.n, self.mean, self.sd, min_bars=min_bars)
 
 
 def kelly(n: int, mean: float, sd: float | None, *, min_bars: int) -> float:
     """f* = max(0, mean - sd / sqrt(n)) / sd^2, the full Kelly fraction on the lower confidence
     bound of the mean (spec §9). 0.0 when n < min_bars, when sd is None or 0, and when the bound
     is not positive. Never negative, never NaN."""
-    raise NotImplementedError
+    if n < min_bars or sd is None or sd == 0 or n < 1:
+        return 0.0
+    lcb = mean - sd / math.sqrt(n)
+    if not lcb > 0:
+        return 0.0
+    return lcb / (sd * sd)
 
 
 class EdgeBook(StrictModel):
@@ -106,22 +123,28 @@ class EdgeBook(StrictModel):
     @classmethod
     def empty(cls) -> EdgeBook:
         """Every label empty."""
-        raise NotImplementedError
+        return cls(stats={label: EdgeStats.empty() for label in Label})
 
     @classmethod
     def seeded(cls, returns: Mapping[Label, Sequence[float]]) -> EdgeBook:
         """The book after adding each label's `returns`, in order, to an empty accumulator
         (labels not named stay empty): equal, field for field, to `empty()` followed by `add`
         for each return. ValueError, its message saying "finite", for a non-finite return."""
-        raise NotImplementedError
+        book = cls.empty()
+        for label, xs in returns.items():
+            for x in xs:
+                book = book.add(label, x)
+        return book
 
     def add(self, label: Label, x: float) -> EdgeBook:
         """The book with `x` added to `label`'s accumulator. Pure."""
-        raise NotImplementedError
+        stats = dict(self.stats)
+        stats[label] = stats[label].add(x)
+        return EdgeBook.model_construct(stats=stats)
 
     def f_star(self, label: Label, *, min_bars: int) -> float:
         """`self.stats[label].f_star(min_bars=min_bars)`."""
-        raise NotImplementedError
+        return self.stats[label].f_star(min_bars=min_bars)
 
 
 class ShadowState(StrictModel):
@@ -141,7 +164,7 @@ class ShadowState(StrictModel):
     @classmethod
     def cold(cls) -> ShadowState:
         """`TradeState.flat()`, no previous close, not entered."""
-        raise NotImplementedError
+        return cls(trade=TradeState.flat(), prev_close=None, entered=False)
 
 
 @dataclass(frozen=True)
@@ -173,7 +196,15 @@ def shadow_return(
     1e-4`, X = `min(bar.open, stop)` when held, `stop` is not None and `bar.low <= stop`, else
     `bar.close`. ValueError, its message naming `changes` or `prev_close`, when `changes` is
     negative or `prev_close` isn't finite and > 0."""
-    raise NotImplementedError
+    if changes < 0:
+        raise ValueError("changes must be >= 0")
+    if not (math.isfinite(prev_close) and prev_close > 0):
+        raise ValueError("prev_close must be finite and > 0")
+    r = 0.0
+    if held:
+        x = min(bar.open, stop) if stop is not None and bar.low <= stop else bar.close
+        r = x / prev_close - 1.0
+    return r - changes * cost_bp * 1e-4
 
 
 def shadow_step(
@@ -193,4 +224,19 @@ def shadow_step(
     held and in position after the step). Pure. ValueError (from `step`) when `values` isn't
     `bar`'s; a flat playbook's shadow stays `ShadowState.cold()` apart from `prev_close`, held
     never, its returns 0.0."""
-    raise NotImplementedError
+    held = state.trade.in_position
+    s = step(playbook, state.trade, values, bar, entries_allowed=True, label_prob=None)
+    after = s.state.in_position
+    ret = None
+    if state.prev_close is not None:
+        changes = (1 if held and state.entered else 0) + (1 if held and not after else 0)
+        ret = shadow_return(
+            state.prev_close,
+            bar,
+            held=held,
+            stop=state.trade.stop,
+            changes=changes,
+            cost_bp=cost_bp,
+        )
+    new = ShadowState(trade=s.state, prev_close=float(bar.close), entered=(not held and after))
+    return ShadowStep(new, held, ret, s.reason)

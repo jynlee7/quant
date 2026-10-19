@@ -25,7 +25,6 @@ from quant.core.regime import Label
 from tests.support.calibration import sizing_calibration
 from tests.support.decide import DecideFixture, day_states, engine_config, r1_caps, r1_playbook
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
 EQUITY = 100_000.0
 
 
@@ -83,7 +82,6 @@ def _decide(case: dict[str, Any]) -> tuple[Any, Any]:
     return d, out
 
 
-@RED
 @pytest.mark.spec("D9", "SPEC§9", "SPEC§10", "A3", "ARCH§13", "SPEC§8", "C5")
 @settings(max_examples=25)
 @given(_cases())
@@ -126,7 +124,6 @@ def test_decide_never_goes_short_or_over_a_cap_and_sizes_zero_where_it_must(
         assert record.target.value == 0.0
 
 
-@RED
 @pytest.mark.spec("D9", "SPEC§10", "ARCH§13", "ARCH§4.2")
 @settings(max_examples=50)
 @given(
@@ -168,7 +165,6 @@ def test_an_order_never_shorts_or_moves_more_than_half_of_equity(
         assert not d.reduce_only
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§10", "ARCH§13", "C5")
 @settings(max_examples=50)
 @given(
@@ -212,7 +208,6 @@ def test_rebalancing_never_passes_the_ceiling_and_never_raises_when_it_may_not(
         assert plan.forced
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§7", "ARCH§13")
 @settings(max_examples=50)
 @given(

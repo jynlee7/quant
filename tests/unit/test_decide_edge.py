@@ -21,7 +21,6 @@ from quant.decide.playbook import Playbook
 from quant.decide.primitives import Reason, TradeState
 from tests.support.decide import priced, r1_playbook
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
 MIN_BARS = 100
 COST_BP = 2.0
 COST = COST_BP * 1e-4
@@ -34,7 +33,6 @@ def _close(a: float, b: float, rel: float = 1e-12) -> bool:
 # --- Welford and f* --------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_welford_matches_a_plain_two_pass_reference() -> None:
     from quant.decide.edge import EdgeStats
@@ -51,7 +49,6 @@ def test_welford_matches_a_plain_two_pass_reference() -> None:
     assert _close(stats.sd, statistics.stdev(xs))
 
 
-@RED
 @pytest.mark.spec("C12")
 def test_the_accumulator_is_pure_and_empty_has_no_variance() -> None:
     from quant.decide.edge import EdgeStats
@@ -67,7 +64,6 @@ def test_the_accumulator_is_pure_and_empty_has_no_variance() -> None:
         empty.add(math.nan)
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_kelly_is_the_lower_bound_over_the_variance() -> None:
     from quant.decide.edge import EdgeStats, kelly
@@ -83,7 +79,6 @@ def test_kelly_is_the_lower_bound_over_the_variance() -> None:
     assert expected > 0
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_kelly_is_zero_without_an_edge() -> None:
     from quant.decide.edge import EdgeStats, kelly
@@ -99,7 +94,6 @@ def test_kelly_is_zero_without_an_edge() -> None:
     assert kelly(200, -0.5, 0.01, min_bars=MIN_BARS) == 0.0
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_kelly_is_zero_with_fewer_than_a_hundred_bars() -> None:
     from quant.decide.edge import EdgeStats
@@ -112,7 +106,6 @@ def test_kelly_is_zero_with_fewer_than_a_hundred_bars() -> None:
     assert stats.add(-0.001).f_star(min_bars=MIN_BARS) > 0  # the 100th bar counts
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_kelly_is_zero_when_every_return_is_equal() -> None:
     from quant.decide.edge import EdgeStats, kelly
@@ -126,7 +119,6 @@ def test_kelly_is_zero_when_every_return_is_equal() -> None:
     assert kelly(150, 0.001, None, min_bars=MIN_BARS) == 0.0
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_a_book_seeded_from_a_sequence_equals_adding_it_in_order() -> None:
     from quant.decide.edge import EdgeBook
@@ -152,7 +144,6 @@ def test_a_book_seeded_from_a_sequence_equals_adding_it_in_order() -> None:
 # --- the shadow return -----------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_a_held_bar_earns_the_close_over_the_previous_close() -> None:
     from quant.decide.edge import shadow_return
@@ -163,7 +154,6 @@ def test_a_held_bar_earns_the_close_over_the_previous_close() -> None:
     assert shadow_return(100.0, bar, held=False, stop=None, changes=0, cost_bp=COST_BP) == 0.0
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_a_stop_inside_the_bar_exits_at_the_stop_and_a_gap_at_the_open() -> None:
     from quant.decide.edge import shadow_return
@@ -185,7 +175,6 @@ def test_a_stop_inside_the_bar_exits_at_the_stop_and_a_gap_at_the_open() -> None
     )
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_each_change_of_shadow_position_costs_shadow_cost_bp() -> None:
     from quant.decide.edge import shadow_return
@@ -221,7 +210,6 @@ def _run_shadow(playbook: Playbook, steps: list[tuple[float, float, float, float
     return out
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9", "SPEC§7")
 def test_a_shadow_round_trip_charges_entry_and_exit_on_held_bars() -> None:
     calm = r1_playbook(Label.CALM_UP)  # enter: fast > slow and close > fast; exit: fast < slow
@@ -250,7 +238,6 @@ def test_a_shadow_round_trip_charges_entry_and_exit_on_held_bars() -> None:
     assert rets[5] == 0.0
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9", "SPEC§7")
 def test_a_shadow_stopped_out_exits_at_the_stop_and_pays_its_exit() -> None:
     from quant.decide.edge import ShadowState, shadow_step
@@ -282,7 +269,6 @@ def test_a_shadow_stopped_out_exits_at_the_stop_and_pays_its_exit() -> None:
     assert not step.state.entered
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9")
 def test_a_shadow_ignores_invalidation_and_blocks() -> None:
     from quant.decide.edge import ShadowState, shadow_step
@@ -313,7 +299,6 @@ def test_a_shadow_ignores_invalidation_and_blocks() -> None:
     assert _close(step.ret, 100.5 / 100.0 - 1, 1e-15)
 
 
-@RED
 @pytest.mark.spec("C12")
 def test_a_flat_playbook_shadow_never_holds() -> None:
     from quant.decide.edge import ShadowState, shadow_step
@@ -334,7 +319,6 @@ def test_a_flat_playbook_shadow_never_holds() -> None:
 # --- counting under the label active at t - 1 (through decide) --------------------------------
 
 
-@RED
 @pytest.mark.spec("C12", "SPEC§9", "ARCH§4.3")
 def test_decide_counts_a_shadow_return_only_under_the_label_active_before_the_bar() -> None:
     from quant.decide.edge import ShadowState

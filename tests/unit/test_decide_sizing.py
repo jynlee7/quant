@@ -15,8 +15,6 @@ from quant.core.regime import Label
 from tests.support.calibration import sizing_calibration
 from tests.support.decide import engine_config, r1_caps, r1_playbook
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
 
 def _size(label: Label, **overrides: object) -> object:
     from quant.decide.sizing import size
@@ -39,7 +37,6 @@ def _size(label: Label, **overrides: object) -> object:
 # --- the formula -----------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "C13")
 def test_without_a_calibration_every_label_gets_a_quarter_of_its_cap_and_the_raw_p() -> None:
     from quant.decide.sizing import NO_CALIBRATION_CAP
@@ -56,7 +53,6 @@ def test_without_a_calibration_every_label_gets_a_quarter_of_its_cap_and_the_raw
     assert s.value == 0.25 * 0.9 * (1 - 0.2) * 1.0 * 1.0  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9")
 def test_each_factor_of_the_formula_scales_the_target() -> None:
     base = _size(Label.CALM_UP).value  # type: ignore[attr-defined]
@@ -67,7 +63,6 @@ def test_each_factor_of_the_formula_scales_the_target() -> None:
     assert _size(Label.CALM_UP, entropy=1.0).value == 0.0  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§7", "C12")
 def test_the_smallest_of_cap_max_size_and_kelly_binds() -> None:
     passing = sizing_calibration()
@@ -87,7 +82,6 @@ def test_the_smallest_of_cap_max_size_and_kelly_binds() -> None:
     assert _size(Label.CALM_UP, f_star=0.0).value == 0.0  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "A4", "C13", "ARCH§7.4")
 def test_a_real_calibration_supplies_the_cap_fraction_and_p_tilde() -> None:
     passing = sizing_calibration()
@@ -106,7 +100,6 @@ def test_a_real_calibration_supplies_the_cap_fraction_and_p_tilde() -> None:
     assert f.p_calibrated == failed.calibrated(Label.CALM_UP, 0.9)  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§7", "SPEC§10")
 def test_crash_and_uncertain_size_zero() -> None:
     crash = _size(Label.CRASH, calibration=sizing_calibration())
@@ -115,7 +108,6 @@ def test_crash_and_uncertain_size_zero() -> None:
     assert _size(Label.CALM_UP, m_rule5=0.0, calibration=sizing_calibration()).value == 0.0  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9")
 def test_size_refuses_inputs_outside_their_ranges() -> None:
     for bad in (
@@ -155,7 +147,6 @@ def _target(**overrides: object) -> object:
     return target(active, **fields)  # type: ignore[arg-type]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§8", "SPEC§10")
 def test_the_target_is_zero_halted_unhealthy_inactive_blocked_or_out_of_position() -> None:
     from quant.decide.sizing import ZeroReason
@@ -183,14 +174,12 @@ def test_the_target_is_zero_halted_unhealthy_inactive_blocked_or_out_of_position
         _target(label_prob=None)
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§7")
 def test_crash_active_targets_zero_through_its_cap() -> None:
     t = _target(active=Label.CRASH, playbook=r1_playbook(Label.CRASH))
     assert t.value == 0.0  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9")
 def test_caps_name_every_label_and_none_is_zero() -> None:
     caps = r1_caps()
@@ -221,7 +210,6 @@ def _rebalance(target: float, current: float, **overrides: object) -> object:
     return rebalance(target, current, **fields)  # type: ignore[arg-type]
 
 
-@RED
 @pytest.mark.spec("SPEC§9")
 def test_the_deadband_is_exactly_a_tenth_on_decimal_values() -> None:
     from quant.decide.sizing import exceeds_deadband
@@ -239,7 +227,6 @@ def test_the_deadband_is_exactly_a_tenth_on_decimal_values() -> None:
     assert (down.desired, down.move, down.held) == (0.25, False, True)  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§8", "SPEC§10")
 def test_forced_reductions_ignore_the_deadband() -> None:
     # Rules 4-6 (rule_forced), a halt, and a ceiling below the position all force the cut.
@@ -253,7 +240,6 @@ def test_forced_reductions_ignore_the_deadband() -> None:
     assert (up.desired, up.move, up.forced) == (0.25, False, False)  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "SPEC§7")
 def test_an_exit_to_zero_ignores_the_deadband() -> None:
     r = _rebalance(0.0, 0.05)
@@ -262,7 +248,6 @@ def test_an_exit_to_zero_ignores_the_deadband() -> None:
     assert (flat.desired, flat.move) == (0.0, False)  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "C5")
 def test_the_freeze_and_the_loss_lock_never_increase_but_let_reductions_through() -> None:
     for flag in ("frozen", "locked"):
@@ -276,7 +261,6 @@ def test_the_freeze_and_the_loss_lock_never_increase_but_let_reductions_through(
         assert (cut.desired, cut.move, cut.limited) == (0.25, True, False), flag  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "ARCH§5", "A3")
 def test_the_closing_bar_decision_only_reduces() -> None:
     up = _rebalance(0.60, 0.30, reduce_only=True)
@@ -285,7 +269,6 @@ def test_the_closing_bar_decision_only_reduces() -> None:
     assert (down.desired, down.move) == (0.10, True)  # type: ignore[attr-defined]
 
 
-@RED
 @pytest.mark.spec("SPEC§9", "D9")
 def test_rebalance_refuses_negative_or_non_finite_exposures() -> None:
     import math

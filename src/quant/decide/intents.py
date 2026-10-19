@@ -33,7 +33,10 @@ Pure: no clock, no I/O.
 
 from __future__ import annotations
 
-from quant.core.orders import OrderIntent
+import math
+from fractions import Fraction
+
+from quant.core.orders import OrderIntent, Side
 from quant.core.regime import Label
 from quant.core.schedule import Decision
 from quant.decide.sizing import Caps
@@ -42,14 +45,21 @@ from quant.decide.sizing import Caps
 def ceiling(decision: Decision, caps: Caps, active: Label | None) -> float:
     """The ceiling of the module docstring: min(caps.max_position, caps.cap(active)), and
     caps.overnight_cap too when `decision.last_fillable`."""
-    raise NotImplementedError
+    c = min(caps.max_position, caps.cap(active))
+    if decision.last_fillable:
+        c = min(c, caps.overnight_cap)
+    return c
 
 
 def target_shares(desired: float, *, equity: float, price: float) -> int:
     """floor(desired x equity / price), exact on the decimal values. ValueError, its message
     naming the bad argument, unless
     `desired` is finite and in [0, 1] and `equity` and `price` are finite and > 0."""
-    raise NotImplementedError
+    if not (math.isfinite(desired) and 0.0 <= desired <= 1.0):
+        raise ValueError("desired must be in [0, 1]")
+    if not (math.isfinite(equity) and equity > 0 and math.isfinite(price) and price > 0):
+        raise ValueError("equity and price must be finite and > 0")
+    return math.floor(_x(desired) * _x(equity) / _x(price))
 
 
 def order(
@@ -70,4 +80,42 @@ def order(
     for `shares` < 0, a BUY on a closing-bar decision (`decision.reduce_only`: decide may only
     reduce there), or a BUY whose `stop` isn't strictly between 0 and `price`; and as
     `target_shares` raises."""
-    raise NotImplementedError
+    if shares < 0:
+        raise ValueError("shares must be >= 0")
+    goal = target_shares(desired, equity=equity, price=price)
+    most = target_shares(caps.single_order_cap, equity=equity, price=price)
+    delta = goal - shares
+    qty = min(abs(delta), most)
+    if qty == 0:
+        return None
+    if delta > 0:
+        if decision.reduce_only:
+            raise ValueError("reduce_only: a closing-bar decision can only reduce")
+        if stop is None or not 0 < stop < price:
+            raise ValueError("a BUY needs a stop between 0 and the price")
+        return OrderIntent(
+            decision_id=decision.id,
+            tau=decision.tau,
+            side=Side.BUY,
+            quantity=qty,
+            target_exposure=float(desired),
+            label=label,
+            uncertain=uncertain,
+            reduce_only=False,
+            stop_price=float(stop),
+        )
+    return OrderIntent(
+        decision_id=decision.id,
+        tau=decision.tau,
+        side=Side.SELL,
+        quantity=qty,
+        target_exposure=float(desired),
+        label=label,
+        uncertain=uncertain,
+        reduce_only=bool(decision.reduce_only or forced),
+        stop_price=None,
+    )
+
+
+def _x(v: float) -> Fraction:
+    return Fraction(repr(float(v)))

@@ -36,7 +36,6 @@ from tests.support.truncation import (
     world,
 )
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
 SEED = 20160104
 UPSTREAM = ("view", "features", "filter", "refit", "calibration")
 # The refit's model and calibration govern from this open (test_truncation_lifecycle.py).
@@ -60,7 +59,6 @@ def _full_run() -> Any:
     return run_layers(_upto_decide(w), Source(w.store, Variant.FULL, None), w.decisions)
 
 
-@RED
 @pytest.mark.spec("T-NL1", "T-NL2", "ARCH§13", "ARCH§4.3", "SPEC§6", "I1")
 def test_the_decision_layer_records_decision_records_under_the_governing_model() -> None:
     from quant.decide.record import DecisionRecord
@@ -136,7 +134,6 @@ class _LateCalibration(DecisionLayer):
         return sizing_calibration(start=LATE_AS_OF - timedelta(hours=1200))
 
 
-@RED
 @pytest.mark.full  # about 1.5 s each: the fast tier's budget (B8b red)
 @pytest.mark.spec("T-NL1", "I1", "P3", "ARCH§13")
 def test_planted_leak_decide_reading_the_view_at_a_later_tau_is_caught_in_decide() -> None:
@@ -152,7 +149,6 @@ def test_planted_leak_decide_reading_the_view_at_a_later_tau_is_caught_in_decide
     assert all(report.compared[name] > 0 for name in (*UPSTREAM, "decide")), report.compared
 
 
-@RED
 @pytest.mark.full  # about 1.5 s each: the fast tier's budget (B8b red)
 @pytest.mark.spec("T-NL2", "P3", "ARCH§7.4", "ARCH§13")
 def test_planted_leak_a_calibration_as_of_after_tau_is_caught_by_provenance() -> None:

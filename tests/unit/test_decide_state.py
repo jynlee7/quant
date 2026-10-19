@@ -21,13 +21,9 @@ from quant.decide.primitives import TradeState
 from quant.decide.switching import RuleId, SwitchState
 from tests.support.decide import DecideFixture, engine_config, r1_caps, r1_release
 
-RED = pytest.mark.xfail(strict=True, reason="red:B8", raises=NotImplementedError)
-
-
 # --- EngineState -----------------------------------------------------------------------------
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "C4", "SPEC§8")
 def test_the_cold_state_is_flat_with_no_active_label() -> None:
     from quant.decide.edge import EdgeBook
@@ -47,7 +43,6 @@ def test_the_cold_state_is_flat_with_no_active_label() -> None:
     assert EngineState.cold(switching, edge=seeded).edge == seeded
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "ARCH§14")
 def test_the_state_round_trips_through_canonical_json() -> None:
     from quant.decide.state import EngineState
@@ -65,7 +60,6 @@ def test_the_state_round_trips_through_canonical_json() -> None:
     assert EngineState.from_json(cold.to_json()) == cold
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "ARCH§14")
 def test_the_state_hash_is_stable_and_changes_with_the_state() -> None:
     from quant.decide.state import EngineState
@@ -82,7 +76,6 @@ def test_the_state_hash_is_stable_and_changes_with_the_state() -> None:
     assert fx.warm().state_hash() == h  # the same decision from the same cold state
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3")
 def test_from_json_refuses_anything_else() -> None:
     from pydantic import ValidationError
@@ -105,7 +98,6 @@ def _outcome(fx: DecideFixture) -> object:
     return fx.decide(fx.warm_state(active=Label.CHOP, trade=fx.in_trade()))
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "SPEC§8", "SPEC§6", "T-NL2", "ARCH§9.2")
 def test_the_record_holds_what_architecture_4_3_lists() -> None:
     fx = DecideFixture.get()
@@ -152,7 +144,6 @@ def test_the_record_holds_what_architecture_4_3_lists() -> None:
     assert r.record_hash() == sha256_hex(r)
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "ARCH§4.1")
 def test_with_verdicts_returns_a_new_record_with_a_new_hash() -> None:
     fx = DecideFixture.get()
@@ -176,7 +167,6 @@ def test_with_verdicts_returns_a_new_record_with_a_new_hash() -> None:
         r.with_verdicts([{"verdict": "approved", "notional": math.nan}])
 
 
-@RED
 @pytest.mark.spec("ARCH§4.3", "ARCH§14")
 def test_the_record_hash_is_the_same_on_every_run() -> None:
     fx = DecideFixture.get()

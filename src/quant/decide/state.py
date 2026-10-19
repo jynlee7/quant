@@ -34,6 +34,10 @@ read from their JSON text, as everywhere else in the project), and `state_hash()
 
 from __future__ import annotations
 
+import hashlib
+import json
+
+from quant.core.canonical import canonical_dumps
 from quant.core.model import StrictModel
 from quant.core.regime import Label
 from quant.decide.config import SwitchingConfig
@@ -62,20 +66,38 @@ class EngineState(StrictModel):
         warms them), `SwitchState.cold(config)` (no active label, a full health streak), a flat
         live trade (`TradeState.flat()`), no shadows, and `edge` (an empty EdgeBook when None;
         a backtest passes its fit-window seed, spec §9)."""
-        raise NotImplementedError
+        return cls(
+            features=None,
+            filter=None,
+            indicators={},
+            switching=SwitchState.cold(config),
+            trade=TradeState.flat(),
+            shadows={},
+            edge=EdgeBook.empty() if edge is None else edge,
+        )
 
     def to_json(self) -> bytes:
         """`canonical_dumps(self)`."""
-        raise NotImplementedError
+        return canonical_dumps(self)
 
     @classmethod
     def from_json(cls, data: bytes) -> EngineState:
         """The state `data` (canonical JSON, as `to_json` writes it) describes, through
         `model_validate_json`. pydantic's ValidationError for anything else."""
-        raise NotImplementedError
+        return cls.model_validate_json(data)
 
     def state_hash(self) -> str:
         """`sha256_hex(self)`: 64 lowercase hex characters, the same for equal states and for a
         state read back with `from_json`. The DecisionRecord's `state_before` and
         `state_after`, and the T-NL1 harness's `Record.state`."""
-        raise NotImplementedError
+        # These states contain only JSON scalars and containers (no datetimes).
+        # Pydantic serializes them directly; avoid a second recursive normalization.
+        # Recompute: model_copy and nested state changes must never reuse a digest.
+        text = json.dumps(
+            self.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()

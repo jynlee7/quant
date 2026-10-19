@@ -36,6 +36,7 @@ from typing import Any
 
 from pydantic import AwareDatetime
 
+from quant.core.canonical import canonical_dumps, canonical_loads, sha256_hex
 from quant.core.model import StrictModel
 from quant.core.orders import OrderIntent
 from quant.core.regime import Label
@@ -133,16 +134,22 @@ class DecisionRecord(StrictModel):
 
     def record_hash(self) -> str:
         """`sha256_hex(self)`, 64 lowercase hex characters."""
-        raise NotImplementedError
+        return sha256_hex(self)
 
     def with_verdicts(self, verdicts: Sequence[Mapping[str, Any]]) -> DecisionRecord:
         """A new record, equal to this one but with `verdicts`: one plain-JSON mapping per
         intent, in the intents' order (the driver's rendering of each RiskVerdict). This record
         is unchanged. ValueError, its message saying "verdict", when the count isn't the intents', CanonicalJSONError
         (`quant.core.canonical`) for a value without a canonical JSON form."""
-        raise NotImplementedError
+        if len(verdicts) != len(self.intents):
+            raise ValueError("one verdict per intent")
+        items = tuple(dict(canonical_loads(canonical_dumps(dict(v)))) for v in verdicts)
+        return self.model_copy(update={"verdicts": items})
 
     def provenance_times(self) -> tuple[datetime, ...]:
         """The fit end and as-of times the decision depended on, for T-NL2: `model_fit_end`,
         and `calibration_as_of` when there is a calibration."""
-        raise NotImplementedError
+        times = [self.model_fit_end]
+        if self.calibration_as_of is not None:
+            times.append(self.calibration_as_of)
+        return tuple(times)
